@@ -1,0 +1,94 @@
+# Managed by Terraform (module: gitlab-runner). Local edits are overwritten on
+# the next manager boot - change the module inputs instead.
+#
+# Every string here is emitted with jsonencode() rather than raw interpolation: a quote
+# or backslash in an input would otherwise produce a config the runner can't parse.
+
+concurrent = ${concurrent}
+check_interval = 3
+log_format = "json"
+listen_address = ${jsonencode(metrics_listen)}
+
+[[runners]]
+  name = ${jsonencode(name)}
+  url = ${jsonencode(gitlab_url)}
+  token = "RUNNER_TOKEN_PLACEHOLDER"
+  executor = "docker-autoscaler"
+%{ if length(runner_environment) > 0 ~}
+  environment = ${jsonencode(runner_environment)}
+%{ endif ~}
+
+  # The Docker executor as it runs on each ephemeral worker.
+  [runners.docker]
+    image = ${jsonencode(docker_image)}
+    privileged = ${docker_privileged}
+    volumes = ${jsonencode(docker_volumes)}
+%{ if length(allowed_images) > 0 ~}
+    allowed_images = ${jsonencode(allowed_images)}
+%{ endif ~}
+%{ if length(allowed_services) > 0 ~}
+    allowed_services = ${jsonencode(allowed_services)}
+%{ endif ~}
+
+  [runners.autoscaler]
+    plugin = ${jsonencode(plugin)}
+
+    # capacity_per_instance x max_instances is the fleet's total job slots.
+    capacity_per_instance = ${capacity_per_instance}
+    max_use_count = ${max_use_count}
+    max_instances = ${max_instances}
+%{ if ready_command != "" ~}
+
+    # MUST stay above the sub-tables below: TOML binds a bare key to the most
+    # recently opened table, so emitting this after [runners.autoscaler.*] would
+    # silently attach it to that sub-table and the gate would never run.
+    #
+    # Don't hand a worker a job until this succeeds - otherwise the plugin
+    # dispatches as soon as sshd answers, which on a cold instance is before
+    # Docker is up.
+    instance_ready_command = ${jsonencode(ready_command)}
+%{ endif ~}
+%{ if scale_throttle.limit > 0 || scale_throttle.burst > 0 ~}
+
+    # Keep a big pipeline from stampeding the EC2 API.
+    [runners.autoscaler.scale_throttle]
+      limit = ${scale_throttle.limit}
+      burst = ${scale_throttle.burst}
+%{ endif ~}
+
+    # The plugin drives this ASG's desired capacity. AWS credentials come from the
+    # manager's instance role, so nothing is configured here.
+    [runners.autoscaler.plugin_config]
+      name = ${jsonencode(asg_name)}
+
+    # Workers are reached over SSH on their PRIVATE address, using a short-lived
+    # key pushed via EC2 Instance Connect - no keypair to manage or rotate.
+    [runners.autoscaler.connector_config]
+      username = ${jsonencode(ssh_username)}
+      use_external_addr = false
+      timeout = "5m0s"
+%{ for p in policies ~}
+
+    # idle_count ${p.idle_count} during: ${join(", ", p.periods)}
+    [[runners.autoscaler.policy]]
+      idle_count = ${p.idle_count}
+      idle_time = ${jsonencode(p.idle_time)}
+      periods = ${jsonencode(p.periods)}
+      timezone = ${jsonencode(p.timezone)}
+%{ if p.scale_factor > 0 ~}
+      scale_factor = ${p.scale_factor}
+%{ endif ~}
+%{ if p.scale_factor_limit > 0 ~}
+      scale_factor_limit = ${p.scale_factor_limit}
+%{ endif ~}
+%{ endfor ~}
+%{ if extra_config != "" ~}
+
+# ---- caller-supplied raw TOML (extra_runner_config_toml) --------------------
+# Appended at the end, so a table header here is an ABSOLUTE path
+# (e.g. "[runners.cache]" attaches to the runner above). Validation requires the
+# value to start with a table header precisely because a bare key would bind to
+# whichever table was opened last - which would silently corrupt the final
+# autoscaling policy. Opening a table first makes that impossible.
+${extra_config}
+%{ endif ~}

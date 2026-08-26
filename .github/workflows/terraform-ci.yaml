@@ -25,6 +25,77 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
 
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Format Check
+        run: terraform fmt -check -recursive
+
+      # Guard against drift between the two aws_ecs_service resources (autoscaled
+      # vs static) - they must stay identical except the lifecycle block.
+      - name: ECS service parity check
+        run: python3 modules/ecs-orchestrator/tests/service_parity.py
+
+      # Render the agent-warden policy documents offline (create=false, no
+      # creds) and lint them with parliament - catches malformed operators,
+      # unknown action prefixes, and escalation paths that terraform test can't.
+      - name: Agent-warden IAM policy lint
+        run: |
+          cd modules/agent-warden/tests/render
+          terraform init -backend=false
+          terraform apply -auto-approve
+          terraform output -raw boundary_policy_json > /tmp/boundary.json
+          terraform output -raw team_grants_policy_json > /tmp/grants.json
+          terraform output -raw scp_policy_json > /tmp/scp.json
+          # parliament still imports pkg_resources (removed in setuptools >= 81)
+          pip install --quiet 'setuptools<81' parliament
+          python3 ../lint_policies.py /tmp/boundary.json /tmp/grants.json /tmp/scp.json
+
+      # Render the appconfig feature-flag documents offline (create=false, no
+      # creds) and lint them against the AWS flag format + semantic rules
+      # (enum/bounds/pattern/required) that terraform test cannot express.
+      - name: AppConfig flag-format lint
+        run: |
+          cd modules/appconfig/tests/render
+          terraform init -backend=false
+          terraform apply -auto-approve
+          terraform output -json feature_flags_json > /tmp/flags.json
+          python3 ../lint_flags.py /tmp/flags.json
+
+      # Prove agent-warden-2 guardrails offline: render every profile's policies
+      # (create=false, no creds) and assert each prohibition resolves to an
+      # unconditional explicit Deny. An untested guardrail is an absent one.
+      - name: Agent-warden-2 guardrail proof
+        run: |
+          cd modules/agent-warden-2/tests/render
+          terraform init -backend=false
+          terraform apply -auto-approve
+          terraform output -json guardrail_matrix > /tmp/gm.json
+          python3 ../evaluate.py /tmp/gm.json
+
+      # Render config.toml + the bootstrap script offline (create=false, no creds)
+      # and PARSE them. terraform test can only match substrings, and a TOML key
+      # under the wrong table still matches a substring - only a parser catches
+      # it, and that class of bug silently disables the readiness gate.
+      - name: GitLab runner config structural lint
+        run: |
+          cd modules/gitlab-runner/tests/render
+          terraform init -backend=false
+          terraform apply -auto-approve
+          terraform output -raw config_toml > /tmp/runner-config.toml
+          terraform output -raw manager_user_data > /tmp/runner-user-data.sh
+          python3 ../parse_config.py /tmp/runner-config.toml /tmp/runner-user-data.sh
+
+      # Shell-lint the rendered bootstrap. It runs as root on the machine that
+      # holds the runner token, so it gets the same scrutiny as module code.
+      - name: GitLab runner bootstrap shellcheck
+        run: |
+          # bash -n first: a syntax error in the rendered script means every
+          # manager fails to boot, and it costs nothing to check.
+          bash -n /tmp/runner-user-data.sh
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          shellcheck -S warning /tmp/runner-user-data.sh
+
       # - name: Checkov Scan
       #   uses: bridgecrewio/checkov-action@master
       #   continue-on-error: true
@@ -34,19 +105,63 @@ jobs:
       #     output_format: cli
       #     soft_fail: false
 
-      # - name: TFLint
-      #   uses: terraform-linters/setup-tflint@v4
-      #   continue-on-error: true
-      #   with:
-      #     tflint_version: v0.50.0
-      # - run: tflint --recursive
+      # NOTE: tflint runs per-module in the `validate` matrix, not here. A
+      # repo-wide `--recursive` currently fails to build two legacy directories
+      # (examples/acm-import, modules/kuber-experiemental reference nested
+      # modules that no longer exist), which would gate every PR on unrelated
+      # breakage. Per-module linting gates each module on its own health.
 
   validate:
     name: Validate Modules
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
-        module: [aurora, ecr, efs, eks, network-hub, route53, sns, sqs, tfe-hub]
+        # Both ends of the supported range. Without the floor, `required_version
+        # >= 1.9.0` is an untested claim - and 1.9.x evaluates both operands of
+        # `||`/`&&`, so a validation that works on 1.12 can crash there.
+        terraform: ["1.9.8", "latest"]
+        module: [agent-warden, agent-warden-2, appconfig, aurora, wafv2, dynamodb, ci-oidc, aws-backup, gitlab-runner, bastion-isolated, ebs, ecr, ecs-orchestrator, ecs-service-connect, efs, eks, lb, asg-group, network-hub, route53, sm, sns, sqs, tfe-hub]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ matrix.terraform }}
+
+      - name: Terraform Init & Validate
+        run: |
+          cd modules/${{ matrix.module }}
+          terraform init -backend=false
+          terraform validate
+
+      - name: Terraform Test
+        run: |
+          cd modules/${{ matrix.module }}
+          if ls tests/*.tftest.hcl >/dev/null 2>&1; then
+            terraform test
+          else
+            echo "No tests for ${{ matrix.module }}, skipping."
+          fi
+
+      - name: Setup TFLint
+        if: matrix.terraform == 'latest'
+        uses: terraform-linters/setup-tflint@v4
+        with:
+          tflint_version: v0.55.0
+
+      - name: TFLint
+        if: matrix.terraform == 'latest'
+        run: |
+          cd modules/${{ matrix.module }}
+          tflint --init
+          tflint
+
+  validate-examples:
+    name: Validate Examples
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -54,11 +169,123 @@ jobs:
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
 
-      - name: Terraform Init & Validate
+      # Includes modules/*/examples/** - an in-module quick-start that cannot
+      # plan is the worst possible first impression, and nothing caught it before.
+      - name: Terraform Init & Validate (every example dir)
         run: |
-          cd modules/${{ matrix.module }}
-          terraform init -backend=false
-          terraform validate
+          set -e
+          for dir in $(find examples modules/*/examples -type f -name '*.tf' -exec dirname {} \; 2>/dev/null | sort -u); do
+            echo "::group::validate $dir"
+            terraform -chdir="$dir" init -backend=false
+            terraform -chdir="$dir" validate
+            echo "::endgroup::"
+          done
+
+  # Real apply against a live AWS account. Gated: only runs when the repo
+  # variable RUN_INTEGRATION_TESTS == 'true' and an OIDC role is configured.
+  # This is what proves AWS *accepts* the generated resources (not just wiring).
+  integration-apply:
+    name: Integration Apply (gated)
+    runs-on: ubuntu-latest
+    if: vars.RUN_INTEGRATION_TESTS == 'true'
+    permissions:
+      id-token: write
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        example: [lb, lb-network]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_INTEGRATION_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Apply then destroy
+        working-directory: examples/${{ matrix.example }}
+        run: |
+          set -e
+          terraform init
+          terraform apply -auto-approve
+          terraform destroy -auto-approve
+
+  # The gitlab-runner module's highest-value test: an actual apply. Its worst
+  # defects (a readiness gate in the wrong TOML table, alarms on unpublished
+  # metrics, a launch-template/instance conflict) are all invisible to a plan.
+  # Gated behind RUN_INTEGRATION_TESTS + a runner token in secrets.
+  runner-integration:
+    name: GitLab Runner Integration Apply (gated)
+    runs-on: ubuntu-latest
+    if: vars.RUN_RUNNER_INTEGRATION == 'true'
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_INTEGRATION_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Apply, verify the runner registers, destroy
+        working-directory: modules/gitlab-runner/examples/simple
+        env:
+          TF_VAR_runner_token: ${{ secrets.GITLAB_RUNNER_TOKEN }}
+          TF_VAR_vpc_id: ${{ vars.INTEGRATION_VPC_ID }}
+          TF_VAR_private_subnet_ids: ${{ vars.INTEGRATION_SUBNET_IDS }}
+        run: |
+          set -euo pipefail
+          trap 'terraform destroy -auto-approve || true' EXIT
+          terraform init
+          terraform apply -auto-approve
+
+          ASG=$(terraform output -raw worker_asg_name)
+          MGR=$(aws ec2 describe-instances \
+            --filters Name=tag:Name,Values=ci-manager Name=instance-state-name,Values=running \
+            --query 'Reservations[0].Instances[0].InstanceId' --output text)
+          echo "manager: $MGR"
+
+          # The bootstrap publishes BootstrapFailure=0 and then a RunnerHealthy
+          # heartbeat every 60s. Wait for the heartbeat - that is the real
+          # "the runner is up and talking to GitLab" signal.
+          for i in $(seq 1 30); do
+            V=$(aws cloudwatch get-metric-statistics \
+                  --namespace "GitLabRunner/ci" --metric-name RunnerHealthy \
+                  --dimensions Name=Fleet,Value=ci \
+                  --start-time "$(date -u -d '15 minutes ago' +%Y-%m-%dT%H:%M:%SZ)" \
+                  --end-time "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                  --period 60 --statistics Maximum \
+                  --query 'Datapoints[-1].Maximum' --output text 2>/dev/null || echo None)
+            [ "$V" = "1.0" ] && { echo "runner healthy after $((i*30))s"; break; }
+            echo "waiting for runner heartbeat ($i/30)... last=$V"
+            sleep 30
+          done
+          [ "${V:-None}" = "1.0" ] || {
+            echo "::error::runner never reported healthy - dumping bootstrap log"
+            aws ssm send-command --instance-ids "$MGR" \
+              --document-name AWS-RunShellScript \
+              --parameters 'commands=["cat /var/log/runner-bootstrap.log"]' \
+              --query 'Command.CommandId' --output text || true
+            exit 1
+          }
+
+          # Prove the fleet can actually launch a worker.
+          aws autoscaling set-desired-capacity --auto-scaling-group-name "$ASG" --desired-capacity 1
+          aws ec2 wait instance-running --filters "Name=tag:aws:autoscaling:groupName,Values=$ASG"
+          echo "worker launched"
 
   # docs:
   #   name: Auto-Generate Docs

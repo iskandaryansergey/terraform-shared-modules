@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `gitlab-runner` module: autoscaling GitLab CI/CD runners on AWS using the
+  modern GitLab Runner Autoscaler (`docker-autoscaler` executor + the AWS
+  fleeting plugin). A small manager instance drives a Spot fleet of ephemeral,
+  single-use EC2 workers that scales to zero when idle. Includes mandatory
+  artifact pinning, a runner token held in SSM (never in state on the
+  recommended path), unprivileged jobs by default, six CloudWatch alarms, an
+  offline TOML structural linter, and dev/production examples.
+
 - Initial project setup with professional documentation.
 - Code of Conduct based on Contributor Covenant v2.1.
 - Comprehensive Contributing guidelines.

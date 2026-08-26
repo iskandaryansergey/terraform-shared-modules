@@ -1,0 +1,45 @@
+# Copy to terraform.tfvars and fill in. Nothing here is optional except where noted.
+
+aws_region = "us-east-1"
+
+vpc_id             = "vpc-0123456789abcdef0"
+worker_subnet_ids  = ["subnet-aaa", "subnet-bbb", "subnet-ccc"] # 3 AZs, private
+manager_subnet_ids = ["subnet-mmm"]
+
+gitlab_url = "https://gitlab.com"
+
+# Write the token OUT OF BAND first so it never enters Terraform state:
+#   aws ssm put-parameter --name /ci/gitlab-runner/prod-token --type SecureString \
+#     --key-id alias/ci-runners --value 'glrt-xxxxxxxx'
+runner_token_ssm_parameter = "/ci/gitlab-runner/prod-token"
+
+permissions_boundary_arn = "arn:aws:iam::111122223333:policy/ci-permissions-boundary"
+
+# Baked AMIs - build these in your image pipeline (Docker + sshd + SSM agent).
+worker_ami_id  = "ami-0worker00000000000"
+manager_ami_id = "ami-0manager0000000000" # arm64 for a t4g manager
+
+# Pin everything the manager fetches.
+gitlab_runner_version   = "17.9.0-1"
+fleeting_plugin_version = "1.1.0"
+# sha256sum of the plugin binary; the manager refuses to start on mismatch.
+fleeting_plugin_sha256 = ""
+
+max_instances = 20
+
+# An alarm nobody receives is decoration.
+alarm_sns_topic_arns = ["arn:aws:sns:us-east-1:111122223333:platform-oncall"]
+
+# What jobs are allowed to do in AWS. Keep it tight.
+job_policy_arns = ["arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"]
+
+# Shared cache - the biggest CI speed win when workers are single-use.
+cache_bucket = "acme-ci-cache-prod"
+
+tags = {
+  Environment = "prod"
+  ManagedBy   = "Terraform"
+  Component   = "gitlab-ci-runners"
+  Team        = "platform"
+  CostCenter  = "cloud-platform"
+}

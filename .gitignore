@@ -211,3 +211,8 @@ local-testing/
 .terraform.lock.hcl
 
 cost-projection-aws-migration.md
+################################################################################
+# Local agent/task specification files (kept on disk, not shipped with modules)
+################################################################################
+modules/*/REQ.txt
+modules/*/creq.txt

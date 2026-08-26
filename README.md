@@ -173,6 +173,29 @@ Elastic Container Registry for managing Docker container images.
 
 ---
 
+### <img src="https://cdn.worldvectorlogo.com/logos/gitlab.svg" alt="GitLab Runner" height="24"/> [GitLab Runner](./modules/gitlab-runner)
+
+Autoscaling GitLab CI/CD runners that cost nothing when idle. A small manager
+instance drives a Spot fleet of ephemeral EC2 workers via GitLab's modern
+autoscaler (`docker-autoscaler` + the AWS fleeting plugin), scaling from zero to
+your ceiling and back.
+
+```hcl
+module "runners" {
+  source = "./modules/gitlab-runner"
+
+  name              = "ci"
+  vpc_id            = var.vpc_id
+  worker_subnet_ids = var.private_subnet_ids
+
+  runner_token_ssm_parameter = "/ci/gitlab-runner/token"
+  gitlab_runner_version      = "17.9.0-1"
+  fleeting_plugin_version    = "1.1.0"
+
+  max_instances = 10
+}
+```
+
 ### <img src="https://cdn.worldvectorlogo.com/logos/aws-ecs.svg" alt="ECS" height="24"/> [ECS](./modules/ecs)
 
 Elastic Container Service for running containerized applications with Fargate or EC2.
