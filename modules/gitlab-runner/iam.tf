@@ -1,5 +1,5 @@
-# Gated on create so that create = false is a genuine no-op: no API calls, no
-# credentials needed. That also lets CI render and parse the templates offline.
+# Gated on create so create = false makes no API calls, which is what lets CI
+# render and parse the templates offline.
 data "aws_partition" "current" {
   count = local.create ? 1 : 0
 }
@@ -17,11 +17,9 @@ locals {
   ssm_core = "arn:${local.partition}:iam::aws:policy/AmazonSSMManagedInstanceCore"
 }
 
-# The canonical EC2 instance-profile trust, deliberately without an
-# aws:SourceAccount condition: that key is not part of the request context when
-# EC2 assumes a role on behalf of an instance profile, so the condition would
-# guard nothing at best and deny every assume-role at worst. Scoping already
-# comes from the instance profile - only this account can attach it.
+# No aws:SourceAccount condition: that key isn't in the request context when EC2
+# assumes a role for an instance profile, so it would guard nothing and might
+# deny every assume-role. Only this account can attach the instance profile.
 data "aws_iam_policy_document" "ec2_assume" {
   count = local.create ? 1 : 0
 
@@ -34,10 +32,8 @@ data "aws_iam_policy_document" "ec2_assume" {
   }
 }
 
-# ----------------------------------------------------------------------------
-# MANAGER ROLE - drives the ASG and connects to workers. These are the only
-# credentials in the fleet that can change capacity, so they stay off the workers.
-# ----------------------------------------------------------------------------
+# Manager role: drives the ASG and connects to workers. The only credentials in
+# the fleet that can change capacity, so they stay off the workers.
 resource "aws_iam_role" "manager" {
   count = local.create ? 1 : 0
 
@@ -48,31 +44,30 @@ resource "aws_iam_role" "manager" {
   tags                 = local.common_tags
 }
 
-# The manager's authorization model lives here as data, not buried in a policy
-# document, so the test suite can assert on it directly. The document below just
-# serializes it - which means what we test is what gets attached.
+# Kept as data rather than inline in the policy document so the test suite can
+# assert on it. The document below just serialises this.
 locals {
   manager_statements = concat(
     [
       {
-        # Scale the fleet. Instance protection is how the plugin stops the ASG
-        # from terminating a worker that's mid-job.
+        # Instance protection is how the plugin stops the ASG terminating a
+        # worker mid-job.
         sid        = "ManageWorkerFleet"
         actions    = ["autoscaling:SetDesiredCapacity", "autoscaling:SetInstanceProtection", "autoscaling:TerminateInstanceInAutoScalingGroup"]
         resources  = [one(aws_autoscaling_group.workers[*].arn)]
         conditions = []
       },
       {
-        # Read-only discovery; these APIs don't accept resource-level scoping.
+        # These APIs don't accept resource-level scoping.
         sid        = "DiscoverFleet"
         actions    = ["autoscaling:DescribeAutoScalingGroups", "ec2:DescribeInstances", "ec2:DescribeSpotInstanceRequests"]
         resources  = ["*"]
         conditions = []
       },
       {
-        # Push a 60-second SSH key at job start - no long-lived keypair anywhere.
-        # Scoped to this fleet's instances AND to the unprivileged runner user,
-        # so it can never be used to land on a worker as root.
+        # 60-second SSH key at job start, so there's no long-lived keypair.
+        # Scoped to this fleet's instances and to the configured OS user. Note
+        # that user is in the docker group, which is root-equivalent.
         sid       = "EphemeralWorkerAccess"
         actions   = ["ec2-instance-connect:SendSSHPublicKey"]
         resources = ["arn:${local.partition}:ec2:${local.region}:${local.account_id}:instance/*"]
@@ -88,7 +83,7 @@ locals {
         conditions = []
       },
       {
-        # Report bootstrap success/failure so an alarm can see a broken manager.
+        # So an alarm can see a broken manager.
         sid       = "PublishBootstrapSignal"
         actions   = ["cloudwatch:PutMetricData"]
         resources = ["*"]
@@ -142,7 +137,7 @@ resource "aws_iam_role_policy" "manager" {
   policy = data.aws_iam_policy_document.manager[0].json
 }
 
-# Session Manager access for humans debugging the manager.
+# Session Manager, for debugging the manager.
 resource "aws_iam_role_policy_attachment" "manager_ssm" {
   count = local.create ? 1 : 0
 
@@ -165,10 +160,9 @@ resource "aws_iam_instance_profile" "manager" {
   tags = local.common_tags
 }
 
-# ----------------------------------------------------------------------------
-# WORKER ROLE - deliberately minimal. Jobs run here, so it gets no fleet-control
-# permissions at all; add job-specific access via additional_worker_policy_arns.
-# ----------------------------------------------------------------------------
+# Worker role: no fleet-control permissions, since jobs run here. It does carry
+# AmazonSSMManagedInstanceCore. Add job-specific access via
+# additional_worker_policy_arns.
 resource "aws_iam_role" "worker" {
   count = local.create ? 1 : 0
 

@@ -156,7 +156,13 @@ resource "aws_iam_policy" "cache" {
   policy      = data.aws_iam_policy_document.cache[0].json
 }
 
-# Keep the gateway endpoint from becoming an unrestricted exfiltration channel.
+# The S3 gateway endpoint is NOT created by this module any more - endpoints are
+# BYO. This policy document is kept, and exported below, because the knowledge in
+# it is the valuable part: an endpoint policy is default-deny, so anything omitted
+# silently stops working from these subnets, and the AL2023 repo bucket name is
+# region-specific and easy to miss.
+#
+# Hand `output.recommended_s3_endpoint_policy` to whoever owns the endpoint.
 data "aws_iam_policy_document" "s3_endpoint" {
   count = var.cache_bucket != "" ? 1 : 0
 
@@ -187,7 +193,6 @@ module "runners" {
   source = "../../modules/gitlab-runner"
 
   name       = "ci-prod"
-  vpc_id     = var.vpc_id
   gitlab_url = var.gitlab_url
 
   worker_subnet_ids  = var.worker_subnet_ids
@@ -256,13 +261,17 @@ module "runners" {
   # version bump will replace the instance.
   manager_instance_refresh = true
 
-  # ---- network --------------------------------------------------------------
-  assign_public_ips = false
-  # Default worker egress already excludes RFC1918. Narrow further to a proxy or
-  # an allow-list if your security team requires it.
-  create_vpc_endpoints = true # S3 gateway + SSM endpoints keep traffic off NAT
-  # An unscoped S3 gateway endpoint would bypass the 443 egress rules entirely.
-  s3_endpoint_policy_json = var.cache_bucket == "" ? "" : data.aws_iam_policy_document.s3_endpoint[0].json
+  # ---- network: BYO ---------------------------------------------------------
+  # The module creates no VPC, subnet, endpoint, security group or rule. It
+  # attaches these and verifies the one rule that is runner wiring rather than
+  # network policy (manager -> worker TCP 22).
+  #
+  # Run `terraform output network_contract` after apply and hand the result to
+  # whoever owns the VPC - it lists the endpoints the fleet requires. In an
+  # isolated VPC a missing endpoint HANGS rather than erroring.
+  assign_public_ips          = false
+  manager_security_group_ids = [var.runner_manager_security_group_id]
+  worker_security_group_ids  = [var.runner_worker_security_group_id]
 
   # ---- observability --------------------------------------------------------
   create_alarms        = true

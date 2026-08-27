@@ -27,10 +27,15 @@ module "runner" {
 
   create = false # nothing is created; the templates still render
 
-  name              = "render"
-  vpc_id            = "vpc-render"
-  worker_subnet_ids = ["subnet-render"]
-  runner_token      = "glrt-RENDERONLY"
+  name = "render"
+  # BYO network. Verification is off because this fixture applies with FAKE
+  # credentials and must make zero AWS calls - that is what lets it render the
+  # real config.toml and bootstrap offline.
+  manager_security_group_ids        = ["sg-0aaaaaaaaaaaaaaa1"]
+  worker_security_group_ids         = ["sg-0bbbbbbbbbbbbbbb2"]
+  verify_manager_to_worker_ssh_rule = false
+  worker_subnet_ids                 = ["subnet-render"]
+  runner_token                      = "glrt-RENDERONLY"
 
   gitlab_runner_version   = "17.9.0-1"
   fleeting_plugin_version = "1.1.0"
@@ -44,9 +49,12 @@ module "runner" {
   # A bare key AND a table header, so the parser can prove where each lands.
   extra_runner_config_toml = "[runners.cache]\n  Type = \"s3\"\n  Path = \"probe\""
 
+  # Catch-all FIRST, per last-match-wins. This fixture previously shipped the
+  # reversed order - the same defect the module's default had - so the artifact it
+  # produced for the parser to check encoded the bug rather than exposing it.
   autoscaling_policies = [
-    { idle_count = 2, idle_time = "20m0s", periods = ["* 8-18 * * mon-fri"], timezone = "Europe/London" },
     { idle_count = 0, idle_time = "5m0s", periods = ["* * * * *"] },
+    { idle_count = 2, idle_time = "20m0s", periods = ["* 8-18 * * mon-fri"], timezone = "Europe/London" },
   ]
 }
 

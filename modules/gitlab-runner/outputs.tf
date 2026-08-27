@@ -23,16 +23,6 @@ output "worker_role_name" {
   value       = one(aws_iam_role.worker[*].name)
 }
 
-output "manager_security_group_id" {
-  description = "Manager security group (no inbound rules)."
-  value       = one(aws_security_group.manager[*].id)
-}
-
-output "worker_security_group_id" {
-  description = "Worker security group (inbound: SSH from the manager only)."
-  value       = one(aws_security_group.worker[*].id)
-}
-
 output "token_ssm_parameter" {
   description = "SSM parameter the manager reads the runner token from."
   value       = local.create ? local.token_ssm_parameter : null
@@ -49,7 +39,7 @@ output "config_toml" {
   sensitive   = true
 }
 
-# Sanity-check the whole path in one command instead of guessing.
+# Paste-ready checks for the things that actually go wrong.
 output "verify_commands" {
   description = "Copy-paste checks: is the manager healthy, did the runner come online, is the fleet scaling."
   value = local.create ? {
@@ -60,9 +50,8 @@ output "verify_commands" {
   } : null
 }
 
-# --- audit / review surfaces -------------------------------------------------
-# Both are rendered from module inputs and contain no secrets: the token is
-# fetched from SSM at boot and appears in neither.
+# Rendered from module inputs. The token is fetched from SSM at boot, so it
+# appears in neither.
 
 output "manager_user_data_preview" {
   description = "The rendered manager bootstrap script - the code that runs as root on the machine that controls your fleet. Sensitive because it embeds the rendered config; read it deliberately with `terraform output -raw manager_user_data_preview`."
@@ -73,4 +62,53 @@ output "manager_user_data_preview" {
 output "manager_policy_statements" {
   description = "The manager's authorization model as data (sid/actions/resources/conditions) - what the fleet's only privileged role can actually do."
   value       = local.create ? local.manager_statements : null
+}
+
+output "network_contract" {
+  description = <<-EOT
+    What the fleet requires from YOUR network, as data rather than prose - hand it
+    to whoever owns the VPC.
+
+    This module creates no network resources, so nothing here is enforced except
+    the manager-to-worker SSH rule, which is verified at plan time. Everything else
+    is a prerequisite: a missing endpoint or egress rule fails as a hang, not as an
+    error, because there is no public-internet path to fall back on.
+  EOT
+  value = {
+    manager_security_group_ids = var.manager_security_group_ids
+    worker_security_group_ids  = var.worker_security_group_ids
+
+    required_egress = {
+      manager = [
+        "443 -> your GitLab (Direct Connect / VPN / peered VPC)",
+        "443 -> VPC endpoints for: ec2, autoscaling, ssm, ssmmessages, ec2messages, ec2-instance-connect, logs, monitoring",
+        "443 -> S3 gateway endpoint (package repos when not using a baked AMI)",
+        "22  -> worker security group (VERIFIED by this module)",
+        "53  -> your DNS resolver (UDP and TCP)",
+      ]
+      worker = [
+        "443 -> your GitLab (git clone, artifact upload)",
+        "443 -> your container registry and package mirrors",
+        "443 -> VPC endpoints for: ssm, ssmmessages, ec2messages",
+        "443 -> S3 gateway endpoint",
+        "53  -> your DNS resolver (UDP and TCP)",
+      ]
+    }
+
+    required_ingress = {
+      manager = ["none - operator access is via SSM Session Manager, outbound-initiated"]
+      worker  = ["22 from the manager security group ONLY - never a CIDR"]
+    }
+
+    required_vpc_endpoints = {
+      interface = [
+        "ec2", "autoscaling", "ssm", "ssmmessages", "ec2messages",
+        "ec2-instance-connect", "logs", "monitoring",
+      ]
+      gateway = ["s3"]
+      note    = "Interface endpoints need private DNS enabled, or the instances resolve the public name and - with no internet path - hang instead of erroring."
+    }
+
+    ssh_rule_verified = var.verify_manager_to_worker_ssh_rule
+  }
 }

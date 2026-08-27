@@ -24,22 +24,33 @@ mock_provider "aws" {
     defaults = { account_id = "123456789012" }
   }
   mock_data "aws_ami" {
-    defaults = { id = "ami-0123456789abcdef0" }
+    defaults = {
+      id = "ami-0123456789abcdef0"
+      # AL2023 names its root device /dev/xvda; the module derives it from here
+      # rather than hardcoding, so the mock has to model it.
+      root_device_name = "/dev/xvda"
+    }
   }
   mock_data "aws_iam_policy_document" {
     defaults = { json = "{\"Version\":\"2012-10-17\",\"Statement\":[]}" }
   }
-  mock_data "aws_vpc" {
-    defaults = { cidr_block = "10.0.0.0/16", main_route_table_id = "rtb-main0000000000000" }
+  # The BYO-network verification reads the caller's security-group rules. The
+  # default mock models a CORRECT rule (tcp 22 from the manager SG), so the happy
+  # path plans; individual runs use override_data to model a missing or malformed
+  # one.
+  mock_data "aws_vpc_security_group_rules" {
+    defaults = { ids = ["sgr-0000000000000001"] }
   }
-  mock_data "aws_subnet" {
-    defaults = { availability_zone = "us-east-1a" }
-  }
-  mock_data "aws_route_tables" {
-    defaults = { ids = ["rtb-0123456789abcdef0"] }
-  }
-  mock_data "aws_route_table" {
-    defaults = { route_table_id = "rtb-0123456789abcdef0" }
+  mock_data "aws_vpc_security_group_rule" {
+    defaults = {
+      is_egress                    = false
+      ip_protocol                  = "tcp"
+      from_port                    = 22
+      to_port                      = 22
+      referenced_security_group_id = "sg-0aaaaaaaaaaaaaaa1"
+      prefix_list_id               = null
+      cidr_ipv4                    = null
+    }
   }
   mock_resource "aws_cloudwatch_log_group" {
     defaults = { arn = "arn:aws:logs:us-east-1:123456789012:log-group:/aws/gitlab-runner/mock" }
@@ -47,12 +58,13 @@ mock_provider "aws" {
 }
 
 variables {
-  name                    = "ci-test"
-  vpc_id                  = "vpc-0123456789abcdef0"
-  worker_subnet_ids       = ["subnet-aaa", "subnet-bbb", "subnet-ccc"]
-  runner_token            = "glrt-TESTTOKEN123456789"
-  gitlab_runner_version   = "17.9.0-1"
-  fleeting_plugin_version = "1.1.0"
+  name                       = "ci-test"
+  worker_subnet_ids          = ["subnet-aaa", "subnet-bbb", "subnet-ccc"]
+  manager_security_group_ids = ["sg-0aaaaaaaaaaaaaaa1"]
+  worker_security_group_ids  = ["sg-0bbbbbbbbbbbbbbb2"]
+  runner_token               = "glrt-TESTTOKEN123456789"
+  gitlab_runner_version      = "17.9.0-1"
+  fleeting_plugin_version    = "1.1.0"
 }
 
 # ============================================================================
@@ -262,29 +274,6 @@ run "imdsv2_and_encrypted_disks" {
   }
 }
 
-run "manager_has_no_inbound_workers_only_manager_ssh" {
-  command = plan
-
-  assert {
-    condition = alltrue([
-      length(aws_vpc_security_group_ingress_rule.worker_ssh_from_manager) == 1,
-      aws_vpc_security_group_ingress_rule.worker_ssh_from_manager[0].from_port == 22,
-      # SSH is allowed from the manager's SG, never from a CIDR
-      aws_vpc_security_group_ingress_rule.worker_ssh_from_manager[0].cidr_ipv4 == null,
-    ])
-    error_message = "Workers must accept SSH only from the manager's security group, never a CIDR"
-  }
-}
-
-run "ssh_ingress_can_be_disabled" {
-  command = plan
-  variables { manager_to_worker_ssh = false }
-  assert {
-    condition     = length(aws_vpc_security_group_ingress_rule.worker_ssh_from_manager) == 0
-    error_message = "manager_to_worker_ssh=false should leave workers with zero inbound rules"
-  }
-}
-
 run "hardening_knobs" {
   command = plan
   variables {
@@ -423,18 +412,6 @@ run "custom_ami_skips_docker_bootstrap" {
   }
 }
 
-run "vpc_endpoints_optional" {
-  command = plan
-  variables { create_vpc_endpoints = true }
-  assert {
-    condition = alltrue([
-      length(aws_vpc_endpoint.interface) == 3,
-      length(aws_security_group.endpoints) == 1,
-    ])
-    error_message = "create_vpc_endpoints should add the three SSM interface endpoints"
-  }
-}
-
 run "extra_iam_policies" {
   command = plan
   variables {
@@ -461,9 +438,11 @@ run "create_false_builds_nothing" {
       length(aws_iam_role.manager) == 0,
       length(aws_iam_role.worker) == 0,
       length(aws_ssm_parameter.token) == 0,
-      length(aws_security_group.worker) == 0,
+      length(aws_cloudwatch_log_group.manager) == 0,
+      # The BYO verification must not run either - it reads the caller's account.
+      length(data.aws_vpc_security_group_rules.worker) == 0,
     ])
-    error_message = "create=false builds nothing"
+    error_message = "create=false builds nothing, and performs no AWS reads"
   }
 }
 
@@ -576,35 +555,6 @@ run "on_demand_base_over_max_fails" {
 # ============================================================================
 
 # FINDING-N01: SGs allowed only TCP 443, so DNS failed and nothing could boot.
-run "dns_egress_exists" {
-  command = plan
-
-  assert {
-    condition = alltrue([
-      # udp+tcp 53 and udp 123, on both the manager and worker SGs
-      length(aws_vpc_security_group_egress_rule.dns) == 6,
-      length([for k, r in aws_vpc_security_group_egress_rule.dns : k if r.from_port == 53 && r.ip_protocol == "udp"]) == 2,
-      length([for k, r in aws_vpc_security_group_egress_rule.dns : k if r.from_port == 53 && r.ip_protocol == "tcp"]) == 2,
-      length([for k, r in aws_vpc_security_group_egress_rule.dns : k if r.from_port == 123]) == 2,
-    ])
-    error_message = "Both SGs need DNS (udp+tcp 53) and NTP egress or the fleet cannot bootstrap"
-  }
-
-  assert {
-    condition     = alltrue([for k, r in aws_vpc_security_group_egress_rule.dns : r.cidr_ipv4 == "10.0.0.0/16" if r.from_port == 53])
-    error_message = "DNS egress should default to the VPC CIDR where the Amazon resolver lives"
-  }
-}
-
-run "custom_dns_resolver" {
-  command = plan
-  variables { dns_egress_cidrs = ["10.99.0.2/32"] }
-  assert {
-    condition     = alltrue([for k, r in aws_vpc_security_group_egress_rule.dns : r.cidr_ipv4 == "10.99.0.2/32" if r.from_port == 53])
-    error_message = "dns_egress_cidrs should override the VPC default"
-  }
-}
-
 # FINDING-I01: privileged was the default, handing every job root on the worker.
 run "privileged_is_off_by_default" {
   command = plan
@@ -681,18 +631,6 @@ run "no_token_source_fails" {
 }
 
 # FINDING-N02: 0.0.0.0/0 on 443 covered the whole internal estate.
-run "worker_egress_excludes_rfc1918" {
-  command = plan
-  assert {
-    condition = alltrue([
-      !contains([for k, r in aws_vpc_security_group_egress_rule.worker_https : r.cidr_ipv4], "0.0.0.0/0"),
-      !contains([for k, r in aws_vpc_security_group_egress_rule.worker_https : r.cidr_ipv4], "10.0.0.0/8"),
-      length(aws_vpc_security_group_egress_rule.worker_https) > 1,
-    ])
-    error_message = "Default worker egress must exclude RFC1918 - a job shouldn't get free internal 443 reach"
-  }
-}
-
 # FINDING-M09: instances silently got public IPs in a public subnet.
 run "no_public_ips_by_default" {
   command = plan
@@ -724,17 +662,6 @@ run "worker_max_lifetime_backstop" {
 }
 
 # FINDING-T02: create_before_destroy + a static SG name = guaranteed replacement failure.
-run "security_groups_use_name_prefix" {
-  command = plan
-  assert {
-    condition = alltrue([
-      aws_security_group.manager[0].name_prefix == "ci-test-manager-",
-      aws_security_group.worker[0].name_prefix == "ci-test-worker-",
-    ])
-    error_message = "SGs must use name_prefix - create_before_destroy needs the old and new group to coexist"
-  }
-}
-
 # FINDING-O01 / R02: nothing could see a broken manager.
 run "observability_wired" {
   command = plan
@@ -746,8 +673,10 @@ run "observability_wired" {
       length(aws_cloudwatch_metric_alarm.manager_absent) == 1,
       length(aws_cloudwatch_metric_alarm.fleet_at_capacity) == 1,
       length(aws_cloudwatch_metric_alarm.capacity_shortfall) == 1,
+      length(aws_cloudwatch_metric_alarm.workers_present) == 1,
+      length(aws_cloudwatch_composite_alarm.orphaned_workers) == 1,
     ])
-    error_message = "Log group + all five alarms must exist"
+    error_message = "Log group + all alarms must exist"
   }
 
   # The signal semantics are the whole point: a continuous liveness metric where
@@ -784,6 +713,7 @@ run "alarms_can_be_disabled" {
       length(aws_cloudwatch_metric_alarm.bootstrap_failed) == 0,
       length(aws_cloudwatch_metric_alarm.runner_unhealthy) == 0,
       length(aws_cloudwatch_metric_alarm.manager_absent) == 0,
+      length(aws_cloudwatch_composite_alarm.orphaned_workers) == 0,
     ])
     error_message = "create_alarms=false should remove the alarms"
   }
@@ -843,19 +773,6 @@ run "instance_connect_scoped_to_osuser" {
 }
 
 # FINDING-M10: the documented S3 gateway endpoint was never created.
-run "s3_gateway_endpoint_created" {
-  command = plan
-  variables { create_vpc_endpoints = true }
-  assert {
-    condition = alltrue([
-      length(aws_vpc_endpoint.s3) == 1,
-      aws_vpc_endpoint.s3[0].vpc_endpoint_type == "Gateway",
-      length(aws_vpc_endpoint.interface) == 3,
-    ])
-    error_message = "create_vpc_endpoints must deliver the S3 gateway endpoint it documents"
-  }
-}
-
 # FINDING-L10: no escape hatch for config the module doesn't model.
 run "extra_config_escape_hatch" {
   command = plan
@@ -999,18 +916,6 @@ run "bad_permissions_boundary_fails" {
   expect_failures = [var.permissions_boundary_arn]
 }
 
-run "private_dns_can_be_disabled" {
-  command = plan
-  variables {
-    create_vpc_endpoints = true
-    endpoint_private_dns = false
-  }
-  assert {
-    condition     = alltrue([for k, e in aws_vpc_endpoint.interface : e.private_dns_enabled == false])
-    error_message = "endpoint_private_dns=false must not hijack VPC-wide DNS"
-  }
-}
-
 # The alarm statistics are the thing that made the previous design page
 # constantly or never fire - assert them explicitly.
 run "alarm_statistics_are_churn_safe" {
@@ -1062,18 +967,22 @@ run "ec2_trust_has_no_source_account_condition" {
   }
 }
 
-# Orphaned workers - the manager is gone but protected workers keep billing.
-run "orphan_alarm_exists" {
+# The orphan alarm must be a COMPOSITE, not metric math. Metric-math FILL() only
+# fills within the retrieved window, so the obvious form resolves itself once
+# RunnerHealthy stops producing datapoints entirely - i.e. it goes quiet exactly
+# when the fleet has been orphaned longest. A composite has no fill semantics and
+# stays in ALARM for as long as both conditions hold.
+run "orphan_alarm_is_composite_and_persists" {
   command = plan
   assert {
     condition = alltrue([
-      length(aws_cloudwatch_metric_alarm.orphaned_workers) == 1,
-      # both halves of the condition must be present in the expression
-      # expression is null on the two metric queries, set on the math query
-      length([for q in aws_cloudwatch_metric_alarm.orphaned_workers[0].metric_query : q if try(q.expression, null) != null && can(regex("FILL", q.expression))]) == 1,
-      length(aws_cloudwatch_metric_alarm.orphaned_workers[0].metric_query) == 3,
+      length(aws_cloudwatch_composite_alarm.orphaned_workers) == 1,
+      length(aws_cloudwatch_metric_alarm.workers_present) == 1,
+      can(regex("AND", aws_cloudwatch_composite_alarm.orphaned_workers[0].alarm_rule)),
+      can(regex("ci-test-runner-workers-present", aws_cloudwatch_composite_alarm.orphaned_workers[0].alarm_rule)),
+      can(regex("ci-test-runner-unhealthy", aws_cloudwatch_composite_alarm.orphaned_workers[0].alarm_rule)),
     ])
-    error_message = "An orphan alarm must correlate workers-in-service against manager liveness"
+    error_message = "The orphan alarm must be a composite of workers-present AND runner-unhealthy"
   }
 }
 
@@ -1110,48 +1019,6 @@ run "force_delete_off_by_default" {
 
 # A self-managed GitLab on a private address is unreachable under the default
 # RFC1918 carve-out: the manager registers and every job fails to clone.
-run "private_gitlab_gets_egress" {
-  command = plan
-  variables { gitlab_url = "https://10.20.30.40" }
-  assert {
-    condition = alltrue([
-      length(aws_vpc_security_group_egress_rule.worker_to_private_gitlab) == 1,
-      aws_vpc_security_group_egress_rule.worker_to_private_gitlab[0].cidr_ipv4 == "10.20.30.40/32",
-    ])
-    error_message = "A private gitlab_url must be explicitly allowed out of the workers"
-  }
-}
-
-run "public_gitlab_needs_no_extra_rule" {
-  command = plan
-  assert {
-    condition     = length(aws_vpc_security_group_egress_rule.worker_to_private_gitlab) == 0
-    error_message = "gitlab.com is covered by the normal egress set"
-  }
-}
-
-run "extra_egress_rules_render" {
-  command = plan
-  variables {
-    worker_extra_egress_rules = [
-      { protocol = "tcp", port = 5000, cidrs = ["10.0.0.0/8", "172.16.0.0/12"] },
-      { protocol = "tcp", port = 3128, cidrs = ["10.0.0.0/8"] },
-    ]
-  }
-  assert {
-    condition     = length(aws_vpc_security_group_egress_rule.worker_extra) == 3
-    error_message = "Extra egress rules must fan out per protocol/port/CIDR"
-  }
-}
-
-run "bad_extra_egress_port_fails" {
-  command = plan
-  variables {
-    worker_extra_egress_rules = [{ port = 99999, cidrs = ["10.0.0.0/8"] }]
-  }
-  expect_failures = [var.worker_extra_egress_rules]
-}
-
 run "injectable_repo_url_fails" {
   command = plan
   variables {
@@ -1188,4 +1055,358 @@ run "table_header_escape_hatch_passes" {
     condition     = can(regex("runners.cache", output.config_toml))
     error_message = "A table-headed escape hatch must render"
   }
+}
+
+# --- fixes from the fourth audit --------------------------------------------
+
+# A newline in a period string would previously escape the config heredoc and run
+# as root. Now rejected at the input, and the template no longer raw-interpolates.
+run "newline_in_period_fails" {
+  command = plan
+  variables {
+    autoscaling_policies = [{ idle_count = 0, periods = ["* * * * *\nTFCFG_x\nrm -rf /"] }]
+  }
+  expect_failures = [var.autoscaling_policies]
+}
+
+run "shell_metachar_in_period_fails" {
+  command = plan
+  variables {
+    autoscaling_policies = [{ idle_count = 0, periods = ["* * * * * $(whoami)"] }]
+  }
+  expect_failures = [var.autoscaling_policies]
+}
+
+run "normal_cron_periods_still_work" {
+  command = plan
+  variables {
+    autoscaling_policies = [
+      { idle_count = 2, periods = ["* 8-18 * * mon-fri"], timezone = "Europe/London" },
+      { idle_count = 0, periods = ["*/5 * * * *"] },
+    ]
+  }
+  assert {
+    condition     = can(regex("8-18", output.config_toml))
+    error_message = "Ordinary cron expressions must still render"
+  }
+}
+
+# URL-safe is not shell-safe: RFC 3986 permits $ ( ) ; which are live in a shell.
+run "command_substitution_url_fails" {
+  command = plan
+  variables {
+    package_repo_script_url = "https://ok.example/$(touch$IFS/tmp/PWNED;true)"
+  }
+  expect_failures = [var.package_repo_script_url]
+}
+
+run "semicolon_url_fails" {
+  command = plan
+  variables {
+    package_repo_script_url = "https://ok.example/x.sh;id"
+  }
+  expect_failures = [var.package_repo_script_url]
+}
+
+run "legitimate_mirror_url_passes" {
+  command = plan
+  variables {
+    package_repo_script_url = "https://mirror.internal.example.com:8443/gitlab/script.rpm.sh"
+  }
+  assert {
+    condition     = can(regex("mirror.internal.example.com", output.manager_user_data_preview))
+    error_message = "A legitimate internal mirror URL must still be accepted"
+  }
+}
+
+# A private gitlab_url WITH A PORT previously produced "10.0.0.5:8443/32" - an
+# invalid CIDR that hard-failed the plan.
+# A hostname resolving privately can't be detected at plan time, so there's an
+# explicit input for it.
+# Hardcoding /dev/xvda silently discards the whole block mapping - encryption
+# included - on an AMI that names its root device differently.
+run "root_device_is_derived" {
+  command = plan
+  assert {
+    condition     = one(aws_launch_template.worker[0].block_device_mappings).device_name == "/dev/xvda"
+    error_message = "The worker root device should resolve from the AMI (mock returns /dev/xvda)"
+  }
+}
+
+run "root_device_can_be_overridden" {
+  command = plan
+  variables {
+    worker_root_device_name  = "/dev/sda1"
+    manager_root_device_name = "/dev/sda1"
+  }
+  assert {
+    condition = alltrue([
+      one(aws_launch_template.worker[0].block_device_mappings).device_name == "/dev/sda1",
+      one(aws_launch_template.manager[0].block_device_mappings).device_name == "/dev/sda1",
+    ])
+    error_message = "An explicit root device name must be honoured on both tiers"
+  }
+}
+
+# Two rules naming the same protocol/port/CIDR previously collided into a raw
+# HCL "Duplicate object key" crash.
+# ===========================================================================
+# P0 REGRESSION GUARDS (audit cycle 6). Both defects below were invisible to a
+# green 105-run suite, so each gets a test that fails if it returns.
+# ===========================================================================
+
+run "reject_catch_all_as_the_last_policy" {
+  # P0-2. GitLab Runner takes the LAST MATCHING policy. A catch-all matches at
+  # every instant, so placing it last makes it win always and every policy above
+  # it becomes unreachable dead config - the rendered config.toml still visibly
+  # contains idle_count = 1, which is why inspection cannot see this.
+  command = plan
+
+  variables {
+    autoscaling_policies = [
+      { idle_count = 2, idle_time = "20m0s", periods = ["* 8-18 * * mon-fri"] },
+      { idle_count = 0, idle_time = "10m0s", periods = ["* * * * *"] },
+    ]
+  }
+
+  expect_failures = [var.autoscaling_policies]
+}
+
+run "accept_catch_all_first" {
+  command = plan
+
+  variables {
+    autoscaling_policies = [
+      { idle_count = 0, idle_time = "10m0s", periods = ["* * * * *"] },
+      { idle_count = 2, idle_time = "20m0s", periods = ["* 8-18 * * mon-fri"] },
+    ]
+  }
+
+  assert {
+    condition     = can(regex("idle_count = 2", output.config_toml))
+    error_message = "the warm-pool policy must render when the catch-all is first."
+  }
+}
+
+run "default_policies_put_the_catch_all_first" {
+  # The shipped default had the reversed order, so the warm pool it advertises in
+  # three places never existed and every job paid a full cold start.
+  command = plan
+
+  assert {
+    condition     = var.autoscaling_policies[0].idle_count == 0
+    error_message = "the default's FIRST policy must be the scale-to-zero catch-all."
+  }
+
+  assert {
+    condition     = contains(var.autoscaling_policies[0].periods, "* * * * *")
+    error_message = "the default's first policy must be the catch-all period."
+  }
+
+  assert {
+    condition     = var.autoscaling_policies[length(var.autoscaling_policies) - 1].idle_count > 0
+    error_message = "the default's LAST policy must be the warm-pool window, or last-match-wins makes the warm pool unreachable."
+  }
+}
+
+run "manager_bootstrap_gives_the_runner_an_aws_region" {
+  # P0-1, the defect that made the fleet launch zero workers while all seven
+  # alarms reported healthy. aws-sdk-go-v2 does not read the region from IMDS, and
+  # fleeting-plugin-aws exposes no region config key, so the systemd unit's own
+  # environment is the only route - and systemd starts services clean.
+  command = plan
+
+  assert {
+    condition     = can(regex("/etc/systemd/system/gitlab-runner.service.d", output.manager_user_data_preview))
+    error_message = "the bootstrap must write a systemd drop-in for gitlab-runner.service. Without it the fleeting plugin cannot resolve an AWS region, DescribeAutoScalingGroups fails, and the fleet launches ZERO workers with every signal green."
+  }
+
+  assert {
+    condition     = can(regex("Environment=AWS_REGION=", output.manager_user_data_preview))
+    error_message = "the drop-in must set AWS_REGION."
+  }
+
+  assert {
+    condition     = can(regex("Environment=AWS_DEFAULT_REGION=", output.manager_user_data_preview))
+    error_message = "the drop-in must set AWS_DEFAULT_REGION as the fallback."
+  }
+
+  assert {
+    # An `export` in the bootstrap shell and an Environment= line in some OTHER
+    # unit are exactly what was there before and exactly what does not work.
+    condition     = can(regex("systemctl daemon-reload", output.manager_user_data_preview))
+    error_message = "the bootstrap must daemon-reload after writing the drop-in, or the unit starts without the region."
+  }
+}
+
+# ============================================================================
+# BYO NETWORK (module creates no network resources)
+# ============================================================================
+
+run "module_creates_no_network_resources" {
+  # The whole point of the BYO refactor. If any of these appear again, the module
+  # has started managing the caller's VPC.
+  command = plan
+
+  assert {
+    condition     = length(var.manager_security_group_ids) > 0 && length(var.worker_security_group_ids) > 0
+    error_message = "both security-group lists must be supplied by the caller."
+  }
+
+  assert {
+    condition     = aws_launch_template.worker[0].network_interfaces[0].security_groups == toset(var.worker_security_group_ids)
+    error_message = "the worker launch template must attach exactly the caller's security groups, unmodified."
+  }
+
+  assert {
+    condition     = aws_launch_template.manager[0].network_interfaces[0].security_groups == toset(var.manager_security_group_ids)
+    error_message = "the manager launch template must attach exactly the caller's security groups, unmodified."
+  }
+}
+
+run "network_contract_output_names_what_the_caller_must_provide" {
+  # The module cannot enforce most of the network, so it has to STATE it. A missing
+  # endpoint in an isolated VPC fails as a hang, not an error.
+  command = plan
+
+  assert {
+    condition     = contains(output.network_contract.required_vpc_endpoints.interface, "ec2-instance-connect")
+    error_message = "the contract must name ec2-instance-connect: the fleeting plugin pushes the ephemeral SSH key through it, so without that endpoint no worker is ever reachable."
+  }
+
+  assert {
+    condition     = contains(output.network_contract.required_vpc_endpoints.interface, "autoscaling")
+    error_message = "the contract must name autoscaling: the plugin calls SetDesiredCapacity, and with no internet path there is no route to it otherwise."
+  }
+
+  assert {
+    condition     = contains(output.network_contract.required_vpc_endpoints.gateway, "s3")
+    error_message = "the contract must name the S3 gateway endpoint."
+  }
+
+  assert {
+    condition     = length(output.network_contract.required_ingress.manager) == 1
+    error_message = "the contract must state that the manager needs no inbound rules."
+  }
+}
+
+run "ssh_rule_verification_passes_on_a_correct_rule" {
+  # The default mock models tcp 22 from the manager SG.
+  command = plan
+
+  assert {
+    condition     = local.manager_to_worker_ssh_rule_exists
+    error_message = "a correct manager-to-worker rule must be recognised."
+  }
+}
+
+run "ssh_rule_verification_rejects_a_missing_rule" {
+  # THE regression guard for the BYO refactor. A missing rule fails as a hung job
+  # with no diagnostic, so it must fail at plan instead.
+  command = plan
+
+  override_data {
+    target = data.aws_vpc_security_group_rule.worker["sgr-0000000000000001"]
+    values = {
+      is_egress                    = false
+      ip_protocol                  = "tcp"
+      from_port                    = 443
+      to_port                      = 443
+      referenced_security_group_id = "sg-0aaaaaaaaaaaaaaa1"
+      prefix_list_id               = null
+    }
+  }
+
+  expect_failures = [aws_launch_template.worker]
+}
+
+run "ssh_rule_verification_rejects_a_rule_from_the_wrong_sg" {
+  command = plan
+
+  override_data {
+    target = data.aws_vpc_security_group_rule.worker["sgr-0000000000000001"]
+    values = {
+      is_egress                    = false
+      ip_protocol                  = "tcp"
+      from_port                    = 22
+      to_port                      = 22
+      referenced_security_group_id = "sg-0ccccccccccccccc3"
+      prefix_list_id               = null
+    }
+  }
+
+  expect_failures = [aws_launch_template.worker]
+}
+
+run "ssh_rule_verification_accepts_all_protocols" {
+  # ip_protocol "-1" permits 22, and AWS reports from/to as -1 for it - a naive
+  # port-range comparison would reject a rule that does in fact work.
+  command = plan
+
+  override_data {
+    target = data.aws_vpc_security_group_rule.worker["sgr-0000000000000001"]
+    values = {
+      is_egress                    = false
+      ip_protocol                  = "-1"
+      from_port                    = -1
+      to_port                      = -1
+      referenced_security_group_id = "sg-0aaaaaaaaaaaaaaa1"
+      prefix_list_id               = null
+    }
+  }
+
+  assert {
+    condition     = local.manager_to_worker_ssh_rule_exists
+    error_message = "an all-protocols rule from the manager SG does permit 22 and must be accepted."
+  }
+}
+
+run "ssh_rule_verification_accepts_a_cross_account_reference" {
+  # A cross-account reference comes back as "account/sg-xxx". Comparing the raw
+  # string would read a legitimate rule as absent.
+  command = plan
+
+  override_data {
+    target = data.aws_vpc_security_group_rule.worker["sgr-0000000000000001"]
+    values = {
+      is_egress                    = false
+      ip_protocol                  = "tcp"
+      from_port                    = 22
+      to_port                      = 22
+      referenced_security_group_id = "999988887777/sg-0aaaaaaaaaaaaaaa1"
+      prefix_list_id               = null
+    }
+  }
+
+  assert {
+    condition     = local.manager_to_worker_ssh_rule_exists
+    error_message = "a cross-account security-group reference must be normalised before comparison."
+  }
+}
+
+run "ssh_rule_verification_can_be_disabled" {
+  # The check cannot resolve a prefix-list rule. A control that fires on a correct
+  # configuration gets switched off wholesale, so it has an explicit opt-out.
+  command = plan
+
+  variables { verify_manager_to_worker_ssh_rule = false }
+
+  assert {
+    condition     = length(data.aws_vpc_security_group_rules.worker) == 0
+    error_message = "with verification disabled the module must perform no security-group reads at all."
+  }
+}
+
+run "reject_too_many_security_groups" {
+  command = plan
+  variables {
+    worker_security_group_ids = ["sg-11111111111111111", "sg-22222222222222222", "sg-33333333333333333", "sg-44444444444444444", "sg-55555555555555555", "sg-66666666666666666"]
+  }
+  expect_failures = [var.worker_security_group_ids]
+}
+
+run "reject_malformed_security_group_id" {
+  command = plan
+  variables { manager_security_group_ids = ["not-a-sg"] }
+  expect_failures = [var.manager_security_group_ids]
 }

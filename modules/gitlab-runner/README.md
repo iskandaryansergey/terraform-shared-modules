@@ -5,6 +5,16 @@ manager instance drives a Spot fleet of ephemeral EC2 workers via GitLab's
 modern autoscaler (`docker-autoscaler` + the AWS fleeting plugin — the supported
 replacement for Docker Machine), scaling from **zero** to your ceiling and back.
 
+
+> **This module manages no network resources.** No VPC, subnet, route table, NAT,
+> VPC endpoint, security group, or security-group rule. You pass in security
+> groups; `terraform output network_contract` tells you what your network must
+> provide. The expected topology is a VPC with **no public-internet route** —
+> GitLab over Direct Connect/VPN, AWS APIs over PrivateLink.
+>
+> **Choosing a runner topology, trade-offs, use cases and cost model:**
+> see [`ARCHITECTURE.md`](ARCHITECTURE.md). Adversarial audit findings:
+> [`AUDIT.md`](AUDIT.md). Cost derivation: [`COSTS.md`](COSTS.md).
 Secure by default: IMDSv2 enforced, encrypted volumes, no static SSH keys, no
 inbound access to workers except from the manager, and the runner token held in
 SSM as a SecureString — never in user_data or a launch template.
@@ -60,7 +70,9 @@ module "runners" {
   source = "path/to/modules/gitlab-runner"
 
   name              = "ci"
-  vpc_id            = var.vpc_id
+  # BYO network: the module attaches these and creates no network resources.
+  manager_security_group_ids = [aws_security_group.manager.id]
+  worker_security_group_ids  = [aws_security_group.worker.id]
   worker_subnet_ids = var.private_subnet_ids   # 3 AZs ideally
 
   # Prefer this: the token stays out of Terraform state entirely.
@@ -95,7 +107,7 @@ Four dials, in order of impact:
 | `max_instances` × `capacity_per_instance` | The hard ceiling. Surfaced as the `max_concurrent_jobs` output so the number that caps your spend is explicit. |
 
 Then: `cpu_architecture = "arm64"` for Graviton, `capacity_per_instance > 1` to
-pack jobs onto fewer VMs, `create_vpc_endpoints` to keep SSM/S3 traffic off the
+pack jobs onto fewer VMs, baked AMIs to remove boot-time package installs, the
 NAT gateway, and `detailed_monitoring` left off.
 
 ## Recipes
@@ -113,8 +125,8 @@ cold overnight:
 
 ```hcl
 autoscaling_policies = [
+  { idle_count = 0, idle_time = "5m0s",  periods = ["* * * * *"] },   # catch-all FIRST
   { idle_count = 4, idle_time = "20m0s", periods = ["* 7-19 * * mon-fri"], timezone = "Europe/London" },
-  { idle_count = 0, idle_time = "5m0s",  periods = ["* * * * *"] },   # catch-all LAST
 ]
 ```
 
@@ -181,7 +193,9 @@ Full list in [`variables.tf`](variables.tf) — every one is documented and
 | Name | Description | Default |
 |---|---|---|
 | `name` | Fleet name; prefixes every resource. | — |
-| `vpc_id` / `worker_subnet_ids` | BYO network (3 AZs recommended). | — |
+| `manager_security_group_ids` / `worker_security_group_ids` | **BYO.** Attached to the instances; the module creates no SGs or rules. | — |
+| `worker_subnet_ids` / `manager_subnet_ids` | Placement (3 AZs recommended). | — |
+| `verify_manager_to_worker_ssh_rule` | Fail the plan if no rule permits manager→worker TCP 22. Needs `ec2:DescribeSecurityGroupRules`. | `true` |
 | `runner_token` / `runner_token_ssm_parameter` | The `glrt-` token, or an existing SSM param holding it. | `""` |
 | `gitlab_url` | GitLab instance. | `https://gitlab.com` |
 | `max_instances` | Worker ceiling — your spend guardrail. | `10` |
@@ -195,22 +209,16 @@ Full list in [`variables.tf`](variables.tf) — every one is documented and
 | `manager_self_heal` | Manager as an ASG-of-1 vs a plain instance. | `true` |
 | `docker_privileged` | Privileged job containers (= root on the worker). | `false` |
 | `imds_hop_limit` | `1` blocks job containers from the instance role. | `1` |
-| `manager_to_worker_ssh` | The one worker ingress rule (see limits). | `true` |
 | `additional_worker_policy_arns` | How jobs get AWS access. | `[]` |
 | `permissions_boundary_arn` · `kms_key_arn` | Org guardrails. | `""` |
-| `create_vpc_endpoints` | S3 gateway (free) + interface endpoints (hourly, per AZ). | `false` |
-| `vpc_endpoint_services` · `s3_endpoint_policy_json` | Which interface endpoints; scope the S3 gateway. | SSM set / `""` |
 | `allowed_images` · `allowed_services` | Restrict what images jobs may run. | `[]` (any) |
 | `gitlab_runner_version` · `fleeting_plugin_version` | Pinned artifact versions (required). | `""` |
 | `fleeting_plugin_sha256` | Verify the plugin binary; refuse to start on mismatch. | `""` |
 | `allow_unpinned_artifacts` | Opt in to fetching "latest" as root at boot. | `false` |
 | `worker_ready_command` | Wait for Docker before dispatching a job. | docker-info loop |
-| `worker_egress_cidrs` | Worker 443 egress; default excludes RFC1918. | internet only |
-| `dns_egress_cidrs` | DNS/NTP targets (default: the VPC resolver). | `[]` |
 | `assign_public_ips` | Public IPs on instances. | `false` |
 | `create_alarms` · `alarm_sns_topic_arns` · `log_retention_days` | Observability. | `true` / `[]` / `30` |
 | `force_delete_workers` | Let destroy proceed without draining (see Limits). | `false` |
-| `worker_extra_egress_rules` | Extra egress beyond 443 (internal registries, proxies). | `[]` |
 | `manager_instance_refresh` | Auto-replace the manager on LT change. | `false` |
 | `worker_max_lifetime_seconds` | Age ceiling for **unprotected** workers (see Limits). | `604800` |
 | `extra_runner_config_toml` | Raw TOML escape hatch (S3 cache, etc.). | `""` |
@@ -221,7 +229,7 @@ Full list in [`variables.tf`](variables.tf) — every one is documented and
 |---|---|
 | `worker_asg_name` / `worker_asg_arn` | The fleet the runner scales. |
 | `manager_role_arn` / `worker_role_arn` / `worker_role_name` | Both roles — attach job permissions to the worker. |
-| `manager_security_group_id` / `worker_security_group_id` | The two SGs. |
+| `network_contract` | What your network must provide, as data — endpoint list, egress and ingress requirements. Hand it to whoever owns the VPC. |
 | `token_ssm_parameter` | Where the manager reads the token. |
 | `max_concurrent_jobs` | `max_instances × capacity_per_instance` — the spend ceiling, stated. |
 | `config_toml` | The rendered config (token placeholdered) — review it in a plan diff. |
@@ -288,7 +296,8 @@ still ships the log that explains it.
   plugin runs jobs over SSH using a **60-second key pushed via EC2 Instance
   Connect** — so there's no keypair to manage or rotate, but port 22 must be
   reachable from the manager. Native SSM tunnelling is still an upstream feature
-  request; `manager_to_worker_ssh = false` is ready for the day it ships.
+  request. The module verifies the rule exists rather than creating it - see
+  ARCHITECTURE.md §3.6.
   `AmazonSSMManagedInstanceCore` is attached regardless, so operators get keyless
   Session Manager access today.
 - **The manager is intentionally stateless.** The token lives in SSM and
@@ -430,10 +439,6 @@ wrong:
   or an unrelated AL2023 release will replace your manager mid-pipeline.
 - **A self-managed GitLab on a private address** is detected and allowed through
   worker egress automatically. Anything *else* internal your jobs need (registry,
-  artifact store, proxy) must go in `worker_extra_egress_rules` — the default
-  egress deliberately excludes RFC1918.
+
 - **`extra_runner_config_toml` must start with a table header.** A bare key would
   attach to the last table in the generated config; validation rejects it.
-- **`create_vpc_endpoints` is not automatically cheaper.** The S3 gateway endpoint
-  is free and usually worth it; the interface endpoints carry an hourly charge per
-  AZ and only pay for themselves at meaningful SSM/S3 volume.

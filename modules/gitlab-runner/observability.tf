@@ -1,11 +1,7 @@
-# Without this you learn CI is broken from a developer, not a page.
-#
-# The signal design matters more than the alarm count. A one-shot "bootstrap
-# succeeded" metric can't tell "healthy" apart from "instance gone", so the
-# manager publishes RunnerHealthy every 60s via a systemd timer and only reports
-# BootstrapFailure when a boot actually fails. Alarms watch those, plus the ASG
-# group metrics (which are explicitly enabled on both ASGs - they're opt-in, and
-# an alarm on an unpublished metric is decoration).
+# The manager publishes RunnerHealthy every 60s from a systemd timer, and
+# BootstrapFailure only when a boot fails. ASG group metrics are enabled
+# explicitly on both ASGs because they're opt-in and three alarms below read
+# them.
 
 resource "aws_cloudwatch_log_group" "manager" {
   count = local.create && var.log_retention_days > 0 ? 1 : 0
@@ -16,8 +12,7 @@ resource "aws_cloudwatch_log_group" "manager" {
   tags              = local.common_tags
 }
 
-# The primary health signal: is gitlab-runner actually running? Missing data is
-# breaching on purpose - no heartbeat means no manager, which means no CI.
+# Primary health signal. Missing data breaches: no heartbeat means no manager.
 resource "aws_cloudwatch_metric_alarm" "runner_unhealthy" {
   count = local.create && var.create_alarms ? 1 : 0
 
@@ -40,8 +35,7 @@ resource "aws_cloudwatch_metric_alarm" "runner_unhealthy" {
   tags          = local.common_tags
 }
 
-# Bootstrap failure is a discrete event, so missing data here is the normal,
-# healthy state - hence notBreaching.
+# Discrete event, so no data is the healthy state.
 resource "aws_cloudwatch_metric_alarm" "bootstrap_failed" {
   count = local.create && var.create_alarms ? 1 : 0
 
@@ -63,7 +57,7 @@ resource "aws_cloudwatch_metric_alarm" "bootstrap_failed" {
   tags          = local.common_tags
 }
 
-# Belt to the heartbeat's braces: the ASG itself reporting no in-service manager.
+# Second opinion on the heartbeat: the ASG reporting no in-service manager.
 resource "aws_cloudwatch_metric_alarm" "manager_absent" {
   count = local.create && var.create_alarms && var.manager_self_heal ? 1 : 0
 
@@ -74,8 +68,8 @@ resource "aws_cloudwatch_metric_alarm" "manager_absent" {
   metric_name = "GroupInServiceInstances"
   dimensions  = { AutoScalingGroupName = aws_autoscaling_group.manager[0].name }
 
-  # Maximum, not Minimum: an instance refresh legitimately drops in-service to 0
-  # for a few minutes. We want "was there EVER a manager in this window".
+  # Maximum, not Minimum: an instance refresh drops in-service to 0 for a few
+  # minutes. The question is whether there was ever a manager in the window.
   statistic           = "Maximum"
   period              = 300
   evaluation_periods  = 2
@@ -88,8 +82,8 @@ resource "aws_cloudwatch_metric_alarm" "manager_absent" {
   tags          = local.common_tags
 }
 
-# Sustained pin at the ceiling: either a genuine capacity shortfall or a runaway
-# pipeline. One is a throughput problem, the other is a bill.
+# Pinned at the ceiling: either jobs are queueing or something is scaling out of
+# control.
 resource "aws_cloudwatch_metric_alarm" "fleet_at_capacity" {
   count = local.create && var.create_alarms ? 1 : 0
 
@@ -99,11 +93,10 @@ resource "aws_cloudwatch_metric_alarm" "fleet_at_capacity" {
   namespace  = "AWS/AutoScaling"
   dimensions = { AutoScalingGroupName = aws_autoscaling_group.workers[0].name }
 
-  # Desired, not in-service: with max_use_count = 1 the fleet churns constantly,
-  # so in-service dips below any ceiling-based threshold every minute while
-  # DESIRED stays pinned - which is the condition we actually care about.
-  # Threshold at max on small fleets and 90% above that, so a 1- or 2-instance
-  # fleet doesn't sit permanently in alarm.
+  # Desired, not in-service. With max_use_count = 1 the fleet churns constantly
+  # so in-service dips every minute, while desired stays pinned.
+  # Threshold sits at max on small fleets so a 1-2 instance fleet isn't
+  # permanently in alarm.
   metric_name         = "GroupDesiredCapacity"
   statistic           = "Average"
   period              = 300
@@ -116,10 +109,9 @@ resource "aws_cloudwatch_metric_alarm" "fleet_at_capacity" {
   tags          = local.common_tags
 }
 
-# The most common real stall: the manager asked for capacity and AWS won't give
-# it (Spot exhaustion, subnet IPs gone, instance type unavailable). Pending
-# instances are the DIRECT signal for that - no metric math, no two-series
-# statistic mismatch, and it behaves the same on a 2-instance fleet as a 200-one.
+# AWS won't give us capacity: Spot exhaustion, subnet IPs gone, instance type
+# unavailable. Pending instances is the direct signal and behaves the same at any
+# fleet size.
 resource "aws_cloudwatch_metric_alarm" "capacity_shortfall" {
   count = local.create && var.create_alarms ? 1 : 0
 
@@ -141,54 +133,43 @@ resource "aws_cloudwatch_metric_alarm" "capacity_shortfall" {
   tags          = local.common_tags
 }
 
-# FINDING: the orphan condition. If the manager is gone but workers are still
-# in service, those workers are scale-in protected with nothing to release them -
-# they bill indefinitely and max_instance_lifetime cannot reclaim them.
+# Workers running with no live manager. They're scale-in protected with nothing
+# left to release them, so they bill until someone intervenes.
 #
-# Expressed as metric math so it is a single alarm: workers present AND no
-# heartbeat. `FILL(healthy, 0)` turns "no heartbeat datapoint" into 0 rather than
-# a gap, which is what makes the product evaluate at all.
-resource "aws_cloudwatch_metric_alarm" "orphaned_workers" {
+# Composite rather than metric math: IF(FILL(healthy,0) < 1, workers, 0) clears
+# itself once RunnerHealthy stops producing datapoints, which is exactly when the
+# fleet has been orphaned longest. A composite has no fill semantics.
+resource "aws_cloudwatch_metric_alarm" "workers_present" {
   count = local.create && var.create_alarms ? 1 : 0
 
-  alarm_name        = "${var.name}-runner-orphaned-workers"
-  alarm_description = "Workers are running in ${var.name} but no manager is reporting healthy. These instances are scale-in protected and will bill indefinitely until protection is cleared - see the runbook in the module README."
+  alarm_name        = "${var.name}-runner-workers-present"
+  alarm_description = "Informational: the ${var.name} worker fleet is non-empty. Used only as an input to the orphaned-workers composite alarm."
 
-  metric_query {
-    id          = "orphans"
-    expression  = "IF(FILL(healthy, 0) < 1, workers, 0)"
-    label       = "Workers with no live manager"
-    return_data = true
-  }
+  namespace   = "AWS/AutoScaling"
+  metric_name = "GroupInServiceInstances"
+  dimensions  = { AutoScalingGroupName = aws_autoscaling_group.workers[0].name }
 
-  metric_query {
-    id = "workers"
-    metric {
-      namespace   = "AWS/AutoScaling"
-      metric_name = "GroupInServiceInstances"
-      dimensions  = { AutoScalingGroupName = aws_autoscaling_group.workers[0].name }
-      period      = 300
-      stat        = "Maximum"
-    }
-  }
-
-  metric_query {
-    id = "healthy"
-    metric {
-      namespace   = local.alarm_namespace
-      metric_name = "RunnerHealthy"
-      dimensions  = { Fleet = var.name }
-      period      = 300
-      stat        = "Maximum"
-    }
-  }
-
-  # Three windows: long enough to ride out a manager replacement, short enough
-  # that an orphaned fleet doesn't bill all night.
-  evaluation_periods  = 3
+  statistic           = "Maximum"
+  period              = 300
+  evaluation_periods  = 1
   threshold           = 0
   comparison_operator = "GreaterThanThreshold"
   treat_missing_data  = "notBreaching"
+
+  # No actions: input to the composite alarm below, not a page on its own.
+  tags = local.common_tags
+}
+
+resource "aws_cloudwatch_composite_alarm" "orphaned_workers" {
+  count = local.create && var.create_alarms ? 1 : 0
+
+  alarm_name        = "${var.name}-runner-orphaned-workers"
+  alarm_description = "Workers are running in ${var.name} while no manager is reporting healthy. They are scale-in protected and will bill indefinitely until protection is cleared - see the orphaned-workers runbook in the module README."
+
+  alarm_rule = join(" AND ", [
+    "ALARM(${aws_cloudwatch_metric_alarm.workers_present[0].alarm_name})",
+    "ALARM(${aws_cloudwatch_metric_alarm.runner_unhealthy[0].alarm_name})",
+  ])
 
   alarm_actions = var.alarm_sns_topic_arns
   ok_actions    = var.alarm_sns_topic_arns

@@ -125,3 +125,35 @@ variable "tags" {
     Component   = "gitlab-ci-runners"
   }
 }
+
+variable "runner_manager_security_group_id" {
+  description = <<-EOT
+    Security group for the runner manager, owned by your landing zone.
+
+    Must permit egress 443 to GitLab and to the AWS interface endpoints
+    (ec2, autoscaling, ssm, ssmmessages, ec2messages, ec2-instance-connect, logs,
+    monitoring), egress 22 to the worker security group, and DNS. No inbound.
+  EOT
+  type        = string
+
+  validation {
+    condition     = can(regex("^sg-[0-9a-f]{8,17}$", var.runner_manager_security_group_id))
+    error_message = "must be an sg-* identifier."
+  }
+}
+
+variable "runner_worker_security_group_id" {
+  description = <<-EOT
+    Security group for runner workers, owned by your landing zone.
+
+    Must permit inbound 22 FROM the manager security group (a reference, never a
+    CIDR), egress 443 to GitLab/registry/mirrors and the AWS endpoints it uses,
+    and DNS. Workers execute untrusted CI code - keep everything else closed.
+  EOT
+  type        = string
+
+  validation {
+    condition     = can(regex("^sg-[0-9a-f]{8,17}$", var.runner_worker_security_group_id))
+    error_message = "must be an sg-* identifier."
+  }
+}

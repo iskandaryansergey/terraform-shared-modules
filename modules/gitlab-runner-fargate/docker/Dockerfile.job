@@ -1,0 +1,54 @@
+# Job image. This is what your CI actually runs in, because `image:` in
+# .gitlab-ci.yml is IGNORED on this platform.
+#
+# Requirements, per GitLab:
+#   1. the tools your jobs need
+#   2. the gitlab-runner binary - the FULL one, not just gitlab-runner-helper,
+#      because the runner invokes its own subcommands (artifacts-uploader,
+#      cache-archiver, ...) inside this container
+#   3. an sshd that accepts the key from SSH_PUBLIC_KEY
+#
+# Do NOT use the reference images GitLab links to
+# (fargate-driver-debian, docker-nodejs-gitlab-ci-fargate). They are on
+# debian:buster and node:12.16 and pin gitlab-runner v12.9.0 from 2020.
+#
+# No DinD here: Fargate forbids privileged containers. Add Kaniko or rootless
+# BuildKit if you build images.
+
+FROM debian:12-slim
+
+ARG RUNNER_VERSION=17.9.0
+
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+      ca-certificates curl git git-lfs openssh-server tini; \
+    rm -rf /var/lib/apt/lists/*
+
+RUN set -eux; \
+    arch="$(dpkg --print-architecture)"; \
+    curl -fsSL --proto '=https' --proto-redir '=https' --max-redirs 3 --retry 5 \
+      -o /usr/local/bin/gitlab-runner \
+      "https://gitlab-runner-downloads.s3.amazonaws.com/v${RUNNER_VERSION}/binaries/gitlab-runner-linux-${arch}"; \
+    chmod 0755 /usr/local/bin/gitlab-runner; \
+    gitlab-runner --version
+
+# sshd needs this directory to exist and refuses to start without it.
+RUN mkdir -p /run/sshd /opt/gitlab-runner/builds /opt/gitlab-runner/cache
+
+# A non-root CI user. The module's ssh_username input selects who the driver
+# authenticates as, and the entrypoint resolves that user's home directory - so
+# this must exist if you set ssh_username to anything but root. Running CI as
+# non-root is usually a requirement in a regulated estate.
+ARG CI_USER=ci
+RUN useradd -m -s /bin/sh "$CI_USER" \
+ && chown -R "$CI_USER" /opt/gitlab-runner
+
+COPY job-entrypoint.sh /usr/local/bin/job-entrypoint.sh
+RUN chmod 0755 /usr/local/bin/job-entrypoint.sh
+
+EXPOSE 22
+
+# tini as PID 1 so signals reach sshd - relevant on Spot, where the task gets a
+# two-minute SIGTERM before it is reclaimed.
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/job-entrypoint.sh"]

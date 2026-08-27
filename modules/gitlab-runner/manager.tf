@@ -14,8 +14,8 @@ data "aws_ami" "al2023_manager" {
   }
 }
 
-# The token lives in SSM as a SecureString, not in user_data - so it stays out of
-# the launch template and off the instance's disk image.
+# SecureString in SSM rather than user_data, so it stays out of the launch
+# template.
 resource "aws_ssm_parameter" "token" {
   count = local.create && local.create_token_param ? 1 : 0
 
@@ -36,13 +36,13 @@ resource "aws_launch_template" "manager" {
   user_data     = base64encode(local.manager_user_data)
   ebs_optimized = true
 
-  # Only on the ASG path. A standalone aws_instance sets its own subnet, which
-  # AWS refuses to combine with an LT network interface.
+  # ASG path only: aws_instance sets its own subnet, which AWS won't combine
+  # with an LT network interface.
   dynamic "network_interfaces" {
     for_each = var.manager_self_heal ? [1] : []
     content {
       associate_public_ip_address = var.assign_public_ips
-      security_groups             = [aws_security_group.manager[0].id]
+      security_groups             = var.manager_security_group_ids
       delete_on_termination       = true
     }
   }
@@ -59,7 +59,7 @@ resource "aws_launch_template" "manager" {
   }
 
   block_device_mappings {
-    device_name = "/dev/xvda"
+    device_name = local.manager_root_device_resolved
     ebs {
       volume_size           = var.manager_disk_gb
       volume_type           = "gp3"
@@ -90,9 +90,8 @@ resource "aws_launch_template" "manager" {
   }
 }
 
-# An ASG of exactly one. The manager keeps no durable state (the token is in SSM,
-# config.toml is rendered at boot), so if the instance or its AZ dies AWS just
-# builds another and CI resumes on its own.
+# An ASG of one. No durable state on the manager, so if the instance or its AZ
+# dies AWS builds another and CI resumes.
 resource "aws_autoscaling_group" "manager" {
   count = local.create && var.manager_self_heal ? 1 : 0
 
@@ -106,7 +105,7 @@ resource "aws_autoscaling_group" "manager" {
   health_check_type         = "EC2"
   health_check_grace_period = 300
 
-  # Opt in, or the manager_absent alarm can never evaluate.
+  # Opt-in, and manager_absent reads these.
   metrics_granularity = "1Minute"
   enabled_metrics     = ["GroupInServiceInstances", "GroupTotalInstances"]
 
@@ -115,8 +114,8 @@ resource "aws_autoscaling_group" "manager" {
     version = aws_launch_template.manager[0].latest_version
   }
 
-  # Off by default: replacing the manager kills every in-flight job, and with an
-  # unpinned AMI an unrelated `apply` would trigger it. Pin manager_ami_id first.
+  # Off by default: a refresh kills every in-flight job, and with an unpinned AMI
+  # an unrelated apply would trigger one. Pin manager_ami_id first.
   dynamic "instance_refresh" {
     for_each = var.manager_instance_refresh ? [1] : []
     content {
@@ -139,16 +138,15 @@ resource "aws_autoscaling_group" "manager" {
   depends_on = [aws_iam_role_policy.manager, aws_ssm_parameter.token]
 }
 
-# Plain instance alternative: simpler to reason about, but a failure pauses all CI
-# until someone notices. Fine for dev/sandbox.
+# Plain-instance alternative. Simpler, but a failure pauses all CI until someone
+# notices. Dev and sandbox only.
 resource "aws_instance" "manager" {
   count = local.create && !var.manager_self_heal ? 1 : 0
 
-  # Networking is set here rather than in the launch template: an instance-level
-  # subnet_id and an LT network_interfaces block are mutually exclusive, so the
-  # LT omits the block entirely on this path (see the dynamic block above).
+  # Set here rather than in the LT: subnet_id and an LT network_interfaces block
+  # are mutually exclusive, so the LT omits the block on this path.
   subnet_id                   = local.manager_subnet_ids[0]
-  vpc_security_group_ids      = [aws_security_group.manager[0].id]
+  vpc_security_group_ids      = var.manager_security_group_ids
   associate_public_ip_address = var.assign_public_ips
 
   launch_template {

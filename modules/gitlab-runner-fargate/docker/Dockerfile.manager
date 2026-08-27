@@ -1,0 +1,48 @@
+# Manager image: gitlab-runner AND the Fargate custom-executor driver.
+#
+# No official image ships both, so this is not optional scaffolding - you must
+# build it. Pin every version; the module's `check` block warns if you then feed
+# it an unpinned tag.
+
+ARG RUNNER_VERSION=v17.9.0
+FROM gitlab/gitlab-runner:${RUNNER_VERSION}
+
+# Pin the driver explicitly. GitLab's docs still tell you to curl
+# fargate-linux-amd64 from gitlab-runner-custom-fargate-downloads.s3.amazonaws.com,
+# and the driver's OWN docs say that bucket "will be phased out over time". Use a
+# release artifact, verify it, and prefer vendoring the binary into your build
+# context over fetching at image-build time.
+ARG FARGATE_DRIVER_VERSION=0.5.5
+ARG FARGATE_DRIVER_SHA256=""
+
+USER root
+
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends ca-certificates curl python3 gnupg; \
+    rm -rf /var/lib/apt/lists/*
+
+RUN set -eux; \
+    mkdir -p /opt/gitlab-runner; \
+    url="https://gitlab.com/gitlab-org/ci-cd/custom-executor-drivers/fargate/-/releases/v${FARGATE_DRIVER_VERSION}/downloads/fargate_${FARGATE_DRIVER_VERSION}_linux_amd64.tar.gz"; \
+    curl -fsSL --proto '=https' --proto-redir '=https' --max-redirs 3 --retry 5 -o /tmp/fargate.tgz "$url"; \
+    if [ -n "$FARGATE_DRIVER_SHA256" ]; then \
+      echo "$FARGATE_DRIVER_SHA256  /tmp/fargate.tgz" | sha256sum -c -; \
+    else \
+      echo "WARNING: building with an UNVERIFIED driver binary. Set FARGATE_DRIVER_SHA256." >&2; \
+    fi; \
+    tar -xzf /tmp/fargate.tgz -C /opt/gitlab-runner; \
+    rm -f /tmp/fargate.tgz; \
+    chmod 0755 /opt/gitlab-runner/fargate; \
+    /opt/gitlab-runner/fargate --version
+
+COPY manager-entrypoint.sh /usr/local/bin/manager-entrypoint.sh
+RUN chmod 0755 /usr/local/bin/manager-entrypoint.sh
+
+# The module's task definition mounts writable volumes at these two paths.
+# gitlab-runner writes .runner_system_id beside config.toml and will not start
+# without it; the driver hands per-job SSH keys between four separate stage
+# processes through the metadata directory.
+RUN mkdir -p /etc/gitlab-runner /opt/gitlab-runner/metadata
+
+ENTRYPOINT ["/usr/local/bin/manager-entrypoint.sh"]

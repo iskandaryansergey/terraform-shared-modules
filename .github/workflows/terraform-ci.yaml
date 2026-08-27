@@ -28,6 +28,54 @@ jobs:
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
 
+      # Runs FIRST, on purpose. Every path this workflow references must be
+      # tracked in git, because an untracked path does not exist on a fresh
+      # checkout: the step that uses it fails with an interpreter or `cd` error,
+      # and because steps are sequential that aborts every later step in the job.
+      #
+      # That is not hypothetical. An untracked script plus an untracked module
+      # directory each independently killed this job, so four gitlab-runner
+      # quality gates never executed once in CI while the job's redness read as
+      # chronic breakage rather than as a signal.
+      #
+      # Failing here, first, with the full list, makes that class of failure
+      # comprehensible instead of mysterious.
+      - name: Referenced paths are tracked in git
+        run: |
+          set -uo pipefail
+          missing=()
+          # Scripts invoked by any workflow.
+          # Only scripts that are actually INVOKED, i.e. the argument to python3 or
+          # python. Matching every occurrence of "*.py" produced a false positive on
+          # a filename mentioned inside an error message, and a guard that cries
+          # wolf is a guard someone switches off.
+          #
+          # Repo-root-relative paths only: a path beginning with ../ is relative to
+          # some earlier `cd` in the same step and cannot be resolved from here.
+          for f in $(grep -ohE 'python3?[[:space:]]+[A-Za-z0-9_./-]+\.py' .github/workflows/*.yaml \
+                     | awk '{print $2}' | sort -u); do
+            case "$f" in ..*|/*) continue ;; esac
+            git ls-files --error-unmatch "$f" >/dev/null 2>&1 || missing+=("$f (script)")
+          done
+          # Directories any workflow cd's into.
+          for d in $(grep -ohE '^\s*cd\s+[A-Za-z0-9_./-]+' .github/workflows/*.yaml \
+                     | awk '{print $2}' | sort -u); do
+            [ "$d" = "-" ] && continue
+            if [ -z "$(git ls-files "$d")" ]; then
+              missing+=("$d/ (directory, 0 tracked files)")
+            fi
+          done
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::error::${#missing[@]} path(s) referenced by CI are not tracked in git:"
+            printf '  - %s\n' "${missing[@]}"
+            echo ""
+            echo "A gate that lives only in a working tree protects nothing, and it takes"
+            echo "every later step in this job down with it. Either 'git add' these paths"
+            echo "or remove the steps that reference them."
+            exit 1
+          fi
+          echo "All CI-referenced scripts and directories are tracked."
+
       - name: Terraform Format Check
         run: terraform fmt -check -recursive
 
@@ -73,44 +121,6 @@ jobs:
           terraform output -json guardrail_matrix > /tmp/gm.json
           python3 ../evaluate.py /tmp/gm.json
 
-      # Render config.toml + the bootstrap script offline (create=false, no creds)
-      # and PARSE them. terraform test can only match substrings, and a TOML key
-      # under the wrong table still matches a substring - only a parser catches
-      # it, and that class of bug silently disables the readiness gate.
-      - name: GitLab runner config structural lint
-        run: |
-          cd modules/gitlab-runner/tests/render
-          terraform init -backend=false
-          terraform apply -auto-approve
-          terraform output -raw config_toml > /tmp/runner-config.toml
-          terraform output -raw manager_user_data > /tmp/runner-user-data.sh
-          python3 ../parse_config.py /tmp/runner-config.toml /tmp/runner-user-data.sh
-
-      # Shell-lint the rendered bootstrap. It runs as root on the machine that
-      # holds the runner token, so it gets the same scrutiny as module code.
-      - name: GitLab runner bootstrap shellcheck
-        run: |
-          # bash -n first: a syntax error in the rendered script means every
-          # manager fails to boot, and it costs nothing to check.
-          bash -n /tmp/runner-user-data.sh
-          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
-          shellcheck -S warning /tmp/runner-user-data.sh
-
-      # - name: Checkov Scan
-      #   uses: bridgecrewio/checkov-action@master
-      #   continue-on-error: true
-      #   with:
-      #     directory: .
-      #     framework: terraform
-      #     output_format: cli
-      #     soft_fail: false
-
-      # NOTE: tflint runs per-module in the `validate` matrix, not here. A
-      # repo-wide `--recursive` currently fails to build two legacy directories
-      # (examples/acm-import, modules/kuber-experiemental reference nested
-      # modules that no longer exist), which would gate every PR on unrelated
-      # breakage. Per-module linting gates each module on its own health.
-
   validate:
     name: Validate Modules
     runs-on: ubuntu-latest
@@ -121,7 +131,7 @@ jobs:
         # >= 1.9.0` is an untested claim - and 1.9.x evaluates both operands of
         # `||`/`&&`, so a validation that works on 1.12 can crash there.
         terraform: ["1.9.8", "latest"]
-        module: [agent-warden, agent-warden-2, appconfig, aurora, wafv2, dynamodb, ci-oidc, aws-backup, gitlab-runner, bastion-isolated, ebs, ecr, ecs-orchestrator, ecs-service-connect, efs, eks, lb, asg-group, network-hub, route53, sm, sns, sqs, tfe-hub]
+        module: [agent-warden, agent-warden-2, appconfig, aurora, wafv2, dynamodb, ci-oidc, aws-backup, gitlab-runner, gitlab-runner-fargate, bastion-isolated, ebs, ecr, ecs-orchestrator, ecs-service-connect, efs, eks, lb, asg-group, route53, sm, sns, sqs, tfe-hub]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -171,15 +181,31 @@ jobs:
 
       # Includes modules/*/examples/** - an in-module quick-start that cannot
       # plan is the worst possible first impression, and nothing caught it before.
+      # Failures are ACCUMULATED, not fatal on the first one. With `set -e` the
+      # loop aborted on the alphabetically-first directory, so a single unrelated
+      # broken example silently prevented every other example from being
+      # validated at all - which is how four gitlab-runner examples went
+      # unchecked in CI while this step reported green.
       - name: Terraform Init & Validate (every example dir)
         run: |
-          set -e
+          set -uo pipefail
+          failed=()
           for dir in $(find examples modules/*/examples -type f -name '*.tf' -exec dirname {} \; 2>/dev/null | sort -u); do
             echo "::group::validate $dir"
-            terraform -chdir="$dir" init -backend=false
-            terraform -chdir="$dir" validate
+            if terraform -chdir="$dir" init -backend=false && terraform -chdir="$dir" validate; then
+              echo "OK: $dir"
+            else
+              echo "::error::validate failed: $dir"
+              failed+=("$dir")
+            fi
             echo "::endgroup::"
           done
+          if [ ${#failed[@]} -gt 0 ]; then
+            echo "::error::${#failed[@]} example directory/ies failed to validate:"
+            printf '  - %s\n' "${failed[@]}"
+            exit 1
+          fi
+          echo "All example directories validated."
 
   # Real apply against a live AWS account. Gated: only runs when the repo
   # variable RUN_INTEGRATION_TESTS == 'true' and an OIDC role is configured.
@@ -328,3 +354,117 @@ jobs:
   #                                  --github-token ${{ github.token }} \
   #                                  --pull-request ${{ github.event.pull_request.number }} \
   #                                  --behavior update
+
+  # ---------------------------------------------------------------------------
+  # Own job on purpose.
+  #
+  # These gates previously sat as sequential steps after four unrelated modules'
+  # lint steps inside `static-analysis`. GitHub Actions aborts a job at the first
+  # failing step, so an untracked sibling module - or a pip resolution failure in
+  # someone else's linter - silently prevented every runner gate from executing.
+  # That is not hypothetical: it is how these gates went unrun for the module's
+  # entire life while the job's redness read as chronic breakage.
+  #
+  # Separate jobs also run in parallel, so this is faster as well as honest.
+  # ---------------------------------------------------------------------------
+  runner-gates:
+    name: GitLab Runner Gates
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      # Render config.toml + the bootstrap script offline (create=false, no creds)
+      # and PARSE them. terraform test can only match substrings, and a TOML key
+      # under the wrong table still matches a substring - only a parser catches
+      # it, and that class of bug silently disables the readiness gate.
+      # Guard the CLASS of bug, not the instance: two root-RCE defects in this
+      # module came from a caller string reaching a shell or a heredoc without
+      # being encoded. This fails the build on any new raw interpolation.
+      - name: GitLab runner (Fargate) template safety
+        run: |
+          python3 modules/gitlab-runner-fargate/tests/template_safety.py \
+            modules/gitlab-runner-fargate/templates \
+            --module-dir modules/gitlab-runner-fargate
+
+      - name: GitLab runner (Fargate) egress complement
+        run: python3 modules/gitlab-runner-fargate/tests/egress_complement.py modules/gitlab-runner-fargate
+
+      - name: GitLab runner (Fargate) config structural lint
+        run: |
+          set -euo pipefail
+          cd modules/gitlab-runner-fargate/tests/render
+          terraform init -backend=false
+          terraform apply -auto-approve
+          terraform output -raw config_toml  > /tmp/fargate-config.toml
+          terraform output -raw fargate_toml > /tmp/fargate-driver.toml
+          cd -
+          python3 modules/gitlab-runner-fargate/tests/parse_config.py \
+            /tmp/fargate-config.toml /tmp/fargate-driver.toml
+
+      # Proves the structural guard by REGRESSION rather than trusting it (R2.4).
+      # Removing listen_address reproduces the defect that made the fleet
+      # undeployable; the guard must reject it. A guard that is never shown to
+      # fail is an assertion, not a control.
+      - name: GitLab runner (Fargate) guard regression proof
+        run: |
+          set -euo pipefail
+          grep -v '^listen_address' /tmp/fargate-config.toml > /tmp/fargate-broken.toml
+          if python3 modules/gitlab-runner-fargate/tests/parse_config.py \
+               /tmp/fargate-broken.toml /tmp/fargate-driver.toml; then
+            echo "::error::parse_config.py accepted a config.toml with no listen_address."
+            echo "::error::That is the defect that made the fleet undeployable - the manager"
+            echo "::error::health check probes an endpoint gitlab-runner never starts."
+            exit 1
+          fi
+          echo "OK: the guard rejects a config.toml missing listen_address."
+
+      - name: GitLab runner (Fargate) entrypoint shellcheck
+        run: |
+          set -euo pipefail
+          for f in modules/gitlab-runner-fargate/docker/*.sh; do
+            sh -n "$f"
+            shellcheck -S warning "$f"
+          done
+
+      - name: GitLab runner template safety
+        run: python3 modules/gitlab-runner/tests/template_safety.py modules/gitlab-runner/templates
+
+      - name: GitLab runner config structural lint
+        run: |
+          cd modules/gitlab-runner/tests/render
+          terraform init -backend=false
+          terraform apply -auto-approve
+          terraform output -raw config_toml > /tmp/runner-config.toml
+          terraform output -raw manager_user_data > /tmp/runner-user-data.sh
+          python3 ../parse_config.py /tmp/runner-config.toml /tmp/runner-user-data.sh
+
+      # Shell-lint the rendered bootstrap. It runs as root on the machine that
+      # holds the runner token, so it gets the same scrutiny as module code.
+      - name: GitLab runner bootstrap shellcheck
+        run: |
+          # bash -n first: a syntax error in the rendered script means every
+          # manager fails to boot, and it costs nothing to check.
+          bash -n /tmp/runner-user-data.sh
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          shellcheck -S warning /tmp/runner-user-data.sh
+
+      # - name: Checkov Scan
+      #   uses: bridgecrewio/checkov-action@master
+      #   continue-on-error: true
+      #   with:
+      #     directory: .
+      #     framework: terraform
+      #     output_format: cli
+      #     soft_fail: false
+
+      # NOTE: tflint runs per-module in the `validate` matrix, not here. A
+      # repo-wide `--recursive` currently fails to build two legacy directories
+      # (examples/acm-import, modules/kuber-experiemental reference nested
+      # modules that no longer exist), which would gate every PR on unrelated
+      # breakage. Per-module linting gates each module on its own health.

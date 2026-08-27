@@ -1,18 +1,18 @@
 #!/bin/bash
-# Manager bootstrap: install gitlab-runner + the AWS fleeting plugin, drop in the
-# rendered config.toml with the token fetched from SSM, and start the service.
-# The manager holds no durable state, so it's safe to replace at any time.
+# Manager bootstrap: install gitlab-runner and the AWS fleeting plugin, write
+# config.toml with the token from SSM, start the service. No durable state here,
+# so the manager is safe to replace at any time.
 #
-# Every failure here is fatal AND reported. A half-configured manager that still
-# answers its EC2 health check is the worst outcome: CI stops and nothing says so.
+# Every failure is fatal and reported. A half-configured manager that still
+# passes its EC2 health check means CI stops with nothing saying so.
 set -euo pipefail
 exec > >(tee /var/log/runner-bootstrap.log | logger -t runner-bootstrap) 2>&1
 
 export AWS_DEFAULT_REGION="${region}"
 BOOTSTRAP_OK=0
 
-# The AWS CLI has to exist BEFORE the trap is armed, or a failure in the first
-# few steps reports nothing at all - the trap would just hit "command not found".
+# The CLI has to exist before the trap is armed, or the trap itself hits
+# "command not found" and reports nothing.
 if command -v dnf >/dev/null 2>&1; then PKG=dnf; elif command -v yum >/dev/null 2>&1; then PKG=yum; else
   echo "FATAL: no dnf/yum on this AMI - this module's bootstrap targets Amazon Linux/RHEL." >&2; exit 1
 fi
@@ -29,8 +29,7 @@ put_metric() { # put_metric <name> <value>
     --value "$2" --unit Count 2>&1 || echo "WARN: could not publish $1"
 }
 
-# Fires on ANY exit path - including the explicit `exit 1`s below, which an ERR
-# trap alone would miss. This is what makes a failed bootstrap visible.
+# EXIT, not ERR: an ERR trap misses the explicit `exit 1`s below.
 on_exit() {
   local rc=$?
   if [ "$BOOTSTRAP_OK" = "1" ] && [ "$rc" = "0" ]; then
@@ -43,19 +42,36 @@ on_exit() {
 trap on_exit EXIT
 
 echo "== installing prerequisites =="
-# --allowerasing: AL2023 ships curl-minimal, which conflicts with curl. Without
-# it this step fails and takes the whole boot with it.
+# AL2023 ships curl-minimal, which conflicts with curl. Without --allowerasing
+# this step fails and takes the boot with it.
 "$PKG" install -y --allowerasing tar gzip shadow-utils file
 command -v curl >/dev/null 2>&1 || "$PKG" install -y --allowerasing curl
 %{ if ship_logs ~}
 
-# ---------------------------------------------------------------------------
-# Log shipping goes FIRST, before anything can fail. Installing it at the end
-# would mean a failed bootstrap never ships the log that explains the failure.
-# ---------------------------------------------------------------------------
+# Log shipping first, so a failed bootstrap still ships the log explaining why.
 echo "== configuring log shipping =="
-"$PKG" install -y amazon-cloudwatch-agent
-cat > /opt/aws/amazon-cloudwatch-agent/etc/runner.json <<'CWEOF'
+# Non-fatal: this runs first, so a hard failure here would abort every boot.
+{
+  "$PKG" install -y amazon-cloudwatch-agent
+
+  # The CloudWatch agent's logs_collected schema handles files, not journald,
+  # so stream the unit's journal to a file and tail that.
+  cat > /etc/systemd/system/runner-journal-tail.service <<'RJTEOF'
+[Unit]
+Description=Stream the gitlab-runner journal to a file for the CloudWatch agent
+After=gitlab-runner.service
+[Service]
+Restart=always
+RestartSec=10
+ExecStart=/bin/sh -c 'exec journalctl -u gitlab-runner.service -f -o short-iso --no-pager >> /var/log/gitlab-runner.log'
+[Install]
+WantedBy=multi-user.target
+RJTEOF
+  install -m 0640 /dev/null /var/log/gitlab-runner.log
+  systemctl daemon-reload
+  systemctl enable --now runner-journal-tail.service
+
+  cat > /opt/aws/amazon-cloudwatch-agent/etc/runner.json <<'CWEOF'
 {
   "agent": { "metrics_collection_interval": 60 },
   "logs": {
@@ -65,16 +81,14 @@ cat > /opt/aws/amazon-cloudwatch-agent/etc/runner.json <<'CWEOF'
           {
             "file_path": "/var/log/runner-bootstrap.log",
             "log_group_name": "${log_group}",
-            "log_stream_name": "{instance_id}/bootstrap"
-          }
-        ]
-      },
-      "journald": {
-        "units": [
+            "log_stream_name": "{instance_id}/bootstrap",
+            "timezone": "UTC"
+          },
           {
-            "unit": "gitlab-runner.service",
+            "file_path": "/var/log/gitlab-runner.log",
             "log_group_name": "${log_group}",
-            "log_stream_name": "{instance_id}/gitlab-runner"
+            "log_stream_name": "{instance_id}/gitlab-runner",
+            "timezone": "UTC"
           }
         ]
       }
@@ -82,8 +96,9 @@ cat > /opt/aws/amazon-cloudwatch-agent/etc/runner.json <<'CWEOF'
   }
 }
 CWEOF
-/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
-  -a fetch-config -m ec2 -s -c file:/opt/aws/amazon-cloudwatch-agent/etc/runner.json
+  /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+    -a fetch-config -m ec2 -s -c file:/opt/aws/amazon-cloudwatch-agent/etc/runner.json
+} || echo "WARN: log shipping could not be configured; continuing without it"
 %{ endif ~}
 %{ if unpinned ~}
 
@@ -92,15 +107,9 @@ echo "WARNING: latest gitlab-runner and fleeting plugin as root on every boot."
 echo "WARNING: Pin gitlab_runner_version and fleeting_plugin_version for production."
 %{ endif ~}
 
-# ---------------------------------------------------------------------------
-# Liveness heartbeat. A one-shot "bootstrap succeeded" metric can't distinguish
-# "healthy" from "instance gone", so publish continuously while the runner is
-# actually up - that's what an alarm can meaningfully watch.
-#
-# Installed EARLY, before the slow steps: it starts publishing RunnerHealthy=0
-# within ~60s of boot, so the alarm evaluates real datapoints rather than
-# treating a still-bootstrapping manager as missing data.
-# ---------------------------------------------------------------------------
+# Liveness heartbeat, published continuously so an alarm has something to watch.
+# Installed before the slow steps so it starts emitting within ~60s and the alarm
+# sees real datapoints instead of missing data during bootstrap.
 echo "== installing liveness heartbeat =="
 cat > /usr/local/bin/runner-heartbeat <<'HBEOF'
 #!/bin/bash
@@ -136,15 +145,17 @@ systemctl enable --now runner-heartbeat.timer
 
 echo "== installing gitlab-runner =="
 REPO_SCRIPT="$(mktemp)"
-curl -fsSL --retry 5 --retry-delay 3 "${repo_script_url}" -o "$REPO_SCRIPT"
+# Single-quoted: command substitution can't happen inside single quotes, even if
+# the URL validation is ever loosened.
+curl -fsSL --retry 5 --retry-delay 3 '${repo_script_url}' -o "$REPO_SCRIPT"
 test -s "$REPO_SCRIPT"
 %{ if repo_script_sha256 != "" ~}
-# Verify before executing. Without a pin this is curl|bash with extra steps.
+# Without a digest this is curl|bash with extra steps.
 echo "${repo_script_sha256}  $REPO_SCRIPT" | sha256sum -c - \
   || { echo "FATAL: package-repo script checksum mismatch" >&2; exit 1; }
 %{ else ~}
-# NOTE: no repo_script_sha256 supplied, so this script is executed as root
-# unverified. Set it (or use an internal mirror) for production.
+# No repo_script_sha256 supplied, so this runs as root unverified. Set it, or
+# use an internal mirror, for production.
 %{ endif ~}
 bash "$REPO_SCRIPT"
 rm -f "$REPO_SCRIPT"
@@ -169,8 +180,7 @@ cat > /etc/gitlab-runner/config.toml <<'TFCFG_${heredoc_nonce}'
 ${config_toml}
 TFCFG_${heredoc_nonce}
 
-# Token via stdin, never argv: a command-line argument is visible in `ps`,
-# /proc/*/cmdline and any process-monitoring agent.
+# Token via stdin, never argv: argv is visible in ps and /proc/*/cmdline.
 printf '%s' "$TOKEN" | python3 -c '
 import pathlib, sys
 token = sys.stdin.read()
@@ -187,11 +197,35 @@ if grep -q RUNNER_TOKEN_PLACEHOLDER /etc/gitlab-runner/config.toml; then
 fi
 
 echo "== installing the AWS fleeting plugin =="
+# AWS region for gitlab-runner.service.
+#
+# aws-sdk-go-v2 doesn't read the region from IMDS by default and the plugin has no
+# region config key, so the unit's own environment is the only route. systemd
+# starts services clean, so the export at the top of this script and the
+# Environment= line in the heartbeat unit don't reach it.
+#
+# Without it the plugin can't call DescribeAutoScalingGroups and the fleet
+# launches no workers, while every signal still reports healthy.
+#
+# Before `fleeting install`, which also talks to the AWS API.
+# Check on a live manager: systemctl show gitlab-runner -p Environment
+install -d -m 0755 /etc/systemd/system/gitlab-runner.service.d
+cat > /etc/systemd/system/gitlab-runner.service.d/10-aws-region.conf <<'REGIONEOF'
+[Service]
+Environment=AWS_REGION=${region}
+Environment=AWS_DEFAULT_REGION=${region}
+REGIONEOF
+chmod 0644 /etc/systemd/system/gitlab-runner.service.d/10-aws-region.conf
+systemctl daemon-reload
+
+# Fail here rather than proceeding into the silent failure above.
+systemctl show gitlab-runner -p Environment | grep -q 'AWS_REGION=' \
+  || { echo "FATAL: AWS region drop-in did not take effect; the fleeting plugin cannot call the EC2/AutoScaling API" >&2; exit 1; }
+
 gitlab-runner fleeting install
 
-# Resolve where the runner ACTUALLY put the plugin. `fleeting install` places it
-# under the runner's plugin directory, not on $PATH - checking $PATH would verify
-# a file that isn't the one being loaded.
+# `fleeting install` puts the plugin under the runner's plugin directory, not on
+# $PATH, so checking $PATH would verify the wrong file.
 PLUGIN_BIN=""
 for candidate in \
   /etc/gitlab-runner/plugins/fleeting-plugin-aws \
@@ -199,13 +233,12 @@ for candidate in \
   /root/.config/gitlab-runner/plugins/fleeting-plugin-aws \
   "$(command -v fleeting-plugin-aws 2>/dev/null || true)"
 do
-  # -f as well as -x: [ -x <dir> ] is true, and a directory would then fail the
-  # arch check below with a baffling "plugin arch != x86_64: directory".
+  # -f as well as -x: [ -x <dir> ] is true, and the arch check below would then
+  # report "plugin arch != x86_64: directory".
   [ -n "$candidate" ] && [ -f "$candidate" ] && [ -x "$candidate" ] && { PLUGIN_BIN="$candidate"; break; }
 done
-# Broad search as a last resort. The `|| true` is load-bearing: under
-# `set -euo pipefail` a missing search root makes find exit 1, pipefail
-# propagates it, and the script would die HERE - before the diagnostic below.
+# Last resort. The `|| true` matters: under set -euo pipefail a missing search
+# root makes find exit 1 and the script dies before the diagnostic below.
 if [ -z "$PLUGIN_BIN" ]; then
   PLUGIN_BIN="$(find /etc/gitlab-runner /root/.config -type f -name 'fleeting-plugin-aws*' -perm -u+x 2>/dev/null | head -n1 || true)"
 fi
@@ -215,8 +248,8 @@ if [ -z "$PLUGIN_BIN" ]; then
 fi
 echo "plugin resolved to: $PLUGIN_BIN"
 
-# Assert the binary matches the host architecture. Upstream has shipped a 32-bit
-# build to 64-bit hosts before, and it fails at job time, not install time.
+# Upstream has shipped a 32-bit build to 64-bit hosts before, and it fails at job
+# time rather than install time.
 HOST_ARCH="$(uname -m)"
 PLUGIN_DESC="$(file -b "$PLUGIN_BIN")"
 case "$HOST_ARCH" in

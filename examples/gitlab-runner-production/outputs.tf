@@ -37,3 +37,19 @@ output "verify_commands" {
   description = "Paste-ready checks for manager health, bootstrap log, and fleet capacity."
   value       = module.runners.verify_commands
 }
+
+output "recommended_s3_endpoint_policy" {
+  description = <<-EOT
+    Suggested policy for the S3 GATEWAY endpoint serving these subnets. The module
+    no longer creates endpoints, so this is guidance for whoever does.
+
+    An endpoint policy is default-deny: anything omitted here silently stops
+    working from these subnets. The AL2023 repo bucket is region-specific.
+  EOT
+  value       = var.cache_bucket == "" ? null : data.aws_iam_policy_document.s3_endpoint[0].json
+}
+
+output "network_contract" {
+  description = "What the fleet requires from your VPC. Hand this to the network team - a missing endpoint hangs rather than errors."
+  value       = module.runners.network_contract
+}

@@ -1,19 +1,19 @@
 #!/bin/bash
-# Worker bootstrap. Boot time here IS job latency, so in production bake this into
-# an AMI and pass worker_ami_id instead.
+# Worker bootstrap. Boot time here is job latency, so bake an AMI and pass
+# worker_ami_id in production.
 set -euo pipefail
 exec > >(tee /var/log/worker-bootstrap.log | logger -t worker-bootstrap) 2>&1
 %{ if install_docker ~}
 
-# Docker is what the docker-autoscaler executor drives on this instance.
+# The docker-autoscaler executor drives Docker over the SSH session.
 dnf install -y docker || yum install -y docker
 systemctl enable --now docker
 
-# The connecting user needs to reach the Docker socket without sudo.
+# The SSH user needs the Docker socket without sudo. This is root-equivalent.
 usermod -aG docker ${ssh_username}
 %{ endif ~}
 
-# The SSM agent ships with AL2023; make sure it's up for operator access.
+# Ships with AL2023; ensure it's running for operator access.
 systemctl enable --now amazon-ssm-agent || true
 %{ if extra != "" ~}
 

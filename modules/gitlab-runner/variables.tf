@@ -28,14 +28,8 @@ variable "tags" {
 }
 
 # ============================================================================
-# NETWORK (bring your own - a VPC belongs to a landing-zone module, not here)
+# NETWORK (bring your own)
 # ============================================================================
-
-variable "vpc_id" {
-  description = "VPC the fleet lives in."
-  type        = string
-  nullable    = false
-}
 
 variable "worker_subnet_ids" {
   description = "Private subnets for the ephemeral workers. Give it 3+ across different AZs - AZ spread is one of the biggest levers on Spot availability."
@@ -48,17 +42,104 @@ variable "worker_subnet_ids" {
   }
 }
 
+# No VPC, subnets, routing, endpoints or security groups are created here. The
+# module attaches the security groups you pass and nothing else.
+#
+# Expected topology is a VPC with no route to the public internet: GitLab over
+# Direct Connect or VPN, AWS APIs over PrivateLink. See ARCHITECTURE.md for the
+# endpoint list.
+
+variable "manager_security_group_ids" {
+  description = <<-EOT
+    Security groups attached to the manager instance. You own these.
+
+    The manager must be able to reach, on TCP 443:
+      - your GitLab (over Direct Connect / VPN, or a peered VPC)
+      - the AWS API endpoints it uses: ec2, autoscaling, ssm, ssmmessages,
+        ec2messages, ec2-instance-connect, logs, monitoring, and S3 (gateway)
+    and on TCP 22:
+      - the worker security group (see verify_manager_to_worker_ssh_rule)
+    and DNS (UDP+TCP 53) to whatever resolver your VPC uses.
+
+    The manager needs NO inbound rules. Operator access is via SSM Session Manager,
+    which is outbound-initiated.
+  EOT
+  type        = list(string)
+  nullable    = false
+
+  validation {
+    condition     = length(var.manager_security_group_ids) >= 1 && length(var.manager_security_group_ids) <= 5
+    error_message = "manager_security_group_ids must contain 1-5 security groups (AWS caps an ENI at 5)."
+  }
+
+  validation {
+    condition     = alltrue([for s in var.manager_security_group_ids : can(regex("^sg-[0-9a-f]{8,17}$", s))])
+    error_message = "manager_security_group_ids entries must be sg-* identifiers."
+  }
+}
+
+variable "worker_security_group_ids" {
+  description = <<-EOT
+    Security groups attached to every worker instance. You own these.
+
+    Workers execute untrusted CI code, so this is the most consequential network
+    policy in the deployment. A worker must be able to reach:
+      - your GitLab, for `git clone` and artifact upload
+      - your container registry
+      - your package mirrors
+      - the AWS API endpoints it uses: ssm, ssmmessages, ec2messages, and S3
+      - DNS
+    and it should be able to reach as little else as possible. In particular,
+    consider whether a job needs to reach your internal estate at all.
+
+    Workers need exactly ONE inbound rule: TCP 22 from the manager's security
+    group. Never a CIDR - see verify_manager_to_worker_ssh_rule.
+  EOT
+  type        = list(string)
+  nullable    = false
+
+  validation {
+    condition     = length(var.worker_security_group_ids) >= 1 && length(var.worker_security_group_ids) <= 5
+    error_message = "worker_security_group_ids must contain 1-5 security groups (AWS caps an ENI at 5)."
+  }
+
+  validation {
+    condition     = alltrue([for s in var.worker_security_group_ids : can(regex("^sg-[0-9a-f]{8,17}$", s))])
+    error_message = "worker_security_group_ids entries must be sg-* identifiers."
+  }
+}
+
+variable "verify_manager_to_worker_ssh_rule" {
+  description = <<-EOT
+    Verify at plan time that a rule exists permitting TCP 22 from a manager
+    security group to a worker security group.
+
+    Why this is verified rather than assumed: the fleeting plugin reaches each
+    worker over SSH, authenticating with an ephemeral key pushed via EC2 Instance
+    Connect. That path is intrinsic to how this runner works - it is not a property
+    of your network. If the rule is missing, the plugin pushes a key, cannot
+    connect, and the job hangs until the driver's retry budget expires, after
+    paying for the worker. There is no error that names the cause.
+
+    The check reads your security-group rules with
+    ec2:DescribeSecurityGroupRules, so whoever runs `terraform plan` needs that
+    permission.
+
+    Set false if the check cannot see your rule - it understands direct
+    security-group references but not a rule that reaches the manager through a
+    PREFIX LIST, and not a rule on a security group you did not list here. A
+    control that fires on a correct configuration gets switched off, so it has an
+    honest opt-out rather than a workaround.
+  EOT
+  type        = bool
+  default     = true
+  nullable    = false
+}
+
 variable "manager_subnet_ids" {
   description = "Subnet(s) for the manager instance. Private + NAT is the secure default. Empty = reuse worker_subnet_ids."
   type        = list(string)
   default     = []
-  nullable    = false
-}
-
-variable "create_vpc_endpoints" {
-  description = "Create interface endpoints for ssm/ssmmessages/ec2messages (+ a gateway endpoint for S3). Keeps agent and S3 traffic off the NAT gateway, which is usually the cheaper and more private option for a chatty CI fleet."
-  type        = bool
-  default     = false
   nullable    = false
 }
 
@@ -133,8 +214,21 @@ variable "kms_key_arn" {
     kms:Decrypt on the AWS-managed key - a CMK with a tight key policy is the
     stronger choice.
 
-    NOTE: the key policy must allow the manager and worker roles to use the key; the
-    module does not (and cannot safely) edit a key policy you own.
+    REQUIRED KEY-POLICY GRANTS - a key policy that names only the two fleet roles
+    will fail every instance launch, because the roles are not the principals that
+    do the encrypting:
+
+      * the Auto Scaling service-linked role
+        (arn:<partition>:iam::<account>:role/aws-service-role/
+         autoscaling.amazonaws.com/AWSServiceRoleForAutoScaling)
+        needs kms:Decrypt, GenerateDataKey*, CreateGrant, DescribeKey - it attaches
+        the encrypted EBS volumes on the ASG's behalf.
+      * logs.<region>.amazonaws.com needs kms:Encrypt*, Decrypt*, ReEncrypt*,
+        GenerateDataKey*, Describe* (scope it with the
+        kms:EncryptionContext:aws:logs:arn condition) to create the log group.
+      * the manager role needs kms:Decrypt for the SSM SecureString.
+
+    See examples/gitlab-runner-production for a working key policy.
   EOT
   type        = string
   default     = ""
@@ -184,7 +278,7 @@ variable "max_use_count" {
     condition     = var.max_use_count >= 1
     error_message = "max_use_count must be >= 1."
   }
-  # Retiring a multi-slot worker after one job pays for capacity you never use.
+  # Retiring a multi-slot worker after one job wastes the other slots.
   validation {
     condition     = var.capacity_per_instance == 1 || var.max_use_count >= var.capacity_per_instance
     error_message = "With capacity_per_instance > 1, max_use_count should be >= capacity_per_instance - otherwise the worker is retired before its other job slots are ever used."
@@ -193,9 +287,18 @@ variable "max_use_count" {
 
 variable "autoscaling_policies" {
   description = <<-EOT
-    Scaling policies, evaluated in order - the LAST matching period wins, so put the
-    catch-all last. This is where scale-to-zero happens: a policy with idle_count = 0
-    means no workers (and no compute cost) when nothing is queued.
+    Scaling policies. The LAST matching period wins, so the catch-all goes FIRST
+    and the specific windows go after it - each later entry overrides the earlier
+    ones for the hours it covers.
+
+    Getting this backwards is silent: a catch-all of ["* * * * *"] matches at every
+    instant, so placing it last makes it win always and every more specific policy
+    above it becomes unreachable dead config. The rendered config.toml still
+    visibly contains idle_count = 1, which is why this is invisible to inspection -
+    the policy is present and correct and simply never selected.
+
+    This is where scale-to-zero happens: a policy with idle_count = 0 means no
+    workers (and no compute cost) when nothing is queued.
 
       idle_count : warm instances kept ready for instant pickup (0 = scale to zero).
       idle_time  : how long an idle instance survives before termination.
@@ -215,9 +318,11 @@ variable "autoscaling_policies" {
     scale_factor       = optional(number, 0)
     scale_factor_limit = optional(number, 0)
   }))
+  # Catch-all first, specific windows after: last match wins, and the catch-all
+  # matches always.
   default = [
-    { idle_count = 1, idle_time = "20m0s", periods = ["* 8-18 * * mon-fri"] },
     { idle_count = 0, idle_time = "10m0s", periods = ["* * * * *"] },
+    { idle_count = 1, idle_time = "20m0s", periods = ["* 8-18 * * mon-fri"] },
   ]
   nullable = false
 
@@ -229,6 +334,16 @@ variable "autoscaling_policies" {
     condition     = alltrue([for p in var.autoscaling_policies : p.idle_count >= 0])
     error_message = "autoscaling_policies[*].idle_count must be >= 0."
   }
+
+  validation {
+    # A catch-all in the last position wins at every instant and silently kills
+    # every policy above it.
+    condition = length(var.autoscaling_policies) <= 1 ? true : !contains(
+      var.autoscaling_policies[length(var.autoscaling_policies) - 1].periods,
+      "* * * * *"
+    )
+    error_message = "The last autoscaling_policies entry must not use the catch-all period [\"* * * * *\"]. The LAST matching policy wins, and a catch-all matches at every instant - so placing it last makes every earlier policy unreachable dead config, and any warm pool you configured silently never exists. Put the catch-all FIRST."
+  }
   validation {
     condition     = alltrue([for p in var.autoscaling_policies : can(regex("^[0-9]+[hms]", p.idle_time))])
     error_message = "autoscaling_policies[*].idle_time must be a Go duration like \"20m0s\" or \"1h\"."
@@ -236,6 +351,16 @@ variable "autoscaling_policies" {
   validation {
     condition     = alltrue([for p in var.autoscaling_policies : length(p.periods) > 0])
     error_message = "autoscaling_policies[*].periods must be non-empty (use [\"* * * * *\"] for always)."
+  }
+  # Positive grammar: these land in config.toml, which travels through a shell
+  # heredoc, so the charset is limited to what cron actually needs.
+  validation {
+    condition = alltrue([
+      for p in var.autoscaling_policies : alltrue([
+        for period in p.periods : can(regex("^[0-9*,/eq A-Za-z-]+$", period))
+      ])
+    ])
+    error_message = "autoscaling_policies[*].periods entries must be unix-cron expressions (digits, letters, and * , - / space only)."
   }
 }
 
@@ -267,7 +392,7 @@ variable "worker_ssh_username" {
   nullable    = false
 
   validation {
-    # this lands in a shell command and in config.toml - keep it a plain username
+    # Lands in a shell command and in config.toml.
     condition     = can(regex("^[a-z_][a-z0-9_-]{0,31}$", var.worker_ssh_username))
     error_message = "worker_ssh_username must be a valid POSIX username (lowercase, no shell metacharacters)."
   }
@@ -296,8 +421,8 @@ variable "worker_instance_types" {
     error_message = "Provide at least one worker instance type (4+ across families recommended for Spot depth)."
   }
   # Graviton families carry a 'g' after the generation digit (m7g, c6gn, t4g).
-  # Mixing architectures plans cleanly and then fails EVERY launch at runtime,
-  # which shows up 15 minutes later as a misleading capacity alarm.
+  # A mismatch plans cleanly and then fails every launch, surfacing 15 minutes
+  # later as a capacity alarm.
   validation {
     condition = alltrue([
       for t in var.worker_instance_types :
@@ -444,16 +569,14 @@ variable "gitlab_runner_version" {
   nullable    = false
 
   validation {
-    # this is interpolated into a package-manager command
+    # Interpolated into a package-manager command.
     condition     = var.gitlab_runner_version == "" || can(regex("^[0-9][0-9a-zA-Z._~+-]*$", var.gitlab_runner_version))
     error_message = "gitlab_runner_version must be a package version string (no shell metacharacters)."
   }
-  # `gitlab-runner fleeting install` landed in 16.11; an older pin bootstraps
-  # most of the way and then dies at the plugin step.
+  # `fleeting install` landed in 16.11; an older pin dies at the plugin step.
   #
-  # Nested ternaries, not `||`: Terraform < 1.10 evaluates BOTH operands of `||`,
-  # so tonumber("") would throw on the empty-string case even though the
-  # left-hand side already answered true.
+  # Nested ternaries rather than ||: Terraform < 1.10 evaluates both operands, so
+  # tonumber("") would throw even when the left side already answered.
   validation {
     condition = var.gitlab_runner_version == "" ? true : (
       try(tonumber(split(".", var.gitlab_runner_version)[0]), 0) > 16 ? true : (
@@ -473,7 +596,7 @@ variable "fleeting_plugin_version" {
   nullable    = false
 
   validation {
-    # this becomes part of the plugin reference in config.toml
+    # Becomes part of the plugin reference in config.toml.
     condition     = var.fleeting_plugin_version == "" || can(regex("^[0-9a-zA-Z._-]+$", var.fleeting_plugin_version))
     error_message = "fleeting_plugin_version must be a version string like \"1.1.0\" (or \"latest\")."
   }
@@ -497,8 +620,8 @@ variable "allow_unpinned_artifacts" {
   default     = false
   nullable    = false
 
-  # Both pinning checks live here rather than on the version variables themselves:
-  # a validation on one referencing the other creates a dependency cycle.
+  # Here rather than on the version variables: two validations referencing each
+  # other's variable is a dependency cycle.
   validation {
     condition     = var.allow_unpinned_artifacts || (var.gitlab_runner_version != "" && var.fleeting_plugin_version != "")
     error_message = "Pin gitlab_runner_version and fleeting_plugin_version, or set allow_unpinned_artifacts = true to accept fetching \"latest\" as root on every manager boot."
@@ -515,11 +638,12 @@ variable "package_repo_script_url" {
   default     = "https://packages.gitlab.com/install/repositories/runner/gitlab-runner/script.rpm.sh"
   nullable    = false
 
+  # Fetched and executed as root, so a positive grammar rather than a deny-list.
+  # URL-safe is not shell-safe: RFC 3986 permits $ ( ) ; ' & and this lands in a
+  # shell word.
   validation {
-    # This value is interpolated into a root-context curl, so anchor the ENTIRE
-    # string to URL-safe characters rather than just checking the scheme prefix.
-    condition     = can(regex("^https://[A-Za-z0-9._~:/?#@!$&'()*+,;=%-]+$", var.package_repo_script_url))
-    error_message = "package_repo_script_url must be an https:// URL containing only URL-safe characters (it is executed as root)."
+    condition     = can(regex("^https://[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]*)?$", var.package_repo_script_url))
+    error_message = "package_repo_script_url must be https://host[:port][/path] using only letters, digits, dot, underscore, tilde, hyphen and slash. Shell metacharacters are rejected because this URL is fetched and executed as root."
   }
 }
 
@@ -588,93 +712,17 @@ variable "imds_hop_limit" {
   }
 }
 
-variable "manager_to_worker_ssh" {
-  description = "Open TCP 22 on workers to the MANAGER's security group only. Required today: the AWS fleeting plugin connects over SSH with an ephemeral EC2 Instance Connect key (SSM tunnelling isn't supported upstream yet). Flip to false the day it is."
-  type        = bool
-  default     = true
+variable "worker_root_device_name" {
+  description = "Root block-device name for workers. Empty = derive it from the AMI, which is what you want: hardcoding /dev/xvda means every disk setting - INCLUDING encryption - is silently ignored on an AMI that names its root device differently."
+  type        = string
+  default     = ""
   nullable    = false
 }
 
-variable "worker_egress_cidrs" {
-  description = <<-EOT
-    Where workers may reach on 443. The default is the public internet with RFC1918
-    carved OUT - because "0.0.0.0/0" is not "the internet": it also covers 10/8,
-    172.16/12, 192.168/16 and everything reachable through your peers and transit
-    gateways, on exactly the port your internal ALBs, EKS API and interface
-    endpoints listen on. CI jobs run attacker-influenceable code; don't hand them a
-    trusted internal source address by default.
-
-    Narrow it further to an allow-list or an egress proxy if you can. Set it back to
-    ["0.0.0.0/0"] only if jobs genuinely need to call internal services.
-  EOT
-  type        = list(string)
-  default = [
-    "0.0.0.0/5", "8.0.0.0/7", "11.0.0.0/8", "12.0.0.0/6", "16.0.0.0/4",
-    "32.0.0.0/3", "64.0.0.0/2", "128.0.0.0/3", "160.0.0.0/5", "168.0.0.0/6",
-    "172.0.0.0/12", "172.32.0.0/11", "172.64.0.0/10", "172.128.0.0/9",
-    "173.0.0.0/8", "174.0.0.0/7", "176.0.0.0/4", "192.0.0.0/9",
-    "192.128.0.0/11", "192.160.0.0/13", "192.169.0.0/16", "192.170.0.0/15",
-    "192.172.0.0/14", "192.176.0.0/12", "192.192.0.0/10", "193.0.0.0/8",
-    "194.0.0.0/7", "196.0.0.0/6", "200.0.0.0/5", "208.0.0.0/4",
-  ]
-  nullable = false
-
-  validation {
-    condition     = length(var.worker_egress_cidrs) > 0
-    error_message = "worker_egress_cidrs must not be empty (workers need to reach GitLab and registries)."
-  }
-  validation {
-    condition     = alltrue([for c in var.worker_egress_cidrs : can(cidrhost(c, 0))])
-    error_message = "worker_egress_cidrs entries must be valid CIDR blocks."
-  }
-}
-
-variable "worker_extra_egress_rules" {
-  description = <<-EOT
-    Additional egress rules for workers, beyond 443 + DNS/NTP. Needed more often
-    than you'd think: an internal registry on 5000, a proxy on 3128, apt over 80,
-    a package mirror on 8080.
-
-      [{ protocol = "tcp", port = 5000, cidrs = ["10.0.0.0/8"] }]
-  EOT
-  type = list(object({
-    protocol = optional(string, "tcp")
-    port     = number
-    cidrs    = list(string)
-  }))
-  default  = []
-  nullable = false
-
-  validation {
-    condition     = alltrue([for r in var.worker_extra_egress_rules : contains(["tcp", "udp"], r.protocol)])
-    error_message = "worker_extra_egress_rules[*].protocol must be tcp or udp."
-  }
-  validation {
-    condition     = alltrue([for r in var.worker_extra_egress_rules : r.port >= 1 && r.port <= 65535])
-    error_message = "worker_extra_egress_rules[*].port must be 1-65535."
-  }
-  validation {
-    condition     = alltrue([for r in var.worker_extra_egress_rules : length(r.cidrs) > 0])
-    error_message = "worker_extra_egress_rules[*].cidrs must be non-empty."
-  }
-}
-
-variable "manager_egress_cidrs" {
-  description = "Where the manager may reach on 443 (GitLab + the AWS APIs it drives the fleet with). Narrow it to your GitLab and AWS endpoint ranges, or front it with a proxy."
-  type        = list(string)
-  default     = ["0.0.0.0/0"]
-  nullable    = false
-
-  validation {
-    condition     = length(var.manager_egress_cidrs) > 0
-    error_message = "manager_egress_cidrs must not be empty."
-  }
-}
-
-variable "dns_egress_cidrs" {
-  description = "Where DNS (and NTP) queries may go. Defaults to the VPC - the Amazon-provided resolver lives at VPC base + 2 and, like everything else, is subject to security-group egress rules. Without this nothing in the fleet can resolve a hostname, so nothing can bootstrap. Set to your resolver's CIDR if you use custom DNS."
-  type        = list(string)
-  default     = []
+variable "manager_root_device_name" {
+  description = "Root block-device name for the manager. Empty = derive it from the AMI."
+  type        = string
+  default     = ""
   nullable    = false
 }
 
@@ -733,7 +781,7 @@ variable "detailed_monitoring" {
 }
 
 # ============================================================================
-# OBSERVABILITY - without this you find out CI is broken from a developer
+# OBSERVABILITY
 # ============================================================================
 
 variable "create_alarms" {
@@ -817,13 +865,13 @@ variable "extra_runner_config_toml" {
   nullable    = false
 
   validation {
-    # Belt-and-braces: the bootstrap heredoc delimiter is name-derived and
-    # unguessable, but reject the obvious literal anyway.
+    # The heredoc delimiter is derived from var.name, so a caller can compute it.
+    # This rejection is what actually stops the breakout.
     condition     = !can(regex("(?m)^\\s*TFCFG_", var.extra_runner_config_toml))
     error_message = "extra_runner_config_toml must not contain a line starting with \"TFCFG_\" (that's the bootstrap heredoc delimiter prefix)."
   }
-  # This is what removes the bare-key trap entirely: the first meaningful line
-  # must open a table, so nothing can bind to the previous one by accident.
+  # Requiring a table header stops a bare key binding to the last policy above.
+  # Note it does NOT stop a second [[runners]] block.
   validation {
     condition = var.extra_runner_config_toml == "" ? true : can(regex(
       "^\\s*(#[^\n]*\n|\\s*\n)*\\s*\\[", var.extra_runner_config_toml
@@ -865,23 +913,3 @@ variable "metrics_listen_address" {
   nullable    = false
 }
 
-variable "s3_endpoint_policy_json" {
-  description = "Policy for the S3 gateway endpoint (only used with create_vpc_endpoints). Empty means full S3 access, which quietly bypasses the 443 egress restrictions - scope it to the buckets your jobs and AMI actually need."
-  type        = string
-  default     = ""
-  nullable    = false
-}
-
-variable "endpoint_private_dns" {
-  description = "Enable private DNS on the interface endpoints. NOTE: this rewrites resolution of ssm/ssmmessages/ec2messages for the ENTIRE VPC, including instances outside this fleet whose security groups can't reach the endpoints - they would lose SSM. Set false if you don't own the VPC."
-  type        = bool
-  default     = true
-  nullable    = false
-}
-
-variable "vpc_endpoint_services" {
-  description = "Interface endpoints to create. The default covers the SSM agent; add \"ec2\", \"autoscaling\", \"cloudwatch\", \"logs\", \"sts\" if you want the module's own control plane off NAT too (each carries an hourly cost per AZ)."
-  type        = list(string)
-  default     = ["ssm", "ssmmessages", "ec2messages"]
-  nullable    = false
-}

@@ -53,10 +53,12 @@ variable "runner_token" {
 module "runners" {
   source = "../../modules/gitlab-runner"
 
-  name              = "ci-dev"
-  vpc_id            = var.vpc_id
-  worker_subnet_ids = var.private_subnet_ids
-  gitlab_url        = "https://gitlab.com"
+  name = "ci-dev"
+  # BYO network. The module creates no SGs, rules or endpoints.
+  manager_security_group_ids = [aws_security_group.manager.id]
+  worker_security_group_ids  = [aws_security_group.worker.id]
+  worker_subnet_ids          = var.private_subnet_ids
+  gitlab_url                 = "https://gitlab.com"
 
   # Sandbox: the token in state is an accepted risk here, not in prod.
   runner_token = var.runner_token
@@ -105,4 +107,68 @@ output "max_concurrent_jobs" {
 output "verify" {
   description = "Paste-ready checks for whether the fleet actually came up."
   value       = module.runners.verify_commands
+}
+
+# ---------------------------------------------------------------------------
+# Network. Yours, not the module's.
+#
+# Minimal internet-connected form, to keep the dev example a usable quick start.
+# For an isolated VPC, replace 0.0.0.0/0 with on-prem CIDRs and endpoint SGs.
+# ---------------------------------------------------------------------------
+resource "aws_security_group" "manager" {
+  name_prefix = "ci-dev-manager-"
+  description = "Runner manager. No inbound."
+  vpc_id      = var.vpc_id
+  lifecycle { create_before_destroy = true }
+}
+
+resource "aws_security_group" "worker" {
+  name_prefix = "ci-dev-worker-"
+  description = "Runner workers. Inbound 22 from the manager SG only."
+  vpc_id      = var.vpc_id
+  lifecycle { create_before_destroy = true }
+}
+
+# The rule the module VERIFIES at plan time. Without it every job hangs.
+resource "aws_vpc_security_group_ingress_rule" "worker_ssh" {
+  security_group_id            = aws_security_group.worker.id
+  referenced_security_group_id = aws_security_group.manager.id
+  ip_protocol                  = "tcp"
+  from_port                    = 22
+  to_port                      = 22
+}
+
+resource "aws_vpc_security_group_egress_rule" "manager_ssh" {
+  security_group_id            = aws_security_group.manager.id
+  referenced_security_group_id = aws_security_group.worker.id
+  ip_protocol                  = "tcp"
+  from_port                    = 22
+  to_port                      = 22
+}
+
+resource "aws_vpc_security_group_egress_rule" "https" {
+  for_each          = { manager = aws_security_group.manager.id, worker = aws_security_group.worker.id }
+  security_group_id = each.value
+  cidr_ipv4         = "0.0.0.0/0"
+  ip_protocol       = "tcp"
+  from_port         = 443
+  to_port           = 443
+}
+
+resource "aws_vpc_security_group_egress_rule" "dns" {
+  for_each = {
+    manager-udp = { sg = aws_security_group.manager.id, p = "udp" }
+    manager-tcp = { sg = aws_security_group.manager.id, p = "tcp" }
+    worker-udp  = { sg = aws_security_group.worker.id, p = "udp" }
+    worker-tcp  = { sg = aws_security_group.worker.id, p = "tcp" }
+  }
+  security_group_id = each.value.sg
+  cidr_ipv4         = data.aws_vpc.this.cidr_block
+  ip_protocol       = each.value.p
+  from_port         = 53
+  to_port           = 53
+}
+
+data "aws_vpc" "this" {
+  id = var.vpc_id
 }
