@@ -1,0 +1,148 @@
+name: install-docker
+description: >-
+  Installs Docker from the Amazon Linux 2023 repositories and applies the daemon
+  settings a CI worker wants. Baking this saves roughly a minute of billed boot
+  time per instance and removes a package fetch from every launch.
+schemaVersion: 1.0
+
+parameters:
+  - DockerUser:
+      type: string
+      description: >-
+        User added to the docker group. Membership in that group is
+        root-equivalent - the socket accepts a container request that mounts the
+        host filesystem - so this is a real privilege grant, not a convenience.
+      default: ec2-user
+  - LiveRestore:
+      type: string
+      description: >-
+        Keep containers running across a daemon restart. Correct for long-lived
+        hosts, wrong for one-job-per-instance CI workers where a daemon restart
+        should take the job with it.
+      default: "false"
+  - LogMaxSize:
+      type: string
+      description: Per-container log file size cap, e.g. 100m.
+      default: 100m
+  - LogMaxFiles:
+      type: string
+      description: Number of rotated log files kept per container.
+      default: "3"
+
+phases:
+  - name: build
+    steps:
+      - name: InstallDocker
+        action: ExecuteBash
+        inputs:
+          commands:
+            - |
+              set -euo pipefail
+              dnf install -y docker
+
+      - name: ConfigureDaemon
+        action: ExecuteBash
+        inputs:
+          commands:
+            - |
+              set -euo pipefail
+              install -d -m 0755 /etc/docker
+              # Unbounded json-file logs are the usual way a CI worker's root
+              # volume fills mid-job.
+              cat > /etc/docker/daemon.json <<'EOF'
+              {
+                "log-driver": "json-file",
+                "log-opts": {
+                  "max-size": "{{ LogMaxSize }}",
+                  "max-file": "{{ LogMaxFiles }}"
+                },
+                "live-restore": {{ LiveRestore }},
+                "no-new-privileges": true,
+                "icc": false,
+                "userland-proxy": false
+              }
+              EOF
+              chmod 0644 /etc/docker/daemon.json
+              python3 -c 'import json,sys; json.load(open("/etc/docker/daemon.json"))'
+
+      - name: AddUserToDockerGroup
+        action: ExecuteBash
+        inputs:
+          commands:
+            - |
+              set -euo pipefail
+              if id -u '{{ DockerUser }}' >/dev/null 2>&1; then
+                usermod -aG docker '{{ DockerUser }}'
+              else
+                echo "WARNING: user {{ DockerUser }} does not exist in this image; skipping group add." >&2
+              fi
+
+      - name: EnableDocker
+        action: ExecuteBash
+        inputs:
+          commands:
+            - |
+              set -euo pipefail
+              systemctl enable docker
+
+      - name: Cleanup
+        action: ExecuteBash
+        inputs:
+          commands:
+            - |
+              set -euo pipefail
+              dnf clean all
+              rm -rf /var/cache/dnf
+
+  - name: test
+    steps:
+      - name: DaemonStartsAndResponds
+        action: ExecuteBash
+        inputs:
+          commands:
+            - |
+              set -euo pipefail
+              systemctl start docker
+              # Retry: the socket is not ready the instant systemd returns.
+              for _ in $(seq 1 30); do
+                if docker info >/dev/null 2>&1; then exit 0; fi
+                sleep 2
+              done
+              echo "FATAL: docker did not become ready within 60s" >&2
+              docker info || true
+              exit 1
+
+      - name: DaemonConfigIsValidAndApplied
+        action: ExecuteBash
+        inputs:
+          commands:
+            - |
+              set -euo pipefail
+              python3 -c 'import json,sys; json.load(open("/etc/docker/daemon.json"))'
+              # Asserts the daemon actually read the file, rather than that the
+              # file merely exists.
+              docker info --format '{{ "{{" }}.LoggingDriver{{ "}}" }}' | grep -qx json-file
+
+      - name: EnabledOnBoot
+        action: ExecuteBash
+        inputs:
+          commands:
+            - |
+              set -euo pipefail
+              systemctl is-enabled docker | grep -qx enabled
+
+      - name: NoRegistryCredentialsBakedIn
+        action: ExecuteBash
+        inputs:
+          commands:
+            - |
+              set -euo pipefail
+              # A registry credential in an AMI is distributed to everyone who
+              # can launch it.
+              for f in /root/.docker/config.json /home/*/.docker/config.json; do
+                [ -e "$f" ] || continue
+                if grep -q '"auth"' "$f" 2>/dev/null; then
+                  echo "FATAL: registry credentials baked into $f" >&2
+                  exit 1
+                fi
+              done

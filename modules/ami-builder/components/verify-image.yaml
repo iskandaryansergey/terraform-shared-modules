@@ -1,0 +1,170 @@
+name: verify-image
+description: >-
+  Generic assertions to run last, in the test phase only. This component has no
+  build phase on purpose - it exists to fail a build that produced an image you
+  should not launch. Every check here is about the image as an artifact rather
+  than about any particular payload, so it is safe to append to any recipe.
+schemaVersion: 1.0
+
+parameters:
+  - MinFreeRootGb:
+      type: string
+      description: >-
+        Minimum free space on the root filesystem. An image with almost no
+        headroom produces instances that fill up on their first real workload.
+      default: "4"
+  - RequireSsmAgent:
+      type: string
+      description: >-
+        Assert the SSM agent is installed and enabled. Set "false" only when
+        uninstall_ssm_agent_after_build is deliberately true.
+      default: "true"
+  - ForbiddenPaths:
+      type: string
+      description: >-
+        Space-separated paths that must not exist in the finished image. Add
+        anything your own build is known to leave behind.
+      default: "/root/.aws/credentials /root/.ssh/id_rsa /etc/gitlab-runner/config.toml"
+
+phases:
+  # Runs on the BUILD instance. cloud-init regenerates its state on the test
+  # instance's first boot, so this assertion is impossible to make in the test
+  # phase - it failed every build there.
+  - name: validate
+    steps:
+      - name: CloudInitStateCleared
+        action: ExecuteBash
+        inputs:
+          commands:
+            - |
+              set -euo pipefail
+              # A baked cloud-init instance state makes the first boot from this
+              # AMI skip user-data, because cloud-init believes it has already
+              # run on this instance.
+              # Checks the directory as well as the symlink: removing only
+              # the symlink left instances/<id>/user-data.txt in the image and
+              # still passed a step named CloudInitStateCleared.
+              RC=0
+              for p in /var/lib/cloud/instance /var/lib/cloud/instances /var/lib/amazon/toe; do
+                if [ -e "$p" ]; then
+                  echo "FATAL: $p is baked into the image" >&2
+                  RC=1
+                fi
+              done
+              exit "$RC"
+
+  - name: test
+    steps:
+      - name: RootFilesystemHasHeadroom
+        action: ExecuteBash
+        inputs:
+          commands:
+            - |
+              set -euo pipefail
+              case "{{ MinFreeRootGb }}" in
+                ''|*[!0-9]*)
+                  echo "FATAL: MinFreeRootGb must be a whole number, got '{{ MinFreeRootGb }}'" >&2
+                  exit 1 ;;
+              esac
+              AVAIL_KB="$(df --output=avail -k / | tail -1 | tr -d ' ')"
+              AVAIL_GB=$(( AVAIL_KB / 1024 / 1024 ))
+              echo "free on /: ${AVAIL_GB}GB"
+              if [ "$AVAIL_GB" -lt "{{ MinFreeRootGb }}" ]; then
+                echo "FATAL: only ${AVAIL_GB}GB free on /, want at least {{ MinFreeRootGb }}GB. Raise root_volume_size_gb." >&2
+                df -h /
+                exit 1
+              fi
+
+      - name: SsmAgentPresent
+        action: ExecuteBash
+        inputs:
+          commands:
+            - |
+              set -euo pipefail
+              if [ "{{ RequireSsmAgent }}" != "true" ]; then
+                echo "SSM agent check skipped by parameter."
+                exit 0
+              fi
+              # The agent is how an operator reaches an instance without SSH. If
+              # it is missing, the first incident on this image has no access
+              # path at all.
+              systemctl is-enabled amazon-ssm-agent 2>/dev/null | grep -qx enabled
+
+      - name: NoForbiddenPaths
+        action: ExecuteBash
+        inputs:
+          commands:
+            - |
+              set -euo pipefail
+              RC=0
+              for p in {{ ForbiddenPaths }}; do
+                if [ -e "$p" ]; then
+                  echo "FATAL: forbidden path present in image: $p" >&2
+                  RC=1
+                fi
+              done
+              exit "$RC"
+
+      - name: NoPlaintextCloudCredentials
+        action: ExecuteBash
+        inputs:
+          commands:
+            - |
+              set -euo pipefail
+              # An AWS access key baked into an AMI is a long-lived credential
+              # handed to everyone who can launch it. Matches the key-id shape
+              # rather than the word "secret", which catches the real thing and
+              # not a variable named after it.
+              # /var included: AWSTOE's own logs under /var/lib/amazon/toe and
+              # cloud-init's user-data copy both live there.
+              HITS="$(grep -rIlE '(AKIA|ASIA)[0-9A-Z]{16}' /etc /var /root /home /opt /srv 2>/dev/null || true)"
+              if [ -n "$HITS" ]; then
+                echo "FATAL: AWS access key material found in:" >&2
+                echo "$HITS" >&2
+                exit 1
+              fi
+
+      - name: NoWorldWritableFilesInSystemPaths
+        action: ExecuteBash
+        inputs:
+          commands:
+            - |
+              set -euo pipefail
+              # Excludes the sticky-bit directories where world-writable is
+              # correct (/tmp, /var/tmp) and looks at files only.
+              HITS="$(find /etc /usr /opt -xdev -type f -perm -0002 2>/dev/null || true)"
+              if [ -n "$HITS" ]; then
+                echo "FATAL: world-writable files in system paths:" >&2
+                echo "$HITS" >&2
+                exit 1
+              fi
+
+      - name: NoEmptyPasswordAccounts
+        action: ExecuteBash
+        inputs:
+          commands:
+            - |
+              set -euo pipefail
+              HITS="$(awk -F: '($2 == "") {print $1}' /etc/shadow || true)"
+              if [ -n "$HITS" ]; then
+                echo "FATAL: accounts with empty passwords: $HITS" >&2
+                exit 1
+              fi
+
+      - name: ReportImageInventory
+        action: ExecuteBash
+        inputs:
+          commands:
+            - |
+              set -euo pipefail
+              # Not an assertion. This lands in the build log so the artifact's
+              # contents are recorded next to the build that produced it.
+              echo "=== image inventory ==="
+              cat /etc/os-release | grep -E '^(NAME|VERSION)='
+              uname -r
+              echo "--- kernel cmdline ---"
+              cat /proc/cmdline
+              echo "--- installed package count ---"
+              rpm -qa | wc -l
+              echo "--- enabled services ---"
+              systemctl list-unit-files --state=enabled --no-pager --no-legend | awk '{print $1}' | sort

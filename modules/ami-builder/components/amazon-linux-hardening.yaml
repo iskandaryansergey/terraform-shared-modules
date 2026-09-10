@@ -1,0 +1,244 @@
+name: amazon-linux-hardening
+description: >-
+  A baseline for Amazon Linux 2023. This is not a CIS or STIG certification -
+  where you need an attestable benchmark, use the AWS-managed
+  stig-build-linux-high component and reference it by arn instead. What this
+  gives you is the subset that is safe to apply unconditionally, does not break
+  a CI worker, and is verified in the test phase rather than merely asserted.
+schemaVersion: 1.0
+
+parameters:
+  - AllowPasswordAuth:
+      type: string
+      description: >-
+        Leave sshd password authentication enabled. Must be "yes" or "no" - these
+        are the tokens sshd_config actually takes and the ones `sshd -T` echoes
+        back. It previously defaulted to "false", which sshd does not accept, so
+        the default path would have failed at `sshd -t`.
+      default: "no"
+  - JournalMaxSize:
+      type: string
+      description: Cap on persistent journal size, e.g. 500M. Prevents logs filling the root volume.
+      default: 500M
+
+phases:
+  - name: build
+    steps:
+      - name: ApplyPendingSecurityUpdates
+        action: ExecuteBash
+        inputs:
+          commands:
+            - |
+              set -euo pipefail
+              dnf update -y --security
+              # This makes the image non-reproducible over time by design: the
+              # same recipe built next month picks up newer packages.
+              #
+              # Note what that does NOT do. The pipeline's
+              # EXPRESSION_MATCH_AND_DEPENDENCY_UPDATES_AVAILABLE condition
+              # evaluates the base image and component VERSIONS, not the package
+              # repository - so it cannot notice that new packages exist. With a
+              # pinned parent you need EXPRESSION_MATCH_ONLY for a monthly
+              # rebuild to happen at all. An earlier version of this comment
+              # claimed the opposite.
+
+      - name: HardenSshd
+        action: ExecuteBash
+        inputs:
+          commands:
+            - |
+              set -euo pipefail
+              install -d -m 0755 /etc/ssh/sshd_config.d
+              # A drop-in rather than an edit of sshd_config: AL2023 ships an
+              # Include, and rewriting the main file loses upstream changes on
+              # the next package update.
+              cat > /etc/ssh/sshd_config.d/50-hardening.conf <<'EOF'
+              PermitRootLogin no
+              PasswordAuthentication {{ AllowPasswordAuth }}
+              ChallengeResponseAuthentication no
+              KbdInteractiveAuthentication no
+              PermitEmptyPasswords no
+              X11Forwarding no
+              MaxAuthTries 4
+              ClientAliveInterval 300
+              ClientAliveCountMax 2
+              EOF
+              chmod 0600 /etc/ssh/sshd_config.d/50-hardening.conf
+              # Validate before the image is sealed. A malformed drop-in makes
+              # sshd fail to start on first boot, and on an instance whose only
+              # other access path is SSM that is recoverable but alarming.
+              sshd -t
+
+      - name: BoundJournalSize
+        action: ExecuteBash
+        inputs:
+          commands:
+            - |
+              set -euo pipefail
+              install -d -m 0755 /etc/systemd/journald.conf.d
+              cat > /etc/systemd/journald.conf.d/50-size.conf <<'EOF'
+              [Journal]
+              SystemMaxUse={{ JournalMaxSize }}
+              EOF
+              chmod 0644 /etc/systemd/journald.conf.d/50-size.conf
+
+      - name: KernelNetworkHardening
+        action: ExecuteBash
+        inputs:
+          commands:
+            - |
+              set -euo pipefail
+              # Deliberately excludes ip_forward: Docker requires it, and a
+              # hardening component that silently breaks container networking is
+              # worse than no hardening component.
+              cat > /etc/sysctl.d/50-hardening.conf <<'EOF'
+              net.ipv4.conf.all.accept_redirects = 0
+              net.ipv4.conf.all.send_redirects = 0
+              net.ipv4.conf.all.accept_source_route = 0
+              net.ipv4.conf.all.log_martians = 1
+              net.ipv4.conf.all.rp_filter = 1
+              net.ipv6.conf.all.accept_redirects = 0
+              net.ipv6.conf.all.accept_source_route = 0
+              kernel.randomize_va_space = 2
+              fs.suid_dumpable = 0
+              EOF
+              chmod 0644 /etc/sysctl.d/50-hardening.conf
+
+      - name: RemoveBuildArtifacts
+        action: ExecuteBash
+        inputs:
+          commands:
+            - |
+              set -euo pipefail
+              # Everything below is a real source of leaked material in AMIs.
+              rm -f /root/.bash_history /home/*/.bash_history
+              rm -f /root/.ssh/authorized_keys
+              rm -rf /var/lib/cloud/instances /var/lib/cloud/instance
+              rm -f /etc/ssh/ssh_host_*
+              # Host keys are regenerated on first boot. Baking them means every
+              # instance from this AMI shares one host identity, which defeats
+              # host-key verification entirely.
+              truncate -s 0 /var/log/wtmp /var/log/lastlog 2>/dev/null || true
+              dnf clean all
+              # NOT /tmp/* or /var/tmp/*: working_directory defaults to /tmp,
+              # where AWSTOE stages the remaining component documents, the
+              # generated step scripts and this run's log. Deleting it mid-build
+              # takes out the logs for the build you needed them for. dnf clean
+              # all above already handles the package cache, and /tmp does not
+              # survive to the AMI anyway.
+              rm -rf /var/cache/dnf
+
+  # validate runs on the BUILD instance, before the snapshot. test runs on a new
+  # instance booted FROM that snapshot, where cloud-init has already regenerated
+  # host keys and written authorized_keys - so these two assertions can only be
+  # made here. Placed in test they failed every single build.
+  #
+  # There is also an internal proof they cannot live in test: that phase runs
+  # `sshd -t`, which fails when no host keys exist, while NoHostKeysBakedIn
+  # requires that none exist. Mutually unsatisfiable on one instance.
+  - name: validate
+    steps:
+      - name: NoHostKeysBakedIn
+        action: ExecuteBash
+        inputs:
+          commands:
+            - |
+              set -euo pipefail
+              if ls /etc/ssh/ssh_host_* >/dev/null 2>&1; then
+                echo "FATAL: SSH host keys are present in the image; every instance would share one identity." >&2
+                exit 1
+              fi
+
+      - name: NoAuthorizedKeysBakedIn
+        action: ExecuteBash
+        inputs:
+          commands:
+            - |
+              set -euo pipefail
+              FOUND="$(find /root /home -name authorized_keys -size +0 2>/dev/null || true)"
+              if [ -n "$FOUND" ]; then
+                echo "FATAL: a non-empty authorized_keys is baked into the image: $FOUND" >&2
+                exit 1
+              fi
+
+  - name: test
+    steps:
+      - name: SshdConfigIsValid
+        action: ExecuteBash
+        inputs:
+          commands:
+            - |
+              set -euo pipefail
+              sshd -t
+
+      - name: RootLoginRefused
+        action: ExecuteBash
+        inputs:
+          commands:
+            - |
+              set -euo pipefail
+              # Reads sshd's effective config rather than grepping a file, so an
+              # override elsewhere cannot make this pass falsely.
+              sshd -T 2>/dev/null | grep -qx 'permitrootlogin no'
+
+      - name: PasswordAuthMatchesRequest
+        action: ExecuteBash
+        inputs:
+          commands:
+            - |
+              set -euo pipefail
+              # Asserts the POSTURE, not the request. Grepping for
+              # "passwordauthentication {{ AllowPasswordAuth }}" passed happily
+              # with password auth enabled, while the README presented this as a
+              # hardening assertion.
+              case '{{ AllowPasswordAuth }}' in
+                yes|no) : ;;
+                *) echo "FATAL: AllowPasswordAuth must be yes or no, got '{{ AllowPasswordAuth }}'" >&2; exit 1 ;;
+              esac
+              if [ '{{ AllowPasswordAuth }}' = "yes" ]; then
+                echo "WARNING: password authentication is deliberately ENABLED in this image." >&2
+                exit 0
+              fi
+              sshd -T 2>/dev/null | grep -qx 'passwordauthentication no'
+
+      - name: SysctlFilePresentAndParsable
+        action: ExecuteBash
+        inputs:
+          commands:
+            - |
+              set -euo pipefail
+              test -f /etc/sysctl.d/50-hardening.conf
+              # Asserts the kernel accepts every key, catching a typo that would
+              # otherwise be silently ignored at boot.
+              sysctl -p /etc/sysctl.d/50-hardening.conf >/dev/null
+
+      - name: IpForwardNotDisabled
+        action: ExecuteBash
+        inputs:
+          commands:
+            - |
+              set -euo pipefail
+              # Guards against a future edit adding ip_forward = 0, which would
+              # break Docker networking on every worker built from this image.
+              if grep -qE '^\s*net\.ipv4\.ip_forward\s*=\s*0' /etc/sysctl.d/50-hardening.conf; then
+                echo "FATAL: ip_forward is disabled, which breaks container networking." >&2
+                exit 1
+              fi
+
+      - name: NoSecurityUpdatesOutstanding
+        action: ExecuteBash
+        inputs:
+          commands:
+            - |
+              set -euo pipefail
+              # dnf exits 100 when updates are available, 0 when none are.
+              # Capture the status directly: after an if...fi whose branch was
+              # not taken, $? is the compound statement's 0, not dnf's, so the
+              # old `if [ "$?" = "100" ]` form was unreachable dead code.
+              rc=0
+              dnf check-update --security -q >/dev/null 2>&1 || rc=$?
+              case "$rc" in
+                0) echo "no outstanding security updates" ;;
+                100) echo "WARNING: security updates appeared after the build step ran." >&2 ;;
+                *) echo "FATAL: dnf check-update failed with $rc" >&2; exit 1 ;;
+              esac
