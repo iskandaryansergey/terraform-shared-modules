@@ -1,13 +1,11 @@
-# Smallest configuration that is still honest about what a governed image
-# pipeline needs.
+# The smallest configuration that's still honest about what a governed image
+# pipeline needs. It wants a real VPC, so it's a quick-start you can apply
+# rather than a snippet - and `terraform plan` here is the CI gate that catches
+# an example that no longer plans.
 #
-# It plans against a real VPC, so it is a quick-start you can actually apply
-# rather than a snippet. `terraform plan` here is also the CI gate that catches
-# an in-module example that cannot plan.
-#
-# What this produces: a hardened Amazon Linux 2023 image with Docker, rebuilt on
-# the first of each month, published to an SSM parameter, deprecated at 30 days
-# and deleted at 180 with the last three and anything recently launched exempt.
+# What you get: a hardened Amazon Linux 2023 image with Docker, rebuilt on the
+# first of each month, published to an SSM parameter, deprecated at 30 days and
+# deleted at 180 - with the last three and anything recently launched exempt.
 
 terraform {
   required_version = ">= 1.9.0"
@@ -44,18 +42,15 @@ variable "log_bucket" {
   type        = string
 }
 
-# Pinning the parent image is the difference between an artifact you can
-# reproduce and one you cannot. Resolving it through a data source here keeps the
-# example runnable while still handing the module a concrete AMI id: the value
-# the module receives is a specific image, and it is recorded in state.
+# Pinning the parent is the difference between an artifact you can reproduce and
+# one you can't. A data source keeps the example runnable while still handing the
+# module a concrete AMI id, which is what ends up in state.
 #
-# For a truly reproducible pipeline, replace this with a literal ami-... that you
-# bump deliberately. Note that governance.parent_image_pinned will report true
-# either way - it reads the value the module receives, which is a concrete AMI
-# id. What moves is which id most_recent resolves to on your next plan, and
-# governance.components_fetch_from_moving_sources reports the other half: the
-# bundled components run dnf without version pins, so a pinned parent alone does
-# not make the image byte-reproducible.
+# For a genuinely reproducible pipeline, replace this with a literal ami-... you
+# bump on purpose. governance.parent_image_pinned reports true either way - it
+# sees a concrete id - and what moves is which id most_recent picks on your next
+# plan. governance.components_fetch_from_moving_sources covers the other half:
+# the bundled components run dnf with no version pins.
 data "aws_ami" "al2023" {
   owners      = ["amazon"]
   most_recent = true
@@ -80,11 +75,12 @@ module "base_image" {
   parent_image = data.aws_ami.al2023.id
 
   components = [
-    # Note there is no update-linux component here. The bundled hardening
-    # component already runs `dnf update --security`, and stacking the
-    # AWS-managed full-update component in front of it pays a second metadata
-    # refresh for packages the first pass has already applied.
-    # Shipped with the module. Versioned with it, rather than copy-pasted here.
+    # No update-linux component on purpose: the bundled hardening component
+    # already runs `dnf update --security`, and stacking the AWS-managed
+    # full-update component in front of it pays for a second metadata refresh.
+    #
+    # bundled = shipped with the module, so it stays versioned with the module
+    # instead of copy-pasted in here.
     {
       name    = "hardening"
       bundled = "amazon-linux-hardening"
@@ -119,19 +115,18 @@ module "base_image" {
 
   # First of the month at 03:00 Dublin.
   #
-  # EXPRESSION_MATCH_ONLY, not the module's default. The default only builds
-  # when the base image or a component VERSION changed - it cannot see that new
-  # packages exist in the repository. With a pinned parent and content-addressed
-  # components, nothing ever changes between applies, so the default would give
-  # you a cron that never fires and a patching baseline that never patches.
-  # Building unconditionally costs about $0.04 a month.
+  # EXPRESSION_MATCH_ONLY rather than the module's default. The default only
+  # builds when the base image or a component version changed, and it can't see
+  # that new packages exist in the repo - so with a pinned parent and
+  # content-addressed components you'd get a cron that never fires and a
+  # patching baseline that never patches. Building anyway costs ~$0.04/month.
   schedule_expression                = "cron(0 3 1 * ? *)"
   schedule_timezone                  = "Europe/Dublin"
   pipeline_execution_start_condition = "EXPRESSION_MATCH_ONLY"
 
-  # Retention. Snapshot storage is the only line that grows without bound, so
-  # deletion is on - at a long horizon, with the recency exemption protecting
-  # anything still being launched.
+  # Snapshot storage is the only line that grows without bound, so deletion is
+  # on - at a long horizon, with the recency exemption covering anything still
+  # being launched.
   lifecycle_deprecate_after_days           = 30
   lifecycle_delete_after_days              = 180
   lifecycle_retain_at_least                = 3

@@ -29,7 +29,7 @@ resource "aws_iam_role_policy_attachment" "build_imagebuilder" {
   policy_arn = "${local.managed_policy_prefix}/EC2InstanceProfileForImageBuilder"
 }
 
-# Image Builder drives the instance through SSM RunCommand. Not for operator
+# Image Builder drives the instance through SSM RunCommand. Not about operator
 # access - without this nothing runs at all.
 resource "aws_iam_role_policy_attachment" "build_ssm" {
   count = local.create_build_role ? 1 : 0
@@ -51,7 +51,7 @@ resource "aws_iam_role_policy" "build" {
 }
 
 # for_each, not count: with count.index, removing a middle entry re-indexes and
-# therefore churns every attachment after it.
+# churns every attachment after it.
 resource "aws_iam_role_policy_attachment" "build_additional" {
   for_each = local.create_build_role ? toset(var.additional_build_policy_arns) : toset([])
 
@@ -83,7 +83,7 @@ resource "aws_iam_role" "lifecycle" {
       Effect    = "Allow"
       Action    = "sts:AssumeRole"
       Principal = { Service = "imagebuilder.amazonaws.com" }
-      # Confused deputy: without this, any account's Image Builder principal
+      # Confused deputy: without these, any account's Image Builder principal
       # can assume the role.
       Condition = {
         StringEquals = { "aws:SourceAccount" = local.account_id }

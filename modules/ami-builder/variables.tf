@@ -1,14 +1,14 @@
-# Everything is nullable = false, and anything reaching an AWS API or a document
-# that runs as root gets a validation.
+# Everything is nullable = false, and anything that reaches an AWS API or a
+# document running as root gets a validation.
 #
 # Two rules if you add one:
 #
-#   - Nested ternaries, can(), or alltrue([for ...]). Never `x == "" || f(x)`:
-#     1.9 evaluates both sides, so a throwing RHS crashes on the floor version
-#     and passes on current. tests/lint_validations.py checks it.
+#   - Ternaries, can(), or alltrue([for ...]). Never `x == "" || f(x)` - 1.9
+#     evaluates both sides, so a throwing right-hand side crashes on the floor
+#     version and passes on current. tests/lint_validations.py enforces it.
 #
-#   - Component documents are arbitrary root-level YAML. That's the module's job,
-#     so the capability can't be removed. What we do instead is reject malformed
+#   - Component documents are arbitrary root-level YAML, and that is the point
+#     of the module, so the capability stays. What we can do is reject malformed
 #     documents at plan time and ship a linter for the dangerous shapes.
 
 variable "create" {
@@ -24,8 +24,8 @@ variable "name" {
   nullable    = false
 
   validation {
-    # 50 is the binding limit: the AMI name becomes
-    # "${name}-{{ imagebuilder:buildDate }}" against a 128-char ceiling.
+    # 50 is the real ceiling: the AMI name becomes
+    # "${name}-{{ imagebuilder:buildDate }}" against a 128-char limit.
     condition     = can(regex("^[a-z][a-z0-9-]{1,49}$", var.name))
     error_message = "name must be 2-50 chars, lowercase alphanumeric or hyphen, starting with a letter."
   }
@@ -169,7 +169,7 @@ variable "components" {
   }
 
   validation {
-    # Parse now. Otherwise it fails 20 minutes into a build you've paid for.
+    # Parse it now, or it fails 20 minutes into a build you've paid for.
     condition = alltrue([
       for c in var.components : can(yamldecode(c.document)) if c.document != ""
     ])
@@ -177,8 +177,8 @@ variable "components" {
   }
 
   validation {
-    # AWSTOE needs these. Checking at plan time turns the most common component
-    # mistake into a plan error.
+    # AWSTOE needs both keys. Checking here turns the most common component
+    # mistake into a plan error instead of a build failure.
     condition = alltrue([
       for c in var.components :
       can(yamldecode(c.document).schemaVersion) && can(yamldecode(c.document).phases)
@@ -211,19 +211,17 @@ variable "components" {
   }
 
   validation {
-    # AWSTOE substitutes {{ Param }} into the DOCUMENT TEXT before bash sees it,
-    # so a heredoc's quoting protects nothing against a parameter value. A value
-    # containing a newline can terminate a heredoc early and execute the
-    # following lines as root; an unquoted use can execute a command
-    # substitution outright.
+    # AWSTOE substitutes {{ Param }} into the document text before bash sees it,
+    # so a heredoc's quoting protects nothing here. A value with a newline can
+    # close a heredoc early and run the following lines as root; an unquoted one
+    # can run a command substitution outright.
     #
-    # This matters because parameter values are a lower-trust channel than the
-    # component list itself: the shipped examples wire them to root-module
-    # variables, so a CI variable whose job is to bump a version number would
-    # otherwise be root code execution in the golden-image pipeline.
+    # Parameter values are a lower-trust channel than the component list: the
+    # examples wire them to root-module variables, so a CI variable whose job is
+    # to bump a version number would otherwise be code execution in the
+    # golden-image pipeline.
     #
-    # The allowed set covers every legitimate bundled value, including the
-    # space-separated ForbiddenPaths list.
+    # The allowed set covers every legitimate bundled value, spaces included.
     condition = alltrue([
       for c in var.components : alltrue([
         for k, v in c.parameters : can(regex("^[A-Za-z0-9 ._:/=,+@-]*$", v))
@@ -233,9 +231,9 @@ variable "components" {
   }
 
   validation {
-    # RunnerVersion has an empty default and the component hard-fails on it at
-    # step one, four minutes into a build. bundled is a closed set of documents
-    # this module can read, so the check belongs at plan time.
+    # RunnerVersion defaults to empty and the component hard-fails on it at step
+    # one, four minutes in. bundled is a closed set of documents we can read, so
+    # this belongs at plan time.
     condition = alltrue([
       for c in var.components :
       c.bundled != "install-gitlab-runner" ? true : (
@@ -328,8 +326,8 @@ variable "root_volume_iops" {
   }
 
   validation {
-    # io1 and io2 cap at 50 IOPS per GiB. The defaults (30 GB, 3000 IOPS) exceed
-    # that by 2x, so io1 was accepted at plan and rejected at build time.
+    # io1/io2 cap at 50 IOPS per GiB, and the defaults (30 GB, 3000 IOPS) are 2x
+    # over that - fine at plan time, rejected at build time.
     condition = contains(["io1", "io2"], var.root_volume_type) ? (
       var.root_volume_iops <= var.root_volume_size_gb * 50
     ) : true
@@ -409,9 +407,9 @@ variable "additional_block_devices" {
   }
 
   validation {
-    # Unvalidated, an arbitrary - including a third party's public - snapshot
-    # could be baked in as a data volume with nothing to see it. Note that
-    # verify-image's scans use find -xdev and will not cross into it.
+    # Otherwise any snapshot, a stranger's public one included, can be baked in
+    # as a data volume with nothing to catch it - and verify-image scans with
+    # find -xdev, so it won't look inside either.
     condition = alltrue([
       for d in var.additional_block_devices :
       d.snapshot_id == "" ? true : can(regex("^snap-[0-9a-f]{8,17}$", d.snapshot_id))
@@ -420,7 +418,7 @@ variable "additional_block_devices" {
   }
 
   validation {
-    # st1/sc1 have a 125 GB minimum. Accepted at plan, rejected at build time.
+    # st1/sc1 have a 125 GB minimum - fine at plan time, rejected at build time.
     condition = alltrue([
       for d in var.additional_block_devices :
       contains(["st1", "sc1"], d.volume_type) ? d.size_gb >= 125 : true
@@ -433,8 +431,8 @@ variable "additional_block_devices" {
 # Versioning
 #
 # Component and recipe versions are immutable. Edit a document without bumping
-# the version and the API rejects it - the most common papercut with this
-# service. auto_version derives the version from the content so it can't happen.
+# the version and the API says no, which is the papercut everyone hits once.
+# auto_version derives the version from the content so it can't happen.
 # ---------------------------------------------------------------------------
 
 variable "auto_version" {
@@ -735,9 +733,9 @@ variable "distribution_kms_key_arns" {
   nullable    = false
 
   validation {
-    # Keys first. They were unvalidated AND interpolated straight into the regex
-    # below, so a metacharacter in a key altered the pattern - and a typo'd key
-    # silently matched no distribution region and contributed nothing.
+    # Keys first, because they get interpolated into the regex below: a
+    # metacharacter in a key would rewrite the pattern, and a typo'd key matches
+    # no distribution region and contributes nothing.
     condition = alltrue([
       for r in keys(var.distribution_kms_key_arns) :
       can(regex("^[a-z]{2}(-[a-z]+)+-[0-9]$", r))
@@ -782,10 +780,17 @@ variable "ami_name_prefix" {
 }
 
 variable "ami_description" {
-  description = "Description on the produced AMI. Empty falls back to description, then to a generated one."
+  description = "Description on the produced AMI. Empty falls back to description, then to a generated one. EC2 caps an AMI description at 255 characters, which is shorter than description allows."
   type        = string
   default     = ""
   nullable    = false
+
+  validation {
+    # description allows 1024 and falls through to here, so the resolved value
+    # is checked again on the distribution config.
+    condition     = length(var.ami_description) <= 255
+    error_message = "ami_description must be 255 characters or fewer; that is EC2's limit for an AMI description, and exceeding it fails at the distribution step after the build has already run."
+  }
 }
 
 variable "ami_tags" {
@@ -847,7 +852,7 @@ variable "launch_permission" {
       for a in var.launch_permission.organization_arns :
       can(regex("^arn:aws[a-z-]*:organizations::[0-9]{12}:organization/o-[0-9a-z]{10,32}$", a))
     ])
-    error_message = "launch_permission.organization_arns entries must be AWS Organizations organization ARNs. These had no validation at all, so a typo - or another company's organization id - was accepted silently."
+    error_message = "launch_permission.organization_arns entries must be AWS Organizations organization ARNs; a typo, or another company's organization id, would otherwise be accepted silently."
   }
 
   validation {
@@ -929,8 +934,8 @@ variable "fast_launch" {
 
   validation {
     # Windows-only in practice. On a Linux image it buys nothing and bills
-    # target_resource_count pre-provisioned snapshots per AMI - a 6x multiplier
-    # at the default of 5, on the one cost line that grows without bound.
+    # target_resource_count pre-provisioned snapshots per AMI - 5 by default, on
+    # the one cost line that already grows without bound.
     condition = !var.fast_launch.enabled ? true : anytrue([
       for c in var.components : c.platform == "Windows"
     ])
@@ -961,7 +966,7 @@ variable "schedule_expression" {
   }
 
   validation {
-    # Image Builder wants 6 fields; EventBridge takes 5. Easy to get wrong by
+    # Image Builder wants 6 fields, EventBridge takes 5. Easy to get wrong by
     # copying a rule.
     condition     = can(regex("^cron\\(", var.schedule_expression)) ? length(split(" ", trimsuffix(trimprefix(var.schedule_expression, "cron("), ")"))) == 6 : true
     error_message = "a cron() schedule_expression must have 6 fields: minute hour day-of-month month day-of-week year. Image Builder rejects the 5-field EventBridge form."
@@ -1252,7 +1257,7 @@ variable "additional_build_policy_arns" {
 
   validation {
     condition     = length(var.additional_build_policy_arns) <= 8
-    error_message = "additional_build_policy_arns must contain 8 entries or fewer: IAM's default quota is 10 managed policies per role and this module already attaches 2. The previous limit of 10 allowed a configuration that failed at AttachRolePolicy."
+    error_message = "additional_build_policy_arns must contain 8 entries or fewer: IAM's default quota is 10 managed policies per role and this module already attaches 2."
   }
 
   validation {
@@ -1284,6 +1289,18 @@ variable "create_event_rule" {
   type        = bool
   default     = true
   nullable    = false
+}
+
+variable "event_dead_letter_queue_arn" {
+  description = "SQS queue for build notifications EventBridge could not deliver. Worth setting: a publish rejected by the topic policy, or by the key policy of an encrypted topic, is discarded with nothing anywhere going red - so the first time you notice is a build that failed quietly weeks ago. The queue's policy must allow events.amazonaws.com to SendMessage."
+  type        = string
+  default     = ""
+  nullable    = false
+
+  validation {
+    condition     = var.event_dead_letter_queue_arn == "" ? true : can(regex("^arn:aws[a-z-]*:sqs:[a-z0-9-]+:[0-9]{12}:", var.event_dead_letter_queue_arn))
+    error_message = "event_dead_letter_queue_arn must be empty or an SQS queue ARN."
+  }
 }
 
 variable "notify_on_states" {

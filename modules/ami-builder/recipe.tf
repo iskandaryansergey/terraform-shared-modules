@@ -10,8 +10,8 @@ resource "aws_imagebuilder_image_recipe" "this" {
 
   user_data_base64 = var.recipe_user_data != "" ? base64encode(var.recipe_user_data) : null
 
-  # dynamic over the caller's list, not over the computed ARNs. Keys are known at
-  # plan time and only the values inside are computed. for_each over a set of
+  # dynamic over the caller's list, not over the computed ARNs. Keys are known
+  # at plan time and only the values inside are computed; for_each over a set of
   # ARNs that don't exist yet can't be planned at all.
   dynamic "component" {
     for_each = var.components
@@ -30,8 +30,8 @@ resource "aws_imagebuilder_image_recipe" "this" {
     }
   }
 
-  # "true" as a string. The API takes strings here and the provider mirrors it;
-  # a bool is a type error at plan.
+  # "true" as a string - the API takes strings here and the provider mirrors it.
+  # A bool is a type error at plan.
   block_device_mapping {
     device_name = local.root_device
 
@@ -89,19 +89,17 @@ resource "aws_imagebuilder_image_recipe" "this" {
     }
 
     precondition {
-      # Wrong device_name and AWS silently drops the whole mapping - volume
-      # size and encryption with it. You get an unencrypted default-sized image
-      # and a green build.
+      # Get the device name wrong and AWS drops the whole mapping - volume size
+      # and encryption with it. You get an unencrypted default-sized image and a
+      # green build.
       condition     = startswith(local.root_device, "/dev/")
       error_message = "root_device_name must be a /dev/ path matching the parent image's root device."
     }
 
     precondition {
-      # The trap this closes: AWS discards a block device mapping whose
-      # device_name does not match the parent's root device - taking volume size
-      # AND encryption with it - and the build still succeeds. Nothing else in
-      # the module can see that, which is why governance had to hedge the
-      # encryption claim rather than assert it.
+      # Same trap, checked against the parent we actually read. Nothing else in
+      # the module can see it, which is why the governance field has to hedge
+      # the encryption claim when this check didn't run.
       condition = local.parent_root_device == null ? true : (
         local.root_device == local.parent_root_device
       )
@@ -109,11 +107,28 @@ resource "aws_imagebuilder_image_recipe" "this" {
     }
 
     precondition {
-      # Fails ~2 minutes into a build as a generic Image Builder error otherwise.
+      # Image Builder treats instance_types as a pool and picks whatever is
+      # available, so a mixed list is a coin flip: half the builds launch the
+      # wrong architecture for the parent and die at instance launch.
+      condition     = length(local.instance_type_architectures) == 1
+      error_message = "instance_types mixes architectures (${join(", ", local.instance_type_architectures)}). Image Builder picks any type from the list, so builds would fail at instance launch whenever it picks one that does not match the parent image."
+    }
+
+    precondition {
+      # Otherwise fails ~2 minutes into a build as a generic Image Builder error.
       condition = local.parent_architecture == null ? true : (
         contains(local.instance_type_architectures, local.parent_architecture)
       )
       error_message = "the parent image is ${local.parent_architecture_display} but instance_types resolve to ${join(", ", local.instance_type_architectures)}. The build instance cannot launch from a mismatched architecture."
+    }
+
+    precondition {
+      # EBS can grow a volume from a snapshot but never shrink one, so this
+      # fails at instance launch with nothing built.
+      condition = local.parent_root_volume_gb == null ? true : (
+        var.root_volume_size_gb >= local.parent_root_volume_gb
+      )
+      error_message = "root_volume_size_gb is ${var.root_volume_size_gb} but the parent image's root volume is ${local.parent_root_volume_display}. A volume created from a snapshot cannot be smaller than the snapshot, so the build would fail at instance launch."
     }
 
     precondition {

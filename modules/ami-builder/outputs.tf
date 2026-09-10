@@ -98,25 +98,29 @@ output "governance" {
     parent_image_pinned = !local.parent_unpinned
     parent_image_owner  = local.parent_owner
     # The bundled hardening and docker components run dnf without version pins,
-    # so a pinned parent does NOT make the image reproducible on its own.
+    # so a pinned parent does not make the image reproducible on its own.
     components_fetch_from_moving_sources = length([
       for c in var.components : c.name
       if contains(["amazon-linux-hardening", "install-docker"], c.bundled)
     ]) > 0
 
-    # Encryption. snapshots_encrypted is not a claim about the whole image:
-    # if root_device_name does not match the parent's actual root device, AWS
+    # Encryption. snapshots_encrypted is not a claim about the whole image: if
+    # root_device_name doesn't match the parent's actual root device, AWS
     # discards the mapping and encryption goes with it, which Terraform cannot
     # see. Hence the qualified name.
     snapshots_encrypted_if_root_device_matches_parent = true
     root_device                                       = local.root_device
-    # null when parent_image is not a plain AMI id, or verify_parent_image is
-    # false. When populated, the recipe preconditions have checked both.
-    parent_image_verified_at_plan = local.parent_root_device != null
-    parent_image_root_device      = local.parent_root_device
-    parent_image_architecture     = local.parent_architecture
-    customer_managed_key          = length(local.regions_without_cmk) == 0
-    regions_without_cmk           = local.regions_without_cmk
+    # These are null when parent_image is not a plain AMI id, or when
+    # verify_parent_image is false. Populated means the recipe preconditions
+    # have checked them.
+    parent_image_verified_at_plan  = local.parent_root_device != null
+    parent_image_root_device       = local.parent_root_device
+    parent_image_architecture      = local.parent_architecture
+    parent_image_root_volume_gb    = local.parent_root_volume_gb
+    parent_image_deprecated        = local.parent_deprecated
+    parent_image_marketplace_codes = local.parent_product_codes
+    customer_managed_key           = length(local.regions_without_cmk) == 0
+    regions_without_cmk            = local.regions_without_cmk
 
     # Build instance
     imds_v2_required           = var.imds_http_tokens == "required"
@@ -125,7 +129,6 @@ output "governance" {
     terminates_on_failure      = var.terminate_instance_on_failure
 
     # Blast radius of the role that runs arbitrary component code as root.
-    # Absent entirely before - the widest knob in the module had no field here.
     byo_instance_profile         = var.build_instance_profile_name != ""
     permissions_boundary         = var.permissions_boundary_arn
     additional_build_policy_arns = var.additional_build_policy_arns
@@ -133,18 +136,29 @@ output "governance" {
     # Gates
     image_tests_enabled    = var.enable_image_tests
     vulnerability_scanning = var.enable_image_scanning
-    build_logs_persisted   = local.logging_enabled
+    build_log_bucket       = var.log_s3_bucket
     log_retention_days     = var.log_retention_days
 
-    # Retention
+    # Alerting. A topic with no DLQ can drop every failure notification without
+    # anything anywhere going red.
+    notifications_enabled           = local.notifications_enabled
+    notification_states             = var.notify_on_states
+    notification_failures_go_to_dlq = var.event_dead_letter_queue_arn != ""
+
+    # Retention, which is also the rollback window - see ROLLOUT.md. You cannot
+    # roll back to an image the policy has deleted, and retain_at_least is the
+    # floor that survives every age rule.
     component_versions_retained = var.retain_component_versions
     lifecycle_policy_enabled    = var.create_lifecycle_policy
     lifecycle_deletes_amis      = local.lifecycle_deletes_amis
     lifecycle_delete_after_days = var.lifecycle_delete_after_days
+    # The two together are the rollback window: how many images survive whatever
+    # the age rules say, and when the age rule takes the rest.
+    rollback_depth_images = var.lifecycle_retain_at_least
 
-    # Distribution. organization_arns and organizational_unit_arns were in no
-    # field at all, so an AMI shared with an entire org reported as shared with
-    # nobody - and the module's own "nothing shared by default" test passed.
+    # Distribution. org and OU shares get their own fields: rolled into
+    # "shared_with_accounts" they'd report an org-wide share as shared with
+    # nobody.
     ami_is_public                    = local.ami_is_public
     shared_with_accounts             = var.launch_permission.user_ids
     shared_with_organizations        = var.launch_permission.organization_arns
@@ -205,7 +219,7 @@ output "network_contract" {
       "Interface endpoints need private DNS enabled, or the instance resolves the public name and hangs instead of erroring.",
       "There is deliberately no imagebuilder endpoint in the list: the build instance talks to SSM, not to the Image Builder control plane.",
       "No KMS endpoint is needed for EBS or SSM encryption - both call KMS service-side. It IS needed if a component calls KMS itself.",
-      local.logging_enabled ? "Build logs go to s3://${var.log_s3_bucket}, reachable over the S3 gateway endpoint." : "No S3 log bucket is configured, so failed builds leave no component output.",
+      "Build logs go to s3://${var.log_s3_bucket}, reachable over the S3 gateway endpoint.",
     ]
   }
 }
@@ -213,7 +227,7 @@ output "network_contract" {
 # ---------------------------------------------------------------------------
 # Key policies the CALLER has to write
 #
-# Same reasoning as network_contract: this module cannot set a key policy, and
+# Same reasoning as network_contract: the module cannot set a key policy, and
 # every entry here fails at a different time and in a different way when it is
 # missing - one of them by producing a log group that exists and stays
 # permanently empty.
@@ -226,12 +240,45 @@ output "kms_key_policy_requirements" {
   value = [for r in local.kms_key_policy_requirements : r if local.create]
 }
 
+# ---------------------------------------------------------------------------
+# The SNS topic policy is the caller's job too
+#
+# The module creates the rule and the target but owns no topic, and an
+# aws_sns_topic_policy here would replace whatever policy the topic already has.
+# Without these statements the publish is simply denied and the notification is
+# gone - EventBridge does not retry into a permission error forever, and nothing
+# turns red.
+# ---------------------------------------------------------------------------
+output "sns_topic_policy_requirement" {
+  description = "Statements sns_topic_arn's resource policy needs for build notifications to arrive, as data. null when no topic is configured."
+  value = !local.create || var.sns_topic_arn == "" ? null : {
+    topic = var.sns_topic_arn
+    statements = concat(
+      [
+        {
+          principal = "imagebuilder.amazonaws.com"
+          actions   = ["sns:Publish"]
+          condition = "StringEquals on aws:SourceAccount = ${local.account_id}"
+          why       = "the infrastructure configuration publishes Image Builder's own build messages to this topic."
+        },
+      ],
+      local.notifications_enabled ? [
+        {
+          principal = "events.amazonaws.com"
+          actions   = ["sns:Publish"]
+          condition = "ArnEquals on aws:SourceArn = ${one(aws_cloudwatch_event_rule.image_state[*].arn)}"
+          why       = "the EventBridge rule created here carries the failure reason. This is the notification worth paging on, and it is the one that silently disappears without the statement."
+        },
+      ] : [],
+    )
+  }
+}
+
 output "verify_commands" {
   description = "Copy-paste checks for what actually goes wrong. The first three are for a hung build, which is this module's documented first-run failure mode."
   value = !local.create ? null : {
-    # A missing endpoint fails as a hang. This is how you get onto the box and
-    # see it. The ImageBuilderFor tag exists for exactly this and nothing used
-    # to tell anyone about it.
+    # A missing endpoint fails as a hang, so start by getting onto the box. The
+    # ImageBuilderFor tag exists for exactly this.
     find_build_instance = "aws ec2 describe-instances --filters Name=tag:ImageBuilderFor,Values=${var.name} Name=instance-state-name,Values=running --query 'Reservations[].Instances[].InstanceId' --output text"
     shell_on_build      = "aws ssm start-session --target <instance-id-from-find_build_instance>"
     cancel_stuck_build  = "aws imagebuilder cancel-image-creation --image-build-version-arn <arn-from-list_builds>"
@@ -239,7 +286,7 @@ output "verify_commands" {
     why_no_build  = var.create_pipeline ? "aws imagebuilder get-image-pipeline --image-pipeline-arn ${local.pipeline_arn_or_note} --query 'imagePipeline.[status,dateLastRun,dateNextRun]'" : "no pipeline (create_pipeline = false)"
     trigger_build = var.create_pipeline ? "aws imagebuilder start-image-pipeline-execution --image-pipeline-arn ${local.pipeline_arn_or_note}" : "no pipeline (create_pipeline = false); build from the recipe directly"
     list_builds   = "aws imagebuilder list-image-pipeline-images --image-pipeline-arn ${local.pipeline_arn_or_note} --query 'reverse(sort_by(imageSummaryList,&dateCreated))[*].[version,state.status,dateCreated]' --output table"
-    # sorted: taking [0] of an unsorted list returned a months-old reason.
+    # sorted: taking [0] of an unsorted list returns a months-old reason.
     last_failure = "aws imagebuilder list-image-pipeline-images --image-pipeline-arn ${local.pipeline_arn_or_note} --query 'reverse(sort_by(imageSummaryList[?state.status==`FAILED`],&dateCreated))[0].state.reason' --output text"
 
     current_ami = var.ami_ssm_parameter_name != "" ? "aws ssm get-parameter --name ${var.ami_ssm_parameter_name} --query Parameter.Value --output text" : "ami_ssm_parameter_name not set; aws ec2 describe-images --owners self --filters Name=tag:SourceRecipe,Values=${var.name} --query 'sort_by(Images,&CreationDate)[-1].ImageId' --output text"
@@ -247,9 +294,18 @@ output "verify_commands" {
     build_logs  = "aws s3 sync s3://${var.log_s3_bucket}/${trimsuffix(var.log_s3_prefix != "" ? var.log_s3_prefix : "imagebuilder", "/")}/${var.name}/ ./imagebuilder-logs/"
     service_log = "aws logs tail ${local.log_group_name} --since 2h"
 
-    # Nobody could answer the FinOps question about a module this cost-conscious.
+    # The FinOps question about a cost-conscious module.
     snapshot_spend    = "aws ec2 describe-images --owners self --filters Name=tag:SourceRecipe,Values=${var.name} --query 'Images[].BlockDeviceMappings[].Ebs.SnapshotId' --output text | xargs -r aws ec2 describe-snapshots --snapshot-ids --query 'sum(Snapshots[].VolumeSize)'"
     lifecycle_actions = var.create_lifecycle_policy ? "aws imagebuilder list-lifecycle-execution-resources --lifecycle-execution-id <id-from-list-lifecycle-executions>" : "no lifecycle policy created"
+
+    # Rollback. Full sequence and the reasoning in ROLLOUT.md; these are the
+    # three commands you want at 3am, in order.
+    rollback_candidates    = "aws ec2 describe-images --owners self --filters Name=tag:SourceRecipe,Values=${var.name} --query 'reverse(sort_by(Images,&CreationDate))[*].[ImageId,CreationDate,Tags[?Key==`SourceRecipeVersion`].Value|[0]]' --output table"
+    protect_from_lifecycle = length(var.lifecycle_exclude_tags) > 0 ? "aws ec2 create-tags --resources <ami-id> --tags ${join(" ", [for k, v in var.lifecycle_exclude_tags : "Key=${k},Value=${v}"])}" : "lifecycle_exclude_tags is empty, so no tag exempts an image from deletion - set it if you want a break-glass"
+    stop_the_pipeline      = var.create_pipeline ? "aws imagebuilder update-image-pipeline --image-pipeline-arn ${local.pipeline_arn_or_note} --status DISABLED   # remember to re-enable it" : "no pipeline (create_pipeline = false)"
+
+    # "Did my failure notifications actually arrive" has no other answer.
+    undelivered_notifications = var.event_dead_letter_queue_arn != "" ? "aws sqs get-queue-attributes --queue-url <url-of-${basename(var.event_dead_letter_queue_arn)}> --attribute-names ApproximateNumberOfMessages" : "no event_dead_letter_queue_arn set; a rejected publish (missing topic policy, wrong KMS key policy) is discarded with no trace"
 
     # The module cannot check this: the provider has no aws_inspector2_* data
     # source, which is why enable_image_scanning defaults false.

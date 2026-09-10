@@ -15,6 +15,10 @@ assertion cannot express them:
     shell is the supply-chain hole this whole module exists to close, so it gets
     caught here rather than in review.
 
+  - Every step is its own shell. A variable set in one step and used in the next
+    is an unbound-variable error under `set -u`, which stops the build at that
+    step - and no amount of reading one step at a time makes it obvious.
+
 Usage:
   lint_components.py <components-dir> [--tf-dir <dir-with-tf-passing-parameters>]
   lint_components.py --self-test
@@ -60,6 +64,28 @@ WORLD_WRITABLE = re.compile(r"chmod\s+(-[A-Za-z]+\s+)*777\b")
 
 # {{ ParamName }} — AWSTOE's parameter substitution.
 PARAM_REF = re.compile(r"\{\{\s*([A-Za-z][A-Za-z0-9_]*)\s*\}\}")
+
+# Shell variables, for the one-step-one-shell check below. Assignments cover the
+# forms that actually appear: NAME=, export NAME=, a for-loop variable, read.
+SHELL_ASSIGN = re.compile(
+    r"^\s*(?:export\s+|readonly\s+|declare\s+(?:-[A-Za-z]+\s+)?|local\s+)?"
+    r"([A-Za-z_][A-Za-z0-9_]*)=",
+    re.M,
+)
+SHELL_FOR = re.compile(r"\bfor\s+([A-Za-z_][A-Za-z0-9_]*)\s+in\b")
+SHELL_READ = re.compile(r"\bread\s+(?:-[A-Za-z]+\s+)*([A-Za-z_][A-Za-z0-9_]*)")
+# $NAME and ${NAME}. Positional and special parameters ($1, $?, $@) start with a
+# digit or punctuation, so they never match - which also keeps awk programs like
+# '{print $2}' out of the results.
+SHELL_REF = re.compile(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?")
+
+# Set by the environment rather than by the script.
+SHELL_ENV = {
+    "PATH", "HOME", "PWD", "OLDPWD", "SHELL", "USER", "LOGNAME", "HOSTNAME",
+    "TERM", "LANG", "IFS", "TMPDIR", "RANDOM", "UID", "EUID", "PS1", "PS4",
+    "BASH", "BASH_SOURCE", "BASH_VERSION", "FUNCNAME", "LINENO", "SECONDS",
+    "AWS_REGION", "AWS_DEFAULT_REGION", "AWS_EXECUTION_ENV",
+}
 
 # AWSTOE's own build-time substitutions - {{ imagebuilder:buildDate }} and
 # friends. PARAM_REF cannot match these anyway because of the colon, so this set
@@ -200,6 +226,33 @@ def lint_component(path: pathlib.Path) -> set[str]:
                     f"step would report success.",
                 )
 
+    # ---- one step, one shell -------------------------------------------
+    # Each ExecuteBash step runs as its own script, so a variable has to be
+    # assigned in the step that uses it. Pass anything else through a file.
+    for phase in phases:
+        if not isinstance(phase, dict):
+            continue
+        for step in phase.get("steps") or []:
+            if not isinstance(step, dict) or step.get("action") != "ExecuteBash":
+                continue
+            cmds = (step.get("inputs") or {}).get("commands") or []
+            block = "\n".join(c for c in cmds if isinstance(c, str))
+            assigned = (
+                set(SHELL_ASSIGN.findall(block))
+                | set(SHELL_FOR.findall(block))
+                | set(SHELL_READ.findall(block))
+            )
+            for ref in sorted(set(SHELL_REF.findall(block))):
+                if ref in assigned or ref in SHELL_ENV:
+                    continue
+                check(
+                    False,
+                    f"{name}: step {step.get('name')!r} uses ${ref} but never sets it. "
+                    f"AWSTOE runs every step in a separate shell, so a variable from an "
+                    f"earlier step is unset here - and under `set -u` that fails the "
+                    f"build at this step. Write the value to a file and read it back.",
+                )
+
     # ---- parameters ----------------------------------------------------
     declared = declared_parameters(doc)
     referenced = {m for m in PARAM_REF.findall(body) if m not in BUILTIN_REFS}
@@ -328,6 +381,33 @@ phases:
               dnf install -y something
               echo done
               true
+""",
+    ),
+    (
+        "a variable carried over from an earlier step",
+        """
+name: bad
+schemaVersion: 1.0
+phases:
+  - name: build
+    steps:
+      - name: Fetch
+        action: ExecuteBash
+        inputs:
+          commands:
+            - |
+              set -euo pipefail
+              TARGET="$(mktemp)"
+              curl -fsSL --max-time 30 https://example.com/x -o "$TARGET"
+              test -s "$TARGET"
+      - name: Verify
+        action: ExecuteBash
+        inputs:
+          commands:
+            - |
+              set -euo pipefail
+              EXPECTED=deadbeef
+              echo "$EXPECTED  $TARGET" | sha256sum -c -
 """,
     ),
     (

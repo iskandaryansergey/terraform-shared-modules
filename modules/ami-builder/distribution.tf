@@ -98,5 +98,19 @@ resource "aws_imagebuilder_distribution_configuration" "this" {
       condition     = contains(local.distribution_regions, local.region)
       error_message = "the distribution configuration must include the region the pipeline builds in (${local.region})."
     }
+
+    precondition {
+      # EC2 caps an AMI description at 255 chars while description allows 1024,
+      # and ami_description falls back to it. Otherwise the build runs to
+      # completion and dies at distribution.
+      condition     = length(local.ami_description) <= 255
+      error_message = "the AMI description resolves to ${length(local.ami_description)} characters and EC2 accepts at most 255. It comes from ami_description, or from description when that is empty. The build would finish and then fail at the distribution step."
+    }
+
+    precondition {
+      # tags + ami_tags + the two the module adds, against EC2's 50-tag ceiling.
+      condition     = length(local.distribution_ami_tags) <= 50
+      error_message = "the produced AMI would carry ${length(local.distribution_ami_tags)} tags (tags + ami_tags + SourceRecipe and SourceRecipeVersion) and EC2 allows 50 per resource. Trim tags or ami_tags."
+    }
   }
 }

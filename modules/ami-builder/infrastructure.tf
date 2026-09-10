@@ -20,14 +20,10 @@ resource "aws_imagebuilder_infrastructure_configuration" "this" {
     http_put_response_hop_limit = var.imds_hop_limit
   }
 
-  dynamic "logging" {
-    for_each = local.logging_enabled ? [1] : []
-
-    content {
-      s3_logs {
-        s3_bucket_name = var.log_s3_bucket
-        s3_key_prefix  = var.log_s3_prefix != "" ? var.log_s3_prefix : null
-      }
+  logging {
+    s3_logs {
+      s3_bucket_name = var.log_s3_bucket
+      s3_key_prefix  = var.log_s3_prefix != "" ? var.log_s3_prefix : null
     }
   }
 
@@ -49,7 +45,8 @@ resource "aws_imagebuilder_infrastructure_configuration" "this" {
 
   # These land on the build instance and its volumes, not on the Image Builder
   # resource. Without them the instance is anonymous in Cost Explorer and
-  # invisible to tag-based SCPs.
+  # invisible to tag-based SCPs. ImageBuilderFor is what verify_commands greps
+  # for when a build hangs.
   resource_tags = merge(var.build_resource_tags, {
     "ManagedBy"       = "Terraform"
     "Module"          = "ami-builder"
@@ -67,12 +64,20 @@ resource "aws_imagebuilder_infrastructure_configuration" "this" {
 
     precondition {
       # With a BYO profile the module creates no role, so both of these become
-      # silent no-ops. A platform team that mandates a boundary and hands teams a
-      # shared profile would get an unbounded shared role and a green plan.
+      # silent no-ops. A platform team that mandates a boundary and hands teams
+      # a shared profile would get an unbounded shared role and a green plan.
       condition = var.build_instance_profile_name == "" ? true : (
         length(var.additional_build_policy_arns) == 0 && var.permissions_boundary_arn == ""
       )
       error_message = "build_instance_profile_name is set, so this module creates no role - additional_build_policy_arns and permissions_boundary_arn would be silently ignored. Attach them to the profile's role yourself, or drop build_instance_profile_name."
+    }
+
+    precondition {
+      # Both notification paths are same-region only: Image Builder publishes to
+      # a topic in its own region, and an EventBridge rule can't target a topic
+      # in another one. Cross-region just drops the notifications.
+      condition     = var.sns_topic_arn == "" ? true : local.sns_topic_region == local.region
+      error_message = "sns_topic_arn lives in \"${local.sns_topic_region}\" but this pipeline builds in ${local.region}. Neither Image Builder nor EventBridge delivers to a topic in another region, so build notifications would silently go nowhere."
     }
   }
 }
@@ -81,8 +86,8 @@ resource "aws_imagebuilder_infrastructure_configuration" "this" {
 # grows for the life of the account. Creating it here is how the retention
 # actually applies.
 #
-# If the pipeline name has ever run before - a reused name, an existing pipeline
-# being brought under management, a prior sandbox attempt - the group already
+# If the pipeline name has run before - a reused name, an existing pipeline
+# being brought under management, an old sandbox attempt - the group already
 # exists and this fails with ResourceAlreadyExistsException. Set
 # create_log_group = false, or import it.
 resource "aws_cloudwatch_log_group" "this" {

@@ -8,14 +8,11 @@ resource "aws_cloudwatch_event_rule" "image_state" {
   name        = "${var.name}-imagebuilder-state"
   description = "Image Builder state changes for ${var.name}"
 
-  # Three separate defects lived here:
-  #   - the detail-type was "EC2 Image Builder State Change". The documented
-  #     type is "EC2 Image Builder Image State Change" - one missing word, and
-  #     the rule matched nothing while looking configured.
-  #   - no resources filter, so it fired on every pipeline in the account while
-  #     the message hardcoded this one's name.
-  #   - the transformer read $.detail.arn and $.detail.name, neither of which
-  #     the event carries. The ARN is in top-level resources[].
+  # Three things are easy to get wrong here, and all three fail silently:
+  # the detail-type is "EC2 Image Builder Image State Change" (the word "Image"
+  # twice), the resources prefix is what scopes the rule to this pipeline rather
+  # than every pipeline in the account, and the ARN lives in top-level
+  # resources[] - not in detail.arn, which the event doesn't have.
   event_pattern = jsonencode({
     source      = ["aws.imagebuilder"]
     detail-type = ["EC2 Image Builder Image State Change"]
@@ -37,8 +34,19 @@ resource "aws_cloudwatch_event_target" "image_state" {
   target_id = "sns"
   arn       = var.sns_topic_arn
 
-  # Flattened so it's readable in an email or a chat webhook instead of a wall
-  # of event JSON.
+  # EventBridge gives up quietly if the topic rejects the publish - a missing
+  # topic policy, an encrypted topic whose key policy is wrong. A DLQ is the
+  # only way to find out that your build alerts have been going nowhere.
+  dynamic "dead_letter_config" {
+    for_each = var.event_dead_letter_queue_arn != "" ? [1] : []
+
+    content {
+      arn = var.event_dead_letter_queue_arn
+    }
+  }
+
+  # Flattened so it reads in an email or a chat webhook instead of as a wall of
+  # event JSON.
   input_transformer {
     input_paths = {
       state = "$.detail.state.status"
@@ -46,13 +54,13 @@ resource "aws_cloudwatch_event_target" "image_state" {
       time  = "$.time"
     }
 
-    # <reason> is deliberately absent. EventBridge does not escape transformer
+    # No <reason> on purpose. EventBridge does not escape transformer
     # substitutions, and an AWSTOE failure reason routinely contains quotes and
     # newlines - which makes the payload invalid JSON and the notification is
     # dropped. The alert would be silenced by exactly the condition it reports.
     # Read the reason from the log group or with verify_commands.last_failure.
     input_template = <<-EOT
-      "Image Builder ${var.name} is <state> at <time>. Image: <arn>. Logs: ${local.log_group_name}${local.logging_enabled ? " and s3://${var.log_s3_bucket}/${var.log_s3_prefix}" : " (no S3 log bucket configured)"}"
+      "Image Builder ${var.name} is <state> at <time>. Image: <arn>. Logs: ${local.log_group_name} and s3://${var.log_s3_bucket}/${var.log_s3_prefix}"
     EOT
   }
 }
@@ -63,18 +71,6 @@ resource "aws_cloudwatch_event_target" "image_state" {
 # Warnings, not refusals. Postures the module will let you have but a reviewer
 # should see at plan time.
 # ---------------------------------------------------------------------------
-
-check "failed_builds_are_diagnosable" {
-  assert {
-    # Previously this demanded terminate_instance_on_failure = false when no
-    # bucket was set, while build_instance_survives_only_deliberately demanded
-    # true - so exactly one of the two always fired and no configuration could
-    # satisfy both. log_s3_bucket is now required, so this reduces to the honest
-    # question: are the logs going somewhere.
-    condition     = local.logging_enabled
-    error_message = "log_s3_bucket is empty, so a failed build's component output is discarded. The CloudWatch group carries the service log, not AWSTOE's stdout."
-  }
-}
 
 check "build_instance_has_no_standing_ssh_credential" {
   assert {
@@ -99,10 +95,10 @@ check "images_are_scanned" {
 
 check "snapshots_do_not_accumulate_forever" {
   assert {
-    # Asserting create_lifecycle_policy passed while lifecycle_delete_after_days
-    # was 0 and nothing was ever deleted - the check certified the opposite of
-    # its own error message. Deprecation costs nothing and saves nothing;
-    # deletion is the only line that touches the bill.
+    # Asserting create_lifecycle_policy would pass while
+    # lifecycle_delete_after_days is 0 and nothing is ever deleted. Deprecation
+    # costs nothing and saves nothing; deletion is the only line that touches
+    # the bill.
     condition     = local.lifecycle_deletes_amis
     error_message = "nothing deletes old AMIs: create_lifecycle_policy = ${var.create_lifecycle_policy}, lifecycle_delete_after_days = ${var.lifecycle_delete_after_days}. Deprecation alone does not reclaim snapshot storage, so it grows without bound."
   }
@@ -129,16 +125,30 @@ check "parent_image_is_reproducible" {
   }
 }
 
+# Only visible when parent_image is an AMI id and verify_parent_image is on.
+check "parent_image_is_not_deprecated" {
+  assert {
+    condition     = !local.parent_deprecated
+    error_message = "the parent AMI is past its deprecation date. It still builds today, but AWS deregisters deprecated public images eventually - and when it does, this pipeline starts failing at the least convenient moment. Move to a current base image."
+  }
+}
+
+# Same caveat - needs a readable AMI id parent.
+check "parent_image_has_no_marketplace_codes" {
+  assert {
+    condition     = length(local.parent_product_codes) == 0
+    error_message = "the parent AMI carries marketplace/billing product codes (${join(", ", local.parent_product_codes)}). Every image built from it inherits them, which means cross-account copies and shared launches need a matching subscription in the receiving account and usually fail without one."
+  }
+}
+
 # The worst defect this module shipped with: a schedule that can never fire.
 #
 # EXPRESSION_MATCH_AND_DEPENDENCY_UPDATES_AVAILABLE builds only when the base
-# image or a component version has changed. With a pinned parent AMI (which
+# image or a component version changed. With a pinned parent (which
 # allow_unpinned_parent_image = false forces) and content-addressed component
-# versions that move only on apply, nothing ever changes between applies - so
+# versions that only move on apply, nothing ever changes between applies - so
 # the cron fires and does nothing, forever, while the pipeline reports ENABLED
-# and governance reports the schedule.
-#
-# Every term is known at plan time, so this is checkable rather than a comment.
+# and governance reports a cadence.
 check "the_schedule_can_actually_fire" {
   assert {
     condition = var.schedule_expression == "" ? true : (
@@ -150,8 +160,7 @@ check "the_schedule_can_actually_fire" {
   }
 }
 
-# The build role is the ceiling on what arbitrary component code can reach, and
-# it had no advisory check at all while nine strictly lower-impact things did.
+# The build role is the ceiling on what arbitrary component code can reach.
 check "build_role_blast_radius_was_reviewed" {
   assert {
     condition = length(var.additional_build_policy_arns) == 0 ? true : (
@@ -171,6 +180,6 @@ check "imds_hop_limit_is_tight" {
 check "cross_region_copies_are_intentional" {
   assert {
     condition     = length(var.distribution_regions) <= 3
-    error_message = "the AMI is distributed to more than three extra regions. Each is a full snapshot copy per build, billed for storage in that region plus cross-region transfer — worth confirming every one has a consumer."
+    error_message = "the AMI is distributed to more than three extra regions. Each is a full snapshot copy per build, billed for storage in that region plus cross-region transfer - worth confirming every one has a consumer."
   }
 }

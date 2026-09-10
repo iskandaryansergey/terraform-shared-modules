@@ -33,8 +33,8 @@ resource "aws_imagebuilder_image_pipeline" "this" {
       schedule_expression = var.schedule_expression
       timezone            = var.schedule_timezone != "" ? var.schedule_timezone : null
 
-      # Default only builds when the parent image or a component changed.
-      # EXPRESSION_MATCH_ONLY bills you a new AMI and new snapshots every tick.
+      # The default only builds when the parent image or a component changed.
+      # EXPRESSION_MATCH_ONLY bills a new AMI and new snapshots every tick.
       pipeline_execution_start_condition = var.pipeline_execution_start_condition
     }
   }
@@ -79,7 +79,7 @@ resource "aws_imagebuilder_image_pipeline" "this" {
 #
 # The only way to get an AMI id as a Terraform output, and it blocks apply for
 # 20-45 minutes. Fine for bootstrapping something that can't start without an
-# image. For steady state use the pipeline and ami_ssm_parameter_name.
+# image; for steady state use the pipeline and ami_ssm_parameter_name.
 # ---------------------------------------------------------------------------
 resource "aws_imagebuilder_image" "this" {
   count = local.create && var.build_on_apply ? 1 : 0
@@ -104,9 +104,8 @@ resource "aws_imagebuilder_image" "this" {
     }
   }
 
-  # Note this block is a SET on aws_imagebuilder_image (it is a list on the
-  # pipeline), so workflow ORDER is not preserved here. Use parallel_group, or
-  # the pipeline, if ordering matters.
+  # This block is a set here and a list on the pipeline, so workflow order is
+  # not preserved. Use parallel_group, or the pipeline, if ordering matters.
   dynamic "workflow" {
     for_each = var.workflows
 
@@ -133,17 +132,17 @@ resource "aws_imagebuilder_image" "this" {
   tags = local.common_tags
 
   lifecycle {
-    # Everything upstream is create_before_destroy and this was not, so a recipe
-    # version change destroyed the image record first. DeleteImage does NOT
-    # delete the AMI or its snapshots, so each replacement left an untracked,
-    # billing AMI behind with no owner.
+    # Everything upstream is create_before_destroy. Without it here, a recipe
+    # version change destroys the image record first - and DeleteImage does not
+    # delete the AMI or its snapshots, so every replacement left an untracked,
+    # billing AMI behind.
     create_before_destroy = true
 
     precondition {
-      # AWS is allowed to keep building for image_tests_timeout_minutes while
-      # Terraform stops waiting at build_timeout. When they disagree, apply
-      # abandons an in-flight build and the next apply starts a second one
-      # concurrently against the same recipe.
+      # AWS keeps building for image_tests_timeout_minutes while Terraform stops
+      # waiting at build_timeout. When they disagree, apply abandons an
+      # in-flight build and the next apply starts a second one against the same
+      # recipe.
       condition = (
         endswith(var.build_timeout, "h")
         ? tonumber(trimsuffix(var.build_timeout, "h")) * 60

@@ -1,7 +1,7 @@
-# Versions are immutable; see locals.component_versions for the hashing.
+# Versions are immutable - see locals.component_versions for the hashing.
 #
 # create_before_destroy is load-bearing: the recipe pins an exact component
-# version ARN and AWS won't delete a component a recipe still references. New
+# version ARN, and AWS won't delete a component a recipe still references. New
 # version first, then the recipe moves, then the old one is free.
 
 resource "aws_imagebuilder_component" "this" {

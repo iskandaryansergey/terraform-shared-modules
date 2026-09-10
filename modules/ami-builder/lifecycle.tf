@@ -1,10 +1,10 @@
-# No policy means every AMI ever built keeps its snapshots at $0.05/GB-month
-# forever. A monthly pipeline over three years is 36 root snapshots nobody
-# removes.
+# Without a policy, every AMI this pipeline ever built keeps its snapshots at
+# $0.05/GB-month forever. A monthly pipeline over three years is 36 root
+# snapshots nobody removes.
 #
-# Asymmetric on purpose: DEPRECATE on, DELETE off. Deprecation is reversible and
-# only affects discovery, which is enough to stop someone picking last year's
-# image. Deletion isn't, so it's opt-in.
+# Asymmetric on purpose: DEPRECATE on, DELETE opt-in. Deprecation is reversible
+# and only affects discovery, which is enough to stop someone picking last
+# year's image. Deletion isn't.
 
 resource "aws_imagebuilder_lifecycle_policy" "this" {
   count = local.create && var.create_lifecycle_policy ? 1 : 0
@@ -16,8 +16,8 @@ resource "aws_imagebuilder_lifecycle_policy" "this" {
   status         = "ENABLED"
 
   # By tag, not by recipe. resource_selection wants an exact semantic_version,
-  # which with content-addressed versions would pin the policy to one version and
-  # quietly stop covering anything built after the next edit.
+  # which with content-addressed versions would pin the policy to one version
+  # and quietly stop covering anything built after the next edit.
   resource_selection {
     tag_map = {
       "SourceRecipe" = var.name
@@ -28,9 +28,9 @@ resource "aws_imagebuilder_lifecycle_policy" "this" {
     action {
       type = "DEPRECATE"
 
-      # Without this, only the Image Builder image resource is deprecated and
-      # describe-images keeps returning the AMI - i.e. exactly the "stops
-      # someone picking last year's image" effect does not happen.
+      # Without this only the Image Builder image resource is deprecated and
+      # describe-images keeps returning the AMI - so the "stops someone picking
+      # last year's image" part doesn't happen.
       include_resources {
         amis = true
       }
@@ -52,9 +52,9 @@ resource "aws_imagebuilder_lifecycle_policy" "this" {
         # Image-Builder-resource level.
         tag_map = var.lifecycle_exclude_tags
 
-        # And AMI level. tagMap at the top of exclusion_rules does NOT look at
-        # the output AMI's EC2 tags, so an operator tagging an AMI Retain=true
-        # got nothing from the top-level map alone.
+        # And AMI level. The top-level tag_map does not look at the output AMI's
+        # EC2 tags, so an operator tagging an AMI Retain=true gets nothing from
+        # it alone.
         amis {
           tag_map = var.lifecycle_exclude_tags
         }
@@ -91,12 +91,12 @@ resource "aws_imagebuilder_lifecycle_policy" "this" {
           tag_map = length(var.lifecycle_exclude_tags) > 0 ? var.lifecycle_exclude_tags : null
 
           # Accounts this AMI was shared with launch it without touching the
-          # owner's last-launched metadata, so recency alone cannot protect it.
+          # owner's last-launched metadata, so recency alone can't protect it.
           shared_accounts = length(local.shared_ami_accounts) > 0 ? local.shared_ami_accounts : null
 
           # Age is a bad proxy for "in use". A six-month-old image something
           # launched yesterday is load-bearing, and deleting it breaks the next
-          # scale-out, not the next audit.
+          # scale-out rather than the next audit.
           dynamic "last_launched" {
             for_each = var.lifecycle_exclude_recently_launched_days > 0 ? [1] : []
 
@@ -106,8 +106,9 @@ resource "aws_imagebuilder_lifecycle_policy" "this" {
             }
           }
 
-          # true EXCLUDES public AMIs from the action. false was the inverse of
-          # the intent: it left a public AMI eligible for deletion.
+          # true EXCLUDES public AMIs from the action. false reads like the
+          # tighter setting and is the opposite: it leaves a public AMI
+          # eligible for deletion.
           is_public = true
         }
       }
@@ -123,8 +124,8 @@ resource "aws_imagebuilder_lifecycle_policy" "this" {
     }
 
     precondition {
-      # No recency and no tag exemption means deleting purely on age, which is
-      # how an in-use AMI disappears.
+      # No recency exemption and no tag exemption means deleting purely on age,
+      # which is how an in-use AMI disappears.
       condition = !local.lifecycle_deletes_amis ? true : (
         var.lifecycle_exclude_recently_launched_days > 0 ? true : length(var.lifecycle_exclude_tags) > 0
       )

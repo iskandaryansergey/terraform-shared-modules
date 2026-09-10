@@ -33,6 +33,13 @@ import sys
 
 # Functions and constructs that raise rather than return false. Not exhaustive
 # by design: it covers what actually appears in validation conditions.
+# A reference the expression itself null-tests. If the code says it can be
+# null, this tool can rely on that rather than guessing.
+NULL_TESTED = re.compile(
+    r"((?:var|local|data|each|count)\.[A-Za-z0-9_.]+|\b[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*)"
+    r"\s*(?:==|!=)\s*null"
+)
+
 THROWING = [
     "regex(",
     "min(",
@@ -57,6 +64,7 @@ THROWING = [
     "index(",
     "lookup(",  # two-arg lookup throws on a missing key
     "tonumber(",
+    "slice(",  # throws when the range is outside the list
     "timeadd(",
     "formatdate(",
 ]
@@ -170,6 +178,57 @@ def extract_conditions(text: str) -> list[tuple[int, str]]:
     return results
 
 
+def extract_locals(text: str) -> list[tuple[int, str]]:
+    """Every top-level assignment inside a `locals { ... }` block.
+
+    Conditions are not the only place `||` and `&&` appear. The one genuine
+    eager-operator hazard in this module lived in a local, where a
+    condition-only scan could not see it - and locals are evaluated BEFORE any
+    check or precondition, so a throw there is strictly worse: nothing gets to
+    report it.
+    """
+    results: list[tuple[int, str]] = []
+    masked = mask_strings(text)
+    for m in re.finditer(r"^locals\s*\{", text, re.M):
+        # Walk to the matching close brace.
+        i = m.end() - 1
+        depth = 0
+        while i < len(text):
+            if masked[i] == "{":
+                depth += 1
+            elif masked[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            i += 1
+        body_start, body_end = m.end(), i
+        body, mbody = text[body_start:body_end], masked[body_start:body_end]
+
+        # Each `name = <expr>` at the block's own nesting level.
+        for a in re.finditer(r"^[ \t]*([A-Za-z_][A-Za-z0-9_-]*)\s*=\s*", body, re.M):
+            j = a.end()
+            depth = 0
+            while j < len(body):
+                ch = mbody[j]
+                if ch in "([{":
+                    depth += 1
+                elif ch in ")]}":
+                    if depth == 0:
+                        break
+                    depth -= 1
+                elif ch == "\n" and depth == 0:
+                    nl = body.find("\n", j + 1)
+                    nxt = body[j + 1 : nl if nl != -1 else len(body)]
+                    if re.match(r"[ \t]*[A-Za-z_][A-Za-z0-9_-]*\s*=", nxt) or not nxt.strip():
+                        break
+                j += 1
+            expr = body[a.end():j]
+            if "||" in expr or "&&" in expr:
+                line_no = text.count("\n", 0, body_start + a.start()) + 1
+                results.append((line_no, expr))
+    return results
+
+
 def split_top_level_operands(cond: str) -> tuple[str, list[str]]:
     """Split a condition on || and && that sit at bracket depth zero.
 
@@ -206,8 +265,111 @@ def split_top_level_operands(cond: str) -> tuple[str, list[str]]:
     return op, parts
 
 
+def split_ternary_segments(expr: str) -> list[str]:
+    """`a && b ? x : y` split into its condition and its two branches.
+
+    `?:` binds LOOSER than `||`/`&&` in HCL, so the operands of that `&&` are
+    `a` and `b` - not the whole ternary. Without this split, an expression like
+    `local.create && var.on ? flatten([r[0]]) : []` looks like an `&&` whose
+    second operand indexes a list, which is a false positive on a shape the
+    module uses deliberately.
+
+    Every branch is still returned and scanned, because a branch has its own
+    operators and the same eager rule applies inside it. What changes is that
+    a branch is no longer treated as an operand of the condition's operator.
+
+    A `:` inside brackets belongs to a for-expression or an object, and the
+    depth counter leaves those alone.
+    """
+    masked = mask_strings(expr)
+    segments: list[str] = []
+    depth = 0
+    last = 0
+    for i, ch in enumerate(masked):
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        elif depth == 0 and ch in "?:":
+            segments.append(expr[last:i])
+            last = i + 1
+    segments.append(expr[last:])
+    return [s for s in segments if s.strip()]
+
+
+def extract_for_bodies(expr: str) -> list[str]:
+    """The result expression of every `for ... :` inside `expr`.
+
+    A `||` in a for body is evaluated once PER ELEMENT, so on the 1.9 floor
+    both its operands run for every element - the hazard is identical to a
+    top-level one. Treating a for body as opaque was how the module's one real
+    instance of this hid from the linter: the operator was not at the top level
+    of any condition, it was inside anytrue([for r in ... : A || B]).
+
+    Finding the end of the for HEADER means finding the `:` that separates it
+    from the body - and skipping any `:` that belongs to a ternary in the `in`
+    expression, which is why this counts `?` rather than taking the first `:`.
+    """
+    masked = mask_strings(expr)
+    bodies: list[str] = []
+    for m in re.finditer(r"\bfor\s", masked):
+        i = m.end()
+        depth = 0
+        pending_ternary = 0
+        while i < len(expr):
+            ch = masked[i]
+            if ch in "([{":
+                depth += 1
+            elif ch in ")]}":
+                if depth == 0:
+                    break
+                depth -= 1
+            elif depth == 0 and ch == "?":
+                pending_ternary += 1
+            elif depth == 0 and ch == ":":
+                if pending_ternary:
+                    pending_ternary -= 1
+                else:
+                    break  # the for separator
+            i += 1
+        if i >= len(expr) or masked[i] != ":":
+            continue
+        # The body runs to the close of the enclosing bracket, or to an `if`
+        # filter - both are scanned, so take everything.
+        j = i + 1
+        depth = 0
+        while j < len(expr):
+            ch = masked[j]
+            if ch in "([{":
+                depth += 1
+            elif ch in ")]}":
+                if depth == 0:
+                    break
+                depth -= 1
+            j += 1
+        body = expr[i + 1 : j].strip()
+        if body:
+            bodies.append(body)
+    return bodies
+
+
 def lint_text(text: str, label: str) -> None:
-    for line_no, cond in extract_conditions(text):
+    # Conditions AND locals. Locals were the blind spot: the module's one real
+    # eager-operator hazard sat in one, so moving an expression out of a check
+    # block was enough to step around this linter entirely - and a throw in a
+    # local happens before any check can report it.
+    # Each unit is (line, expression-to-analyse, enclosing-expression). The
+    # third element matters: a for BODY does not contain its own `for ... in
+    # data.x` header, so a rule that needs to know where the iteration variable
+    # came from has to look at the expression the body was cut out of.
+    units: list[tuple[int, str, str]] = []
+    for line_no, expr in extract_conditions(text) + extract_locals(text):
+        for piece in [expr] + extract_for_bodies(expr):
+            units.extend(
+                (line_no, segment, expr) for segment in split_ternary_segments(piece)
+            )
+
+    for line_no, cond, outer in units:
         # Only || and && are eager, and only at the top level. A ternary is lazy
         # on every version.
         op, operands = split_top_level_operands(cond)
@@ -229,12 +391,49 @@ def lint_text(text: str, label: str) -> None:
             found = [t for t in THROWING if t in bare]
             if re.search(r"/\s*(var|local)\.", bare):
                 found.append("/ division")
-            if re.search(r"(==|!=)\s*null", cond) and re.search(
+            if re.search(r"(==|!=)\s*null", outer) and re.search(
                 r"(var|local)\.[a-z_0-9]+\.[a-z_][a-z_0-9]*", bare, re.I
             ):
                 found.append("attribute access past a null guard")
             if INDEX.search(bare):
                 found.append("[...] indexing")
+
+            # Relational operators throw on a null operand ("argument must not
+            # be null"), and a data-source or resource attribute CAN be null -
+            # unlike a var, which this repo declares nullable = false
+            # everywhere. That is the shape of the one real instance in this
+            # module: `r.from <= 22` where from_port comes from
+            # aws_vpc_security_group_rule, whose sibling fields the same code
+            # already null-checks.
+            #
+            # No throwing function is involved, so the function-name list could
+            # never have caught it. coalesce/try/can are the fix and are
+            # stripped above, so a wrapped access does not trip this.
+            if re.search(
+                r"(?:data|aws_[a-z0-9_]+)\.[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)+"
+                r"\s*(?:<=|>=|<|>)|"
+                r"(?:<=|>=|<|>)\s*(?:data|aws_[a-z0-9_]+)\.[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)+",
+                bare,
+            ):
+                found.append("relational comparison against a possibly-null attribute")
+
+            # The high-confidence form, and no guessing anywhere in it: an
+            # earlier operand tests a reference against null, and a LATER
+            # operand compares that same reference relationally. The code has
+            # declared the value nullable by testing it, so on the 1.9 floor -
+            # where both operands evaluate - `null >= 0` throws. Mechanical,
+            # provenance-free, and it is the single most common way this bug is
+            # written.
+            for ref in NULL_TESTED.findall(outer):
+                if re.search(
+                    rf"{re.escape(ref)}\s*(?:<=|>=|<|>)|(?:<=|>=|<|>)\s*{re.escape(ref)}",
+                    bare,
+                ):
+                    found.append(
+                        f"relational comparison on {ref}, which an earlier operand "
+                        f"tests against null"
+                    )
+
             return found
 
         per_operand = [operand_hits(o) for o in operands]
@@ -373,6 +572,50 @@ variable "s" {
     ),
 ]
 
+SELF_TEST_BAD += [
+    (
+        "a null-tested reference compared relationally in a later operand",
+        '''
+variable "rate" {
+  type     = number
+  nullable = true
+  validation {
+    condition     = var.rate == null || (var.rate >= 0 && var.rate <= 100)
+    error_message = "bad - on the 1.9 floor both operands evaluate and null >= 0 throws."
+  }
+}
+''',
+    ),
+    (
+        "the same shape hidden in a local, where a condition-only scan cannot see it",
+        '''
+locals {
+  rate_ok = local.rate == null || local.rate >= 0
+}
+''',
+    ),
+    (
+        "an indexed list in a local behind a length guard",
+        '''
+locals {
+  first_or_default = length(var.items) == 0 || var.items[0] == "x"
+}
+''',
+    ),
+    (
+        "slice() out of range behind a length guard",
+        '''
+variable "l" {
+  validation {
+    condition     = length(var.l) >= 2 || join(",", slice(var.l, 1, 2)) == "a"
+    error_message = "bad."
+  }
+}
+''',
+    ),
+]
+
+
 SELF_TEST_GOOD = [
     (
         "&& nested inside a for-expression filter is not a top-level operand",
@@ -449,6 +692,39 @@ variable "n" {
     condition     = var.n >= 1
     error_message = "fine."
   }
+}
+''',
+    ),
+]
+
+
+SELF_TEST_BAD += [
+    (
+        "a hazard inside a ternary branch is still a hazard",
+        '''
+locals {
+  first = var.enabled ? length(var.items) == 0 || var.items[0] == "x" : false
+}
+''',
+    ),
+]
+
+SELF_TEST_GOOD += [
+    (
+        "a ternary whose condition uses && and whose branch indexes a list",
+        '''
+locals {
+  built = local.create && var.build_on_apply ? flatten([
+    for r in aws_imagebuilder_image.this[0].output_resources : tolist(r.amis)
+  ]) : []
+}
+''',
+    ),
+    (
+        "a local with a boolean operator over values that cannot throw",
+        '''
+locals {
+  is_isolated = var.create_endpoints && length(var.nat_gateway_ids) == 0
 }
 ''',
     ),

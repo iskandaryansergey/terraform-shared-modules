@@ -1,20 +1,18 @@
-# Builds the manager AMI that modules/gitlab-runner requires in an isolated VPC.
+# Builds the manager AMI that modules/gitlab-runner needs in an isolated VPC.
 #
-# Why this example exists, specifically:
-#
-# The sibling gitlab-runner module's default manager bootstrap curls
+# Why it exists: that module's default manager bootstrap curls
 # packages.gitlab.com and runs `gitlab-runner fleeting install`, which pulls the
-# plugin from GitLab.com. In a VPC with no route to the public internet neither
-# is reachable, and both HANG rather than failing cleanly. That module's
-# COSTS.md records this as prerequisite P1: a baked manager AMI is mandatory, not
-# an optimization.
+# plugin from GitLab.com. In a VPC with no route to the internet neither is
+# reachable and both hang rather than failing cleanly - which is why its
+# COSTS.md lists a baked manager AMI as prerequisite P1 rather than an
+# optimisation.
 #
-# This is that AMI. The fetch happens once here, in a build subnet that DOES have
-# egress, instead of on every manager boot in an estate that does not.
+# This is that AMI: fetch once here, in a build subnet that does have egress,
+# instead of on every manager boot in an estate that doesn't.
 #
-# The two subnets are the point. Do not collapse them:
+# The two subnets are the point, so don't collapse them:
 #
-#   build subnet  - has egress to packages.gitlab.com. Exists to build images.
+#   build subnet  - egress to packages.gitlab.com. Exists to build images.
 #   runner subnet - fully isolated. Runs the manager from the finished AMI.
 
 terraform {
@@ -62,9 +60,9 @@ variable "kms_key_arn" {
   type        = string
 }
 
-# Versions are pinned and their checksums supplied. An unpinned build here would
-# defeat the purpose: the manager AMI exists to make the runner fleet
-# reproducible, and an AMI built from "whatever was latest that morning" is not.
+# Versions pinned, checksums supplied. The manager AMI exists to make the runner
+# fleet reproducible, and an AMI built from whatever was latest that morning
+# isn't.
 variable "runner_version" {
   description = "gitlab-runner package version, e.g. 17.5.3-1."
   type        = string
@@ -122,17 +120,16 @@ module "manager_image" {
     },
   ]
 
-  # The manager is a t4g, so the image must be arm64 — which means the BUILD
-  # instance must be arm64 too. An x86 build instance with an arm64 parent fails
-  # at launch, not at plan.
+  # The manager is a t4g, so the image has to be arm64 - which means the build
+  # instance does too. Both types here are Graviton: a mixed list is refused,
+  # because Image Builder picks from it on availability.
   instance_types = ["m7g.large", "m6g.large"]
 
   subnet_id          = var.build_subnet_id
   security_group_ids = [var.build_security_group_id]
 
-  # require_cmk now correctly counts kms_key_arn as covering the build region.
-  # It previously read only distribution_kms_key_arns, which made this exact
-  # pair - the natural single-region configuration - refuse to plan.
+  # Single region, so kms_key_arn covers it and require_cmk is satisfied without
+  # a distribution_kms_key_arns entry.
   kms_key_arn = var.kms_key_arn
   require_cmk = true
 
@@ -150,23 +147,23 @@ module "manager_image" {
   # Monthly, unconditionally.
   #
   # EXPRESSION_MATCH_ONLY rather than the module's default: with a pinned parent
-  # AMI and content-addressed component versions, "dependency updates available"
-  # is never true between applies, so the default would produce a schedule that
-  # can never fire. The module now refuses to plan that combination - see
-  # check "the_schedule_can_actually_fire".
+  # and content-addressed component versions, "dependency updates available" is
+  # never true between applies, so the default is a schedule that can't fire.
+  # The module refuses to plan that combination - see check
+  # "the_schedule_can_actually_fire".
   #
-  # A rebuilt manager AMI does not replace the running manager on its own: the
-  # runner module reads the SSM parameter at plan time, so the fleet moves on
-  # your next apply, deliberately. See the wiring note at the bottom.
+  # A rebuilt AMI doesn't replace the running manager on its own. The runner
+  # module reads the SSM parameter at plan time, so the fleet moves on your next
+  # apply. See the wiring note at the bottom.
   schedule_expression                = "cron(0 2 1 * ? *)"
   schedule_timezone                  = "Europe/Dublin"
   pipeline_execution_start_condition = "EXPRESSION_MATCH_ONLY"
 
   enable_image_tests = true
 
-  # Turn this on once Inspector EC2 scanning is enabled in the account. It is off
-  # by default because the module cannot verify that prerequisite, and enabling
-  # it without it fails the build.
+  # Turn this on once Inspector EC2 scanning is enabled in the account. Off by
+  # default because the module can't see that prerequisite, and setting it true
+  # without it fails the build.
   enable_image_scanning = false
 
   # Deprecate at 45 days, keep the last 3, and never touch an image something
@@ -212,7 +209,7 @@ output "governance" {
 # Wiring the result into the runner module
 # ---------------------------------------------------------------------------
 #
-# The runner module takes a concrete manager_ami_id, so read the parameter this
+# The runner module wants a concrete manager_ami_id, so read the parameter this
 # pipeline publishes:
 #
 #   data "aws_ssm_parameter" "manager_ami" {
@@ -225,14 +222,12 @@ output "governance" {
 #     ...
 #   }
 #
-# Note what that does and does not buy you. Terraform reads the parameter at plan
-# time, so a new AMI reaches the manager on the next apply, not automatically —
-# and the manager is replaced when it does, because manager_ami_id feeds the
-# launch template. That is the correct behaviour for a manager: a rolling
-# replacement of the instance that holds the runner registration is a deliberate
-# act, not something a nightly pipeline should trigger on its own.
+# Terraform reads the parameter at plan time, so a new AMI reaches the manager
+# on your next apply rather than on its own - and the manager is replaced when it
+# does, because manager_ami_id feeds the launch template. That's the behaviour
+# you want here: replacing the instance that holds the runner registration
+# should be a deliberate act, not something a nightly pipeline decides.
 #
-# The worker fleet is the opposite case. Workers are ephemeral and replaced
-# constantly, so pointing worker_ami_id at a parameter and letting new images
-# arrive on their own is safe. Build that image with a second instance of this
-# module using the install-docker component.
+# Workers are the opposite. They're ephemeral and replaced constantly, so
+# pointing worker_ami_id at a parameter is fine. Build that image with a second
+# instance of this module using the install-docker component.

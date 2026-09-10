@@ -1,17 +1,17 @@
 name: install-docker
 description: >-
   Installs Docker from the Amazon Linux 2023 repositories and applies the daemon
-  settings a CI worker wants. Baking this saves roughly a minute of billed boot
-  time per instance and removes a package fetch from every launch.
+  settings a CI worker wants. Baking it saves about a minute of billed boot time
+  per instance and takes a package fetch out of every launch.
 schemaVersion: 1.0
 
 parameters:
   - DockerUser:
       type: string
       description: >-
-        User added to the docker group. Membership in that group is
-        root-equivalent - the socket accepts a container request that mounts the
-        host filesystem - so this is a real privilege grant, not a convenience.
+        User added to the docker group. That group is root-equivalent - the
+        socket will happily run a container that mounts the host filesystem - so
+        this is a privilege grant, not a convenience.
       default: ec2-user
   - LiveRestore:
       type: string
@@ -46,9 +46,15 @@ phases:
           commands:
             - |
               set -euo pipefail
+              # live-restore goes into the JSON unquoted, so anything other
+              # than true/false produces a daemon.json docker won't parse.
+              case '{{ LiveRestore }}' in
+                true|false) : ;;
+                *) echo "FATAL: LiveRestore must be true or false, got '{{ LiveRestore }}'" >&2; exit 1 ;;
+              esac
               install -d -m 0755 /etc/docker
               # Unbounded json-file logs are the usual way a CI worker's root
-              # volume fills mid-job.
+              # volume fills up mid-job.
               cat > /etc/docker/daemon.json <<'EOF'
               {
                 "log-driver": "json-file",
@@ -103,7 +109,7 @@ phases:
             - |
               set -euo pipefail
               systemctl start docker
-              # Retry: the socket is not ready the instant systemd returns.
+              # Retry - the socket isn't ready the instant systemd returns.
               for _ in $(seq 1 30); do
                 if docker info >/dev/null 2>&1; then exit 0; fi
                 sleep 2
@@ -119,9 +125,10 @@ phases:
             - |
               set -euo pipefail
               python3 -c 'import json,sys; json.load(open("/etc/docker/daemon.json"))'
-              # Asserts the daemon actually read the file, rather than that the
-              # file merely exists.
-              docker info --format '{{ "{{" }}.LoggingDriver{{ "}}" }}' | grep -qx json-file
+              # Checks the daemon actually read the file, not just that the file
+              # exists. Plain text rather than --format: a Go template here
+              # collides with AWSTOE's own {{ }} substitution.
+              docker info 2>/dev/null | tr -d ' ' | grep -qx 'LoggingDriver:json-file'
 
       - name: EnabledOnBoot
         action: ExecuteBash
@@ -137,8 +144,8 @@ phases:
           commands:
             - |
               set -euo pipefail
-              # A registry credential in an AMI is distributed to everyone who
-              # can launch it.
+              # A registry credential in an AMI goes to everyone who can
+              # launch it.
               for f in /root/.docker/config.json /home/*/.docker/config.json; do
                 [ -e "$f" ] || continue
                 if grep -q '"auth"' "$f" 2>/dev/null; then

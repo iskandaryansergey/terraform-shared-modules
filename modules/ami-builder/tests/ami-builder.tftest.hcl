@@ -1,28 +1,22 @@
 # Layer 1 of three: mocked plan tests.
 #
-# What these CAN prove is the shape of the graph and the content of anything
-# Terraform computes itself - versions, IAM policy documents, the governance
-# output, and every validation and precondition.
+# These prove the shape of the graph and the content of anything Terraform
+# computes itself - versions, IAM policy documents, the governance output, and
+# every validation, precondition and check.
 #
-# READ THIS BEFORE TRUSTING A GREEN RUN.
+# Two things they cannot prove, so read this before trusting a green run.
 #
-# mock_provider cannot report RequiresReplace. A changed component document
-# plans here as "will be updated in-place"; against the real provider the same
-# change is "must be replaced - data, description, kms_key_id, version force
-# replacement". So the module's headline feature, immutable-version handling, is
-# invisible to this file by construction.
+# mock_provider does not report RequiresReplace. A changed component document
+# plans here as "will be updated in-place", while against the real provider it
+# is "must be replaced - data, description, kms_key_id, version force
+# replacement". The module's headline feature, immutable-version handling, is
+# therefore invisible to this file by construction. The hash-coverage runs below
+# are the closest a mocked suite gets: they assert the version MOVES when a
+# ForceNew input changes.
 #
-# That is exactly how a defect shipped: component_hash_input omitted description
-# and kms_key_id, both ForceNew, so adding a CMK replaced the component WITHOUT
-# moving its version and CreateComponent would have failed on a version whose
-# content had not changed - unrecoverable on retry. 78 green tests said nothing.
-# The hash-coverage tests below are the closest a mocked suite can get: they
-# assert that the version MOVES when a ForceNew input changes.
-#
-# What this file also cannot prove is that an image builds. Two bundled test
-# assertions used to fail every single build because test components run on a
-# NEW instance booted from the snapshot, where cloud-init has regenerated the
-# state they asserted was absent. No plan test can see that.
+# And nothing here proves an image builds. Test components run on a NEW instance
+# booted from the snapshot, where cloud-init has already regenerated state that
+# the build instance did not have - no plan test can see that.
 #
 # Structural checks on the component YAML live in tests/lint_components.py.
 
@@ -36,12 +30,22 @@ mock_provider "aws" {
   mock_data "aws_caller_identity" {
     defaults = { account_id = "111122223333" }
   }
-  # The parent-image guards read these. Without the mock, the provider invents a
-  # random root_device_name and the guard fires on every run.
+  # The parent-image guards read all of these. Without the mock the provider
+  # invents a random root_device_name and the guard fires on every run.
+  #
+  # override_data in a run block does NOT inherit these: lists and sets come
+  # back empty and strings get random values. Every guard here is written to
+  # pass when the value is absent, which is why those runs still work.
   mock_data "aws_ami" {
     defaults = {
       architecture     = "x86_64"
       root_device_name = "/dev/xvda"
+      deprecation_time = ""
+      product_codes    = []
+      block_device_mappings = [{
+        device_name = "/dev/xvda"
+        ebs         = { volume_size = "8" }
+      }]
     }
   }
   mock_resource "aws_imagebuilder_component" {
@@ -163,6 +167,28 @@ run "create_false_makes_nothing" {
       length(aws_iam_role.build) == 0,
     ])
     error_message = "create = false must plan to nothing at all."
+  }
+
+  # Every output has to survive the empty case too. A `create = false` plan that
+  # errors inside an output is the same outage as one that errors on a resource.
+  assert {
+    condition = alltrue([
+      output.governance == null,
+      output.network_contract == null,
+      output.verify_commands == null,
+      output.sns_topic_policy_requirement == null,
+      output.pipeline_arn == null,
+      output.recipe_version == null,
+      output.log_group_name == null,
+      output.build_instance_profile_name == null,
+      output.ami_ssm_parameter_name == null,
+      output.ami_launch_template_reference == null,
+      length(output.kms_key_policy_requirements) == 0,
+      length(output.component_arns) == 0,
+      length(output.component_versions) == 0,
+      length(output.ami_ids_by_region) == 0,
+    ])
+    error_message = "create = false must leave every output null or empty."
   }
 }
 
@@ -811,13 +837,12 @@ run "a_six_field_cron_is_accepted" {
 run "the_start_condition_reaches_the_pipeline" {
   command = apply
 
-  # This used to assert that the DEFAULT start condition
-  # (..._AND_DEPENDENCY_UPDATES_AVAILABLE) reached the pipeline, and called that
-  # "avoiding rebuilds when nothing changed". It is worse than that: with a
-  # pinned parent and content-derived component versions, nothing can ever
-  # change, so the schedule never fires at all. The baseline now sets
-  # EXPRESSION_MATCH_ONLY and check "the_schedule_can_actually_fire" rejects the
-  # combination that cannot work.
+  # The configured start condition has to reach the pipeline. The default
+  # (..._AND_DEPENDENCY_UPDATES_AVAILABLE) reads like "don't rebuild when
+  # nothing changed", but with a pinned parent and content-derived component
+  # versions nothing can ever change, so the schedule never fires at all. The
+  # baseline sets EXPRESSION_MATCH_ONLY, and check
+  # "the_schedule_can_actually_fire" rejects the combination that can't work.
   assert {
     condition = alltrue([
       for s in aws_imagebuilder_image_pipeline.this[0].schedule :
@@ -923,10 +948,8 @@ run "build_on_apply_creates_a_one_shot_image" {
 run "both_deprecation_and_deletion_are_on_by_default" {
   command = apply
 
-  # This used to assert that deletion was OFF by default. A policy that deletes
-  # nothing costs nothing and saves nothing, and it satisfied a check whose own
-  # error message described the resulting unbounded growth. Deletion is now on
-  # at 365 days, behind the recency exemption.
+  # Deletion is on by default, at 365 days and behind the recency exemption. A
+  # policy that deprecates and never deletes costs nothing and saves nothing.
   assert {
     condition     = length(aws_imagebuilder_lifecycle_policy.this[0].policy_detail) == 2
     error_message = "expected both a DEPRECATE and a DELETE policy detail by default."
@@ -1039,11 +1062,9 @@ run "the_lifecycle_policy_selects_by_tag_not_by_pinned_version" {
 run "the_lifecycle_selector_tag_exists_where_aws_actually_looks" {
   command = apply
 
-  # This test used to assert that a distribution configuration existed and that
-  # a boolean variable was true. Its comment named the invariant precisely and
-  # its body checked neither half of it - which is how the selector-tag defect
-  # survived. The real invariant is: the tag the policy selects on must be on
-  # the IMAGE BUILDER resource, because that is the only place AWS looks.
+  # Two halves, and both have to hold: the policy selects by tag rather than by
+  # a pinned version, and the tag it selects on sits on the Image Builder
+  # resource - the only place AWS looks for it.
   variables {
     lifecycle_delete_after_days = 400
   }
@@ -1244,7 +1265,7 @@ run "the_governance_output_reports_a_defensible_default_posture" {
       output.governance.image_tests_enabled,
       output.governance.imds_v2_required,
       output.governance.terminates_on_failure,
-      output.governance.build_logs_persisted,
+      output.governance.build_log_bucket != "",
       output.governance.lifecycle_policy_enabled,
       output.governance.lifecycle_deletes_amis,
       # NOT rebuilds_only_on_change: that reports the dependency-updates start
@@ -1438,8 +1459,8 @@ run "baseline_versions" {
 # ---------------------------------------------------------------------------
 # Regressions for the audit findings
 #
-# One run block per defect, each named for the finding. Every one of these
-# passed - or did not exist - while the defect was live.
+# One run block per finding, named for it. Each of these either passed or did
+# not exist while the thing it names was broken.
 # ---------------------------------------------------------------------------
 
 run "regression_lifecycle_selector_tag_is_on_the_imagebuilder_resource" {
@@ -1525,8 +1546,8 @@ run "regression_require_cmk_counts_the_build_region_key" {
   variables {
     kms_key_arn = "arn:aws:kms:eu-west-1:111122223333:key/12345678-1234-1234-1234-123456789012"
     require_cmk = true
-    # Deliberately empty: this is the shipped gitlab-runner-manager shape, and
-    # it used to fail the require_cmk precondition because regions_without_cmk
+    # Deliberately empty: this is the shipped gitlab-runner-manager shape, where
+    # kms_key_arn alone has to satisfy require_cmk because regions_without_cmk
     # read only the distribution map.
     distribution_kms_key_arns = {}
   }
@@ -1538,7 +1559,7 @@ run "regression_require_cmk_counts_the_build_region_key" {
 
   assert {
     condition     = output.governance.customer_managed_key
-    error_message = "governance must report a customer-managed key when kms_key_arn is set. It previously reported false and regions_without_cmk = [] in the same object."
+    error_message = "governance must report a customer-managed key when kms_key_arn is set, and not contradict its own regions_without_cmk field."
   }
 }
 
@@ -1811,9 +1832,8 @@ run "regression_the_snapshot_check_tracks_deletion_not_policy_existence" {
   command = plan
 
   variables {
-    # A policy exists, but deletes nothing. The check used to assert
-    # create_lifecycle_policy and passed here - while its own error message
-    # described exactly this situation.
+    # A policy that exists and deletes nothing, which is the case a check
+    # asserting create_lifecycle_policy would happily call fine.
     lifecycle_delete_after_days = 0
   }
 
@@ -1912,8 +1932,7 @@ run "regression_widening_the_build_role_without_a_boundary_warns" {
     permissions_boundary_arn     = ""
   }
 
-  # The widest knob on a role that runs arbitrary root code had no check at all,
-  # while nine lower-impact things did.
+  # The widest knob in the module, on a role that runs arbitrary code as root.
   expect_failures = [check.build_role_blast_radius_was_reviewed]
 }
 
@@ -2397,5 +2416,273 @@ run "regression_policy_attachments_are_keyed_by_arn_not_index" {
       "arn:aws:iam::111122223333:policy/a"
     )
     error_message = "attachments must be keyed by ARN so removing a middle entry does not churn the rest."
+  }
+}
+
+run "regression_mixed_architecture_instance_types_are_rejected" {
+  command = plan
+
+  # Image Builder treats instance_types as a pool and picks on availability, so
+  # a mixed list fails at instance launch whenever it picks the wrong one. The
+  # parent-architecture guard passed this happily: the parent's architecture was
+  # in the list, just not on its own.
+  variables {
+    instance_types = ["m6i.large", "m7g.large"]
+  }
+
+  expect_failures = [aws_imagebuilder_image_recipe.this]
+}
+
+run "regression_a_root_volume_matching_the_parent_is_accepted" {
+  command = plan
+
+  # The mocked parent has an 8 GB root, so 8 is the floor rather than a failure.
+  variables {
+    root_volume_size_gb = 8
+  }
+
+  assert {
+    condition     = output.governance.parent_image_root_volume_gb == 8
+    error_message = "governance must report the parent's root volume size when the parent was read."
+  }
+}
+
+run "regression_a_root_volume_below_the_parents_fails_the_precondition" {
+  command = plan
+
+  variables {
+    root_volume_size_gb = 8
+  }
+
+  override_data {
+    target = data.aws_ami.parent[0]
+    values = {
+      architecture     = "x86_64"
+      root_device_name = "/dev/xvda"
+      block_device_mappings = [{
+        device_name = "/dev/xvda"
+        ebs         = { volume_size = "30" }
+      }]
+    }
+  }
+
+  expect_failures = [aws_imagebuilder_image_recipe.this]
+}
+
+run "regression_an_ami_description_over_the_ec2_limit_is_rejected" {
+  command = plan
+
+  # description allows 1024 characters and ami_description falls back to it, but
+  # EC2 caps an AMI description at 255 - so this used to fail at distribution,
+  # after the build had run.
+  variables {
+    description = "x0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789 and then some more text to push it well past the limit"
+  }
+
+  expect_failures = [aws_imagebuilder_distribution_configuration.this]
+}
+
+run "regression_too_many_ami_tags_are_rejected" {
+  command = plan
+
+  # EC2 allows 50 tags per resource, and the module adds its own on top of
+  # tags + ami_tags.
+  variables {
+    ami_tags = { for i in range(60) : "key-${i}" => "value" }
+  }
+
+  expect_failures = [aws_imagebuilder_distribution_configuration.this]
+}
+
+run "regression_a_cross_region_sns_topic_is_rejected" {
+  command = plan
+
+  # Neither Image Builder nor EventBridge delivers to a topic in another
+  # region; the notifications just never arrive.
+  variables {
+    sns_topic_arn = "arn:aws:sns:us-east-1:111122223333:image-builds"
+  }
+
+  expect_failures = [aws_imagebuilder_infrastructure_configuration.this]
+}
+
+run "regression_a_same_region_sns_topic_is_accepted" {
+  command = plan
+
+  variables {
+    sns_topic_arn = "arn:aws:sns:eu-west-1:111122223333:image-builds"
+  }
+
+  assert {
+    condition     = length(aws_cloudwatch_event_rule.image_state) == 1
+    error_message = "a same-region topic must still get the EventBridge rule."
+  }
+
+  assert {
+    condition     = output.governance.notifications_enabled
+    error_message = "governance must report that notifications are wired up."
+  }
+}
+
+run "regression_notification_failures_can_go_to_a_dlq" {
+  command = plan
+
+  # A publish the topic rejects - missing topic policy, wrong key policy on an
+  # encrypted topic - is discarded with no trace unless a DLQ catches it.
+  variables {
+    sns_topic_arn               = "arn:aws:sns:eu-west-1:111122223333:image-builds"
+    event_dead_letter_queue_arn = "arn:aws:sqs:eu-west-1:111122223333:image-build-alerts-dlq"
+  }
+
+  assert {
+    condition     = output.governance.notification_failures_go_to_dlq
+    error_message = "governance must report whether undelivered notifications are captured."
+  }
+
+  assert {
+    condition = length([
+      for d in aws_cloudwatch_event_target.image_state[0].dead_letter_config :
+      d if d.arn == "arn:aws:sqs:eu-west-1:111122223333:image-build-alerts-dlq"
+    ]) == 1
+    error_message = "the DLQ must reach the event target, not just the governance output."
+  }
+}
+
+run "regression_the_sns_topic_policy_the_caller_must_write_is_emitted" {
+  command = plan
+
+  # The module owns no topic and an aws_sns_topic_policy here would replace
+  # whatever policy the topic already has. Without these statements the publish
+  # is denied and the alert is gone.
+  variables {
+    sns_topic_arn = "arn:aws:sns:eu-west-1:111122223333:image-builds"
+  }
+
+  assert {
+    condition     = length(output.sns_topic_policy_requirement.statements) == 2
+    error_message = "both publishers - Image Builder itself and the EventBridge rule - need a statement."
+  }
+
+  assert {
+    condition = length([
+      for s in output.sns_topic_policy_requirement.statements :
+      s if s.principal == "events.amazonaws.com"
+    ]) == 1
+    error_message = "the EventBridge principal is the one that silently drops the notification worth paging on."
+  }
+}
+
+run "regression_no_topic_means_no_topic_policy_requirement" {
+  command = plan
+
+  assert {
+    condition     = output.sns_topic_policy_requirement == null
+    error_message = "with no topic configured there is nothing for the caller to write."
+  }
+}
+
+run "regression_a_deprecated_parent_image_warns" {
+  command = plan
+
+  # Deprecated public AMIs get deregistered eventually, and then the pipeline
+  # starts failing at the least convenient moment.
+  override_data {
+    target = data.aws_ami.parent[0]
+    values = {
+      architecture     = "x86_64"
+      root_device_name = "/dev/xvda"
+      deprecation_time = "2020-01-01T00:00:00.000Z"
+    }
+  }
+
+  expect_failures = [check.parent_image_is_not_deprecated]
+}
+
+run "regression_a_marketplace_parent_image_warns" {
+  command = plan
+
+  # Product codes are inherited by every image built from the parent, which is
+  # what breaks the cross-account copy later.
+  override_data {
+    target = data.aws_ami.parent[0]
+    values = {
+      architecture     = "x86_64"
+      root_device_name = "/dev/xvda"
+      product_codes = [{
+        product_code_id   = "aw0evgkw8e5c1q413zgy5pjce"
+        product_code_type = "marketplace"
+      }]
+    }
+  }
+
+  assert {
+    condition     = length(output.governance.parent_image_marketplace_codes) == 1
+    error_message = "governance must expose the inherited product code."
+  }
+
+  expect_failures = [check.parent_image_has_no_marketplace_codes]
+}
+
+run "regression_build_log_statements_have_no_disabled_branch" {
+  command = plan
+
+  # log_s3_bucket is a required variable, so the S3 statements are always
+  # present. The old conditional read as an option that did not exist, and the
+  # check that asserted it could never fire.
+  assert {
+    condition = length([
+      for s in jsondecode(aws_iam_role_policy.build[0].policy).Statement :
+      s.Sid if s.Sid == "PutBuildLogs"
+    ]) == 1
+    error_message = "the build role must always carry the log-write statement."
+  }
+
+  assert {
+    condition = length([
+      for n in output.network_contract.notes : n if can(regex("Build logs go to s3://", n))
+    ]) == 1
+    error_message = "the network contract must always name the log bucket."
+  }
+}
+
+run "rollback_levers_are_reported" {
+  command = plan
+
+  # Retention is also the rollback window, so a change review has to be able to
+  # see the depth without reading the lifecycle policy. See ROLLOUT.md.
+  variables {
+    lifecycle_retain_at_least = 5
+    lifecycle_exclude_tags    = { Retain = "true" }
+  }
+
+  assert {
+    condition     = output.governance.rollback_depth_images == 5
+    error_message = "governance must report how many images survive the age rules, because that is the rollback depth."
+  }
+
+  assert {
+    condition     = can(regex("SourceRecipeVersion", output.verify_commands.rollback_candidates))
+    error_message = "the rollback listing must show which recipe version each candidate came from."
+  }
+
+  assert {
+    condition     = can(regex("Key=Retain,Value=true", output.verify_commands.protect_from_lifecycle))
+    error_message = "the break-glass command must use the caller's own exclusion tags."
+  }
+
+  assert {
+    condition     = can(regex("--status DISABLED", output.verify_commands.stop_the_pipeline))
+    error_message = "stopping a bad image at the source is the first rollback step."
+  }
+}
+
+run "with_no_exclusion_tags_the_break_glass_says_so" {
+  command = plan
+
+  # Empty lifecycle_exclude_tags means no tag protects an image from deletion.
+  # Emitting a command that pretends otherwise would be worse than emitting none.
+  assert {
+    condition     = can(regex("no tag exempts an image", output.verify_commands.protect_from_lifecycle))
+    error_message = "with no exclusion tags configured, the command must say there is no break-glass rather than offer a fake one."
   }
 }

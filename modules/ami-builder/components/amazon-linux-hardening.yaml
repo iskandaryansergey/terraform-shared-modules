@@ -1,20 +1,19 @@
 name: amazon-linux-hardening
 description: >-
-  A baseline for Amazon Linux 2023. This is not a CIS or STIG certification -
-  where you need an attestable benchmark, use the AWS-managed
-  stig-build-linux-high component and reference it by arn instead. What this
-  gives you is the subset that is safe to apply unconditionally, does not break
-  a CI worker, and is verified in the test phase rather than merely asserted.
+  A baseline for Amazon Linux 2023. Not a CIS or STIG certification - if you
+  need an attestable benchmark, reference the AWS-managed stig-build-linux-high
+  component by arn instead. This is the subset that's safe to apply everywhere,
+  doesn't break a CI worker, and gets checked in the test phase rather than
+  just claimed.
 schemaVersion: 1.0
 
 parameters:
   - AllowPasswordAuth:
       type: string
       description: >-
-        Leave sshd password authentication enabled. Must be "yes" or "no" - these
-        are the tokens sshd_config actually takes and the ones `sshd -T` echoes
-        back. It previously defaulted to "false", which sshd does not accept, so
-        the default path would have failed at `sshd -t`.
+        Leave sshd password authentication enabled. Must be "yes" or "no" -
+        those are the tokens sshd_config takes and the ones `sshd -T` echoes
+        back. "true"/"false" fails at `sshd -t`.
       default: "no"
   - JournalMaxSize:
       type: string
@@ -31,16 +30,16 @@ phases:
             - |
               set -euo pipefail
               dnf update -y --security
-              # This makes the image non-reproducible over time by design: the
-              # same recipe built next month picks up newer packages.
+              # This is what makes the image non-reproducible over time, on
+              # purpose: the same recipe built next month picks up newer
+              # packages.
               #
-              # Note what that does NOT do. The pipeline's
+              # What it does not do is trigger anything. The pipeline's
               # EXPRESSION_MATCH_AND_DEPENDENCY_UPDATES_AVAILABLE condition
-              # evaluates the base image and component VERSIONS, not the package
-              # repository - so it cannot notice that new packages exist. With a
-              # pinned parent you need EXPRESSION_MATCH_ONLY for a monthly
-              # rebuild to happen at all. An earlier version of this comment
-              # claimed the opposite.
+              # looks at the base image and component versions, not at the
+              # package repository, so it can't tell that new packages exist.
+              # With a pinned parent you need EXPRESSION_MATCH_ONLY for a
+              # monthly rebuild to happen at all.
 
       - name: HardenSshd
         action: ExecuteBash
@@ -49,7 +48,7 @@ phases:
             - |
               set -euo pipefail
               install -d -m 0755 /etc/ssh/sshd_config.d
-              # A drop-in rather than an edit of sshd_config: AL2023 ships an
+              # A drop-in rather than an edit of sshd_config - AL2023 ships an
               # Include, and rewriting the main file loses upstream changes on
               # the next package update.
               cat > /etc/ssh/sshd_config.d/50-hardening.conf <<'EOF'
@@ -64,9 +63,9 @@ phases:
               ClientAliveCountMax 2
               EOF
               chmod 0600 /etc/ssh/sshd_config.d/50-hardening.conf
-              # Validate before the image is sealed. A malformed drop-in makes
-              # sshd fail to start on first boot, and on an instance whose only
-              # other access path is SSM that is recoverable but alarming.
+              # Validate before the image is sealed. A malformed drop-in stops
+              # sshd starting on first boot - recoverable over SSM, but not the
+              # discovery anyone wants to make.
               sshd -t
 
       - name: BoundJournalSize
@@ -88,9 +87,9 @@ phases:
           commands:
             - |
               set -euo pipefail
-              # Deliberately excludes ip_forward: Docker requires it, and a
-              # hardening component that silently breaks container networking is
-              # worse than no hardening component.
+              # No ip_forward here on purpose: Docker needs it, and a hardening
+              # component that quietly breaks container networking is worse than
+              # none.
               cat > /etc/sysctl.d/50-hardening.conf <<'EOF'
               net.ipv4.conf.all.accept_redirects = 0
               net.ipv4.conf.all.send_redirects = 0
@@ -110,32 +109,31 @@ phases:
           commands:
             - |
               set -euo pipefail
-              # Everything below is a real source of leaked material in AMIs.
+              # Every one of these has leaked something out of an AMI before.
               rm -f /root/.bash_history /home/*/.bash_history
               rm -f /root/.ssh/authorized_keys
               rm -rf /var/lib/cloud/instances /var/lib/cloud/instance
               rm -f /etc/ssh/ssh_host_*
-              # Host keys are regenerated on first boot. Baking them means every
-              # instance from this AMI shares one host identity, which defeats
+              # Host keys come back on first boot. Baking them means every
+              # instance from this AMI shares one identity, which defeats
               # host-key verification entirely.
               truncate -s 0 /var/log/wtmp /var/log/lastlog 2>/dev/null || true
               dnf clean all
-              # NOT /tmp/* or /var/tmp/*: working_directory defaults to /tmp,
-              # where AWSTOE stages the remaining component documents, the
-              # generated step scripts and this run's log. Deleting it mid-build
-              # takes out the logs for the build you needed them for. dnf clean
-              # all above already handles the package cache, and /tmp does not
-              # survive to the AMI anyway.
+              # Not /tmp/* or /var/tmp/*. working_directory defaults to /tmp,
+              # where AWSTOE keeps the remaining component documents, the
+              # generated step scripts and this run's log - deleting it mid-build
+              # takes out the logs you'd want. dnf clean all covers the package
+              # cache, and /tmp doesn't survive into the AMI anyway.
               rm -rf /var/cache/dnf
 
-  # validate runs on the BUILD instance, before the snapshot. test runs on a new
-  # instance booted FROM that snapshot, where cloud-init has already regenerated
-  # host keys and written authorized_keys - so these two assertions can only be
-  # made here. Placed in test they failed every single build.
+  # validate runs on the build instance, before the snapshot. test runs on a new
+  # instance booted from that snapshot, where cloud-init has already regenerated
+  # host keys and written authorized_keys - so these two can only be asserted
+  # here.
   #
-  # There is also an internal proof they cannot live in test: that phase runs
-  # `sshd -t`, which fails when no host keys exist, while NoHostKeysBakedIn
-  # requires that none exist. Mutually unsatisfiable on one instance.
+  # They also can't coexist with the test phase by construction: that phase runs
+  # `sshd -t`, which needs host keys, while NoHostKeysBakedIn needs there to be
+  # none.
   - name: validate
     steps:
       - name: NoHostKeysBakedIn
@@ -177,8 +175,8 @@ phases:
           commands:
             - |
               set -euo pipefail
-              # Reads sshd's effective config rather than grepping a file, so an
-              # override elsewhere cannot make this pass falsely.
+              # sshd's effective config, not a grep of the file, so an override
+              # somewhere else can't make this pass falsely.
               sshd -T 2>/dev/null | grep -qx 'permitrootlogin no'
 
       - name: PasswordAuthMatchesRequest
@@ -187,10 +185,9 @@ phases:
           commands:
             - |
               set -euo pipefail
-              # Asserts the POSTURE, not the request. Grepping for
-              # "passwordauthentication {{ AllowPasswordAuth }}" passed happily
-              # with password auth enabled, while the README presented this as a
-              # hardening assertion.
+              # Asserts the posture, not the request. Grepping for
+              # "passwordauthentication {{ AllowPasswordAuth }}" passes happily
+              # with password auth switched on.
               case '{{ AllowPasswordAuth }}' in
                 yes|no) : ;;
                 *) echo "FATAL: AllowPasswordAuth must be yes or no, got '{{ AllowPasswordAuth }}'" >&2; exit 1 ;;
@@ -208,8 +205,8 @@ phases:
             - |
               set -euo pipefail
               test -f /etc/sysctl.d/50-hardening.conf
-              # Asserts the kernel accepts every key, catching a typo that would
-              # otherwise be silently ignored at boot.
+              # The kernel has to accept every key, which catches a typo that
+              # would otherwise be ignored at boot.
               sysctl -p /etc/sysctl.d/50-hardening.conf >/dev/null
 
       - name: IpForwardNotDisabled
@@ -218,8 +215,8 @@ phases:
           commands:
             - |
               set -euo pipefail
-              # Guards against a future edit adding ip_forward = 0, which would
-              # break Docker networking on every worker built from this image.
+              # Catches a future edit adding ip_forward = 0, which would break
+              # Docker networking on every worker built from this image.
               if grep -qE '^\s*net\.ipv4\.ip_forward\s*=\s*0' /etc/sysctl.d/50-hardening.conf; then
                 echo "FATAL: ip_forward is disabled, which breaks container networking." >&2
                 exit 1
@@ -232,9 +229,9 @@ phases:
             - |
               set -euo pipefail
               # dnf exits 100 when updates are available, 0 when none are.
-              # Capture the status directly: after an if...fi whose branch was
-              # not taken, $? is the compound statement's 0, not dnf's, so the
-              # old `if [ "$?" = "100" ]` form was unreachable dead code.
+              # Capture the status directly - after an if...fi, $? is the
+              # compound statement's 0 rather than dnf's, which makes the
+              # obvious `if [ "$?" = "100" ]` form dead code.
               rc=0
               dnf check-update --security -q >/dev/null 2>&1 || rc=$?
               case "$rc" in

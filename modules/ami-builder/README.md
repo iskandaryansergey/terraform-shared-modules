@@ -4,13 +4,18 @@ Governed, reproducible machine images. One module call gives you a recipe, a
 build environment, a distribution policy, a schedule, and a retention policy
 that actually reclaims snapshot storage.
 
-**Status:** implemented and audited — 19 resources, 4 data sources, 77 variables,
-90 validations, 19 preconditions, 12 advisory checks, 21 outputs, 136 plan tests
+**Status:** implemented and audited — 19 resources, 4 data sources, 78 variables,
+92 validations, 24 preconditions, 13 advisory checks, 22 outputs, 151 plan tests
 green, two linters with self-test regressions.
 
-Three independent audits (security, well-architected, correctness) produced
-**6 CRITICAL, 10 HIGH and ~30 MEDIUM/LOW** findings. All are fixed, each with a
-regression test. See [What the audits found](#what-the-audits-found).
+| Also here | For |
+|---|---|
+| [COSTS.md](COSTS.md) | What this actually costs, and the one line that has no ceiling |
+| [ROLLOUT.md](ROLLOUT.md) | How a fleet moves onto a new image, and how you get it back |
+
+Four review passes (security, well-architected, correctness, then a deep review)
+produced **7 CRITICAL, 10 HIGH and ~35 MEDIUM/LOW** findings. All are fixed,
+each with a regression test. See [What the audits found](#what-the-audits-found).
 
 **Still not validated against a live AWS account:** no image has been built by
 this module. Several of the criticals were things only a real build would
@@ -123,10 +128,16 @@ resource "aws_launch_template" "workers" {
 }
 ```
 
-Two worked examples live in [`examples/`](examples/): a
-[general base image](examples/simple/) and the
-[GitLab runner manager AMI](examples/gitlab-runner-manager/) that closes the P1
-gap above.
+Three worked examples live in [`examples/`](examples/):
+
+| Example | Shows |
+|---|---|
+| [`simple/`](examples/simple/) | A general base image — the smallest honest configuration |
+| [`gitlab-runner-manager/`](examples/gitlab-runner-manager/) | The manager AMI that closes the P1 gap above |
+| [`rollout-asg/`](examples/rollout-asg/) | The consumption side: a worker fleet tracking the pipeline, and the pin that rolls it back |
+
+That `resolve:ssm:` snippet is the whole rollout story in one line, and the
+whole rollback story in none — see [ROLLOUT.md](ROLLOUT.md) for the rest of it.
 
 ### The schedule trap
 
@@ -335,19 +346,31 @@ Three subtleties, all of which were originally wrong:
 
 ## What costs money
 
+Full model, scenarios and sensitivity in **[COSTS.md](COSTS.md)**. The short
+version:
+
 | Line | Driver |
 |---|---|
-| **VPC interface endpoints** | ~$8/AZ/month each. In a dedicated build VPC this dominates everything: about $24/month at 1 AZ to run $0.04/month of builds. Share a landing zone's endpoints and it is ~$0 marginal |
-| **Retained snapshot storage** | ~$0.05/GB-month **per retained image, forever**, until the lifecycle policy removes it. Over five years, roughly 190× the build compute. This is the line that surprises people |
-| Build instance | Two instances per build (build + test), ~15–23 minutes total, about **$0.034 per build** |
-| Cross-region distribution | A full snapshot copy per region per build, plus transfer. A check warns above three extra regions |
-| Fast launch | Windows-only in practice, and `target_resource_count` pre-provisioned snapshots per AMI — a 6× multiplier on the growing line. The module refuses to enable it without a Windows component |
-| `root_volume_size_gb` | Not a build cost. It is the default root volume of **every instance launched from the image**: 30 vs 20 GB across 20 workers is about $17.60/month |
+| **Retained snapshot storage** | $0.05/GB-month **per retained image, forever**, until the lifecycle policy removes it. On a nightly 4-region pipeline the policy is worth **$42,048 over five years** — against **$82** of build compute in the same period. This is the line that surprises people |
+| **VPC interface endpoints** | $8.03/AZ/month each. In a dedicated build VPC this dominates everything: **$24/month at 1 AZ to run $1.86/month of pipeline**. Share a landing zone's endpoints and the marginal cost is ~$0 |
+| Build instance | Two instances per build (build **and** a separate test instance), ~23 minutes total, **$0.046 per build**. 1,000 builds cost $46 |
+| Cross-region distribution | A full snapshot copy per region per build, plus $0.02/GB transfer. Each region *multiplies* the growing line; a check warns above three |
+| Fast launch | Windows-only in practice, and `target_resource_count` pre-provisioned snapshots per AMI — **+389%** on the snapshot line at the default of 5. The module refuses it without a Windows component |
+| `root_volume_size_gb` | Not a build cost. It is the default root volume of **every instance launched from the image**: 30 vs 20 GB across 20 workers is $17.60/month, 9× the pipeline |
 | Image Builder itself | $0. The service is free; you pay for what it launches |
 
-The README originally ranked `pipeline_execution_start_condition` above the
-lifecycle policy as a cost control. That is backwards by three orders of
-magnitude — $14/year versus up to $3,000/year on an aggressive pipeline.
+Two things worth knowing before a cost review:
+
+- **Billed snapshot GB is not provisioned GB.** A 30 GB root holding a hardened
+  AL2023 image bills roughly 6 GB of unique blocks. Sizing the bill on
+  `root_volume_size_gb` overstates it fivefold.
+- **At month 12 the default retention has deleted nothing** — 30 builds a month
+  for a year is 360 images, and none has reached 365 days. A review run at the
+  end of year one concludes the policy is worthless, which is wrong by $42,048.
+
+`pipeline_execution_start_condition` is **not** a cost control: it is worth about
+$14/year of compute. Set it correctly because a schedule that cannot fire is an
+operational lie, not for the money.
 
 ---
 
@@ -420,13 +443,37 @@ instance launch as a generic Image Builder error. Same guard catches it at plan.
 abandon an in-flight build and the next apply would start a second one
 concurrently against the same recipe.
 
+**Mixed architectures in `instance_types`.** Image Builder treats the list as a
+pool and picks on availability, so `["m6i.large", "m7g.large"]` fails at instance
+launch on the runs where it picks the one that does not match the parent. The
+parent-architecture guard passed this happily — the parent's architecture was in
+the list, just not on its own.
+
+**A root volume smaller than the parent's.** EBS grows a volume from a snapshot
+and never shrinks one, so the build dies at instance launch. Read from the
+parent's block device mappings at plan time.
+
+**An AMI description over 255 characters.** `description` allows 1024 and
+`ami_description` falls back to it, but that is EC2's limit — so the build runs
+to completion and fails at the distribution step. Same for more than 50 AMI tags.
+
+**An SNS topic in another region.** Neither Image Builder nor EventBridge
+delivers to one, so every build notification silently goes nowhere.
+
 ### Advisory checks
 
-Twelve `check` blocks warn at plan time without refusing: unpinned parent image,
-scanning off, key pair set, `terminate_instance_on_failure = false`, tests
-disabled, nothing deleting old AMIs, IMDSv1 reachable, a loose IMDS hop limit,
-unlogged builds, more than three distribution regions, a schedule that cannot
-fire, and a widened build role with no permissions boundary.
+Thirteen `check` blocks warn at plan time without refusing: unpinned parent
+image, a *deprecated* parent image, a parent carrying marketplace product codes
+(every image built from it inherits them, and cross-account copies then need a
+subscription), scanning off, key pair set,
+`terminate_instance_on_failure = false`, tests disabled, nothing deleting old
+AMIs, IMDSv1 reachable, a loose IMDS hop limit, more than three distribution
+regions, a schedule that cannot fire, and a widened build role with no
+permissions boundary.
+
+There is no longer a check for unlogged builds: `log_s3_bucket` is a required
+variable, so the condition could never be false. A check that cannot fire reads
+like a control and is not one.
 
 `enable_image_scanning` defaults to **false**, and not because it is optional —
 turn it on. It defaults off because it requires account-level Inspector EC2
@@ -441,9 +488,9 @@ call that closes the loop.
 
 | Layer | What it proves | Run |
 |---|---|---|
-| 136 plan tests | Graph shape, versions, IAM policy content, every validation and precondition, the governance output, and a regression for each audit finding | `terraform test` |
-| `lint_components.py` | AWSTOE schema, undeclared/unused parameters, `curl \| bash`, TLS off, baked credentials, `chmod 777`, multi-line blocks with no `set -e`, plus a cross-check of parameters passed from Terraform | `python3 tests/lint_components.py components --tf-dir examples` |
-| `lint_validations.py` | No validation puts a throwing expression in a *later* operand of `\|\|` or `&&` | `python3 tests/lint_validations.py .` |
+| 149 plan tests | Graph shape, versions, IAM policy content, every validation and precondition, the governance output, and a regression for each audit finding | `terraform test` |
+| `lint_components.py` | AWSTOE schema, undeclared/unused parameters, `curl \| bash`, TLS off, baked credentials, `chmod 777`, multi-line blocks with no `set -e`, a shell variable used in a step that never set it, plus a cross-check of parameters passed from Terraform | `python3 tests/lint_components.py components --tf-dir examples` |
+| `lint_validations.py` | No validation *or local* puts a throwing expression in a *later* operand of `\|\|` or `&&` | `python3 tests/lint_validations.py .` |
 | Component test phases | That an image actually works | Real build |
 
 Both linters have a `--self-test` mode that reintroduces each defect and
@@ -451,10 +498,10 @@ confirms detection, plus asserts the shipped files are clean:
 
 ```
 $ python3 tests/lint_components.py --self-test
-SELF-TEST OK: 7 defects detected, shipped components clean
+SELF-TEST OK: 8 defects detected, shipped components clean
 
 $ python3 tests/lint_validations.py --self-test
-SELF-TEST OK: 10 defects detected, 6 safe forms accepted, module clean
+SELF-TEST OK: 15 defects detected, 8 safe forms accepted, module clean
 ```
 
 ### Read this before trusting a green run
@@ -465,18 +512,30 @@ provider the same change is *"must be replaced — `data`, `description`,
 `kms_key_id`, `version` force replacement"*.
 
 So the module's headline feature — immutable-version handling — is invisible to
-the plan suite **by construction**. That is exactly how a critical defect
-shipped past 78 green tests. The hash-coverage regressions are the closest a
-mocked suite can get: they assert the version **moves** when a ForceNew input
-changes. That is a proxy, not the property itself.
+the plan suite **by construction**, which is how a critical defect once shipped
+past a fully green run. The hash-coverage regressions are the closest a mocked
+suite can get: they assert the version **moves** when a ForceNew input changes.
+That is a proxy, not the property itself.
+
+**`override_data` does not inherit `mock_data` defaults.** A run that overrides
+the parent AMI gets empty lists and random strings for everything it did not
+name, so every parent-image guard is written to pass when the value is absent.
+That is the right failure direction, and it also means those runs prove less
+than they appear to.
 
 **The validation linter is precise about which operand matters.** Only a *later*
 operand of `||`/`&&` is affected by the 1.9 eager-evaluation difference — if the
-*first* operand throws, it throws on every version, which is a different bug. An
-earlier version scanned the whole condition and fired on `x[0] == 1 && x[0] == 2`,
-which is not a version-specific hazard. It now splits on top-level operators and
-only flags a throwing later operand behind a genuine guard. Verified against
-eight sibling modules with no false positives.
+*first* operand throws, it throws on every version, which is a different bug. It
+splits on top-level operators and only flags a throwing later operand behind a
+genuine guard, so `x[0] == 1 && x[0] == 2` is not its business.
+
+It also scans `locals`, not just conditions: a throw in a local happens *before*
+any check or precondition can report it, so moving an expression out of a check
+block was enough to step around the linter entirely. And it splits ternaries
+first, because `?:` binds looser than `&&` in HCL — without that,
+`local.create && var.on ? flatten([x[0]]) : []` reads as an `&&` whose second
+operand indexes a list. This file is shared by copy with
+`gitlab-runner-fargate-v2` and CI fails if the two drift.
 
 ---
 
@@ -510,6 +569,33 @@ an unrecoverable version collision on the first CMK or description change.
 `working_directory` defaulting to `/tmp`, second of four components in both
 examples.
 
+### And what the deep review after them found
+
+**A bundled component could never get past its third step.**
+`install-gitlab-runner` set `REPO_SCRIPT` in `FetchRepoScript` and read it in
+`VerifyRepoScript`. Every AWSTOE step is a separate shell, so under
+`set -euo pipefail` that is an unbound-variable error — the digest check aborts
+the build, every time, for the flagship example. The path was already being
+handed to the *next* step through a file; that step just did not read it.
+`lint_components.py` now checks every step for a variable it never sets, which
+is a property no substring assertion can express.
+
+**A check that could not fire.** `failed_builds_are_diagnosable` asserted
+`log_s3_bucket != ""` on a required variable. It read like a control in the
+governance list and was a constant `true`, along with every branch behind
+`local.logging_enabled`. Both are gone.
+
+**Mixed architectures in `instance_types` passed the architecture guard**, since
+it only asked whether the parent's architecture appeared in the list. See
+[the traps](#traps-the-module-refuses-to-let-you-walk-into) for that one and the
+four other new preconditions.
+
+**Notification delivery had no failure path.** A publish the topic rejects — a
+missing topic policy, the wrong key policy on an encrypted topic — is discarded
+by EventBridge with nothing going red. There is now an
+`event_dead_letter_queue_arn` and an `sns_topic_policy_requirement` output
+carrying the statements the caller has to write.
+
 The auditors also verified as sound: no input path to an unencrypted recipe
 mapping, no route to a public AMI without the gate, correct confused-deputy
 conditions on the lifecycle role, exhaustively clean `create = false` across
@@ -529,6 +615,16 @@ conformance.
   lifecycle selector and the notification path at once.
 - **`terraform destroy` then re-apply may fail** — see
   [Versioning](#versioning).
+- **Retention is also your rollback window.** You cannot roll back to an image
+  the lifecycle policy deleted, so `lifecycle_delete_after_days` and
+  `lifecycle_retain_at_least` are recovery settings as much as cost settings.
+  `governance.rollback_depth_images` reports the floor;
+  [ROLLOUT.md](ROLLOUT.md#4-your-rollback-depth-is-a-retention-setting) has the
+  table.
+- **The module owns nothing that launches the image**, so rollout and rollback
+  are patterns rather than features. `ami_launch_template_reference` and
+  `verify_commands.rollback_candidates` are the handles;
+  [ROLLOUT.md](ROLLOUT.md) is the runbook.
 - **The recipe has no `skip_destroy`** — confirmed absent from the provider
   schema. Images the *pipeline* produced are invisible to Terraform and may
   block `DeleteImageRecipe` when a component edit replaces the recipe. If that
@@ -538,8 +634,13 @@ conformance.
   created — so `terraform destroy` leaves the AMI and its snapshots behind.
 - **The module creates no SNS topic policy.** `events.amazonaws.com` cannot
   publish to a BYO topic without one, so `create_event_rule = true` yields a
-  rule that never delivers until you add it. Named in
-  `kms_key_policy_requirements`.
+  rule that never delivers until you add it. The statements are emitted as
+  `sns_topic_policy_requirement`, and `event_dead_letter_queue_arn` is how you
+  find out it was missing.
+- **The build role's log grant assumes Image Builder's S3 key layout**
+  (`<prefix>/<image-name>/…`). That is what the service writes today and what
+  keeps one pipeline out of another's logs in a shared bucket, but if the layout
+  ever changes, log delivery 403s while the build reports success.
 - **Custom workflows are untested beyond plan**, and `workflow` is a *set* on
   `aws_imagebuilder_image`, so order is not preserved on the `build_on_apply`
   path.
@@ -556,7 +657,7 @@ conformance.
 
 ## Inputs
 
-Seventy-seven variables. The ones that matter most:
+Seventy-eight variables. The ones that matter most:
 
 | Name | Type | Default | Notes |
 |---|---|---|---|
@@ -584,6 +685,8 @@ Seventy-seven variables. The ones that matter most:
 | `lifecycle_delete_after_days` | number | `365` | 0 disables deletion entirely |
 | `target_account_ids` | list(string) | `[]` | Requires a CMK |
 | `build_on_apply` | bool | `false` | Blocks apply for the build |
+| `sns_topic_arn` | string | `""` | Must be in the build region; needs a topic policy |
+| `event_dead_letter_queue_arn` | string | `""` | Catches notifications EventBridge could not deliver |
 
 Run `terraform-docs markdown .` for the full set.
 
@@ -599,7 +702,8 @@ Run `terraform-docs markdown .` for the full set.
 | `governance` | The posture, as data |
 | `network_contract` | Hand to whoever owns the VPC |
 | `kms_key_policy_requirements` | Hand to whoever owns KMS |
-| `verify_commands` | Copy-paste checks, including the three for a hung build |
+| `sns_topic_policy_requirement` | Hand to whoever owns the topic — without it the alerts never arrive |
+| `verify_commands` | Copy-paste checks: three for a hung build, three for a rollback |
 | `build_instance_role_name` | Attach component-specific permissions here |
 
 ## Not in scope

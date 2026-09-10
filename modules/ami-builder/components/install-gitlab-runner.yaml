@@ -1,11 +1,10 @@
 name: install-gitlab-runner
 description: >-
-  Installs gitlab-runner and fleeting-plugin-aws into the image, so a manager
-  instance can boot in a VPC with no route to the public internet. Both are
-  fetched from GitLab's public infrastructure, which means this component must
-  run where that is reachable - a build subnet with egress, or an internal
-  mirror. That is the whole point: the fetch happens once here, at build time,
-  instead of on every manager boot in an isolated estate.
+  Installs gitlab-runner and fleeting-plugin-aws into the image so a manager
+  instance can boot in a VPC with no route to the internet. Both come from
+  GitLab's public infrastructure, so this component needs a build subnet that
+  can reach it (or an internal mirror). That is the trade: fetch once here at
+  build time instead of on every manager boot in an isolated estate.
 schemaVersion: 1.0
 
 parameters:
@@ -44,9 +43,9 @@ phases:
           commands:
             - |
               set -euo pipefail
-              # Quoted: an unquoted value containing a space gave
-              # "[: binary operator expected", exit 2, and a false condition -
-              # so the pin check silently passed.
+              # Quoted. Unquoted, a value with a space gives "[: binary
+              # operator expected" and a false condition, so the pin check
+              # passes without checking anything.
               VERSION='{{ RunnerVersion }}'
               if [ -z "$VERSION" ]; then
                 echo "FATAL: RunnerVersion is empty. An unpinned runner version makes this image non-reproducible." >&2
@@ -59,15 +58,18 @@ phases:
           commands:
             - |
               set -euo pipefail
-              # mktemp -d under 0700, not a fixed /tmp path: verify-then-execute
-              # spans two steps, and working_directory defaults to /tmp.
+              # mktemp -d at 0700 rather than a fixed /tmp path -
+              # verify-then-execute spans three steps and working_directory
+              # defaults to /tmp.
               #
-              # --max-time matters here specifically: in a VPC with no internet
-              # route this fetch is exactly the hang the README warns about, and
-              # without a timeout it burns the whole build window.
+              # --max-time earns its keep here: in a VPC with no internet route
+              # this fetch is the hang the README warns about, and without a
+              # timeout it eats the whole build window.
               WORKDIR="$(mktemp -d)"
               chmod 0700 "$WORKDIR"
               REPO_SCRIPT="$WORKDIR/gl-runner-repo.sh"
+              # Every AWSTOE step is its own shell, so the path has to go
+              # through a file for the next two steps to see it.
               echo "$REPO_SCRIPT" > /run/gl-repo-script-path
               # Single-quoted so command substitution cannot happen inside the URL.
               curl -fsSL --connect-timeout 10 --max-time 120 --retry 5 --retry-delay 3 \
@@ -80,14 +82,14 @@ phases:
           commands:
             - |
               set -euo pipefail
-              # Fails closed. This used to warn and exit 0, so the default
-              # path ran a fetched script as root unverified while the README
-              # advertised "digest-verified repo script" as a fact.
+              # Fails closed. A fetched script that runs as root without a
+              # digest is curl-pipe-bash wearing a hat.
               EXPECTED='{{ RepoScriptSha256 }}'
               if [ -z "$EXPECTED" ]; then
                 echo "FATAL: RepoScriptSha256 is required. This script runs as root; without a digest this is curl-pipe-bash with extra steps." >&2
                 exit 1
               fi
+              REPO_SCRIPT="$(cat /run/gl-repo-script-path)"
               echo "$EXPECTED  $REPO_SCRIPT" | sha256sum -c -
 
       - name: AddRepository
@@ -114,8 +116,9 @@ phases:
           commands:
             - |
               set -euo pipefail
-              # `fleeting install` reads the plugin reference from config.toml,
-              # which does not exist yet at build time, so install by name.
+              # `fleeting install` reads the plugin reference from
+              # config.toml, which doesn't exist yet at build time - so install
+              # it by name.
               if [ -n "{{ PluginVersion }}" ]; then
                 gitlab-runner fleeting install --upgrade \
                   "gitlab.com/gitlab-org/fleeting/plugins/aws:{{ PluginVersion }}"
@@ -131,10 +134,10 @@ phases:
           commands:
             - |
               set -euo pipefail
-              # The image ships no config.toml and no registration token. Leaving
-              # the unit enabled means every instance from this AMI starts a
-              # runner that crash-loops on a missing config, filling the journal
-              # and confusing the first person to look.
+              # No config.toml and no token in the image. Leave the unit
+              # enabled and every instance from this AMI crash-loops a runner on
+              # a missing config, fills the journal, and confuses whoever looks
+              # first.
               systemctl disable gitlab-runner || true
               rm -f /etc/gitlab-runner/config.toml
 
@@ -144,8 +147,8 @@ phases:
           commands:
             - |
               set -euo pipefail
-              # Anything the build fetched with credentials, plus the package
-              # manager caches that record where it came from.
+              # Anything the build fetched with credentials, plus the dnf
+              # caches that record where it came from.
               rm -rf /root/.gitlab-runner /home/*/.gitlab-runner
               dnf clean all
               rm -rf /var/cache/dnf
@@ -166,8 +169,8 @@ phases:
           commands:
             - |
               set -euo pipefail
-              # The package version carries a release suffix, so compare the
-              # upstream part rather than requiring an exact string match.
+              # The package version has a release suffix, so compare the
+              # upstream part instead of demanding an exact match.
               WANT="$(echo '{{ RunnerVersion }}' | cut -d- -f1)"
               GOT="$(gitlab-runner --version | awk '/^Version:/ {print $2}')"
               echo "want=$WANT got=$GOT"
@@ -182,15 +185,15 @@ phases:
           commands:
             - |
               set -euo pipefail
-              # `fleeting install` places the binary under a plugin directory
-              # rather than on $PATH, so checking $PATH would verify nothing.
+              # `fleeting install` drops the binary in a plugin directory, not
+              # on $PATH, so checking $PATH proves nothing.
               FOUND=""
               for c in \
                 /etc/gitlab-runner/plugins/fleeting-plugin-aws \
                 /root/.config/fleeting/plugins/fleeting-plugin-aws \
                 /root/.config/gitlab-runner/plugins/fleeting-plugin-aws
               do
-                # -f as well as -x: [ -x <dir> ] is true for a directory.
+                # -f as well as -x, because [ -x <dir> ] is true for a directory.
                 if [ -f "$c" ] && [ -x "$c" ]; then FOUND="$c"; break; fi
               done
               if [ -z "$FOUND" ]; then
@@ -208,16 +211,13 @@ phases:
           commands:
             - |
               set -euo pipefail
-              # A registration token in an AMI is a credential distributed to
+              # A registration token in an AMI is a credential handed to
               # everyone who can launch it.
-              # No pipeline. The old `grep -rl ... | head -1 | grep -q .` form
-              # took SIGPIPE on grep once head exited, and pipefail then made
-              # the pipeline status 141 - so the FATAL branch was SKIPPED. The
-              # more token material the image contained, the more reliably the
-              # test passed.
               #
-              # /var added: AWSTOE's logs and cloud-init's user-data copy live
-              # there, and both can carry a token.
+              # No pipeline into head: grep takes SIGPIPE when head exits, and
+              # pipefail then turns that into status 141, which skips the FATAL
+              # branch entirely. /var is in the list because AWSTOE's logs and
+              # cloud-init's user-data copy both live there.
               if grep -rIlq 'glrt-' /etc /var /root /home /opt 2>/dev/null; then
                 echo "FATAL: a glrt- runner token is present in this image." >&2
                 grep -rIl 'glrt-' /etc /var /root /home /opt 2>/dev/null | head -20 >&2 || true

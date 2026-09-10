@@ -1,9 +1,9 @@
 name: verify-image
 description: >-
-  Generic assertions to run last, in the test phase only. This component has no
-  build phase on purpose - it exists to fail a build that produced an image you
-  should not launch. Every check here is about the image as an artifact rather
-  than about any particular payload, so it is safe to append to any recipe.
+  Assertions to run last. No build phase on purpose - this component exists to
+  fail a build that produced an image you shouldn't launch. Everything here is
+  about the image as an artifact rather than any particular payload, so it's
+  safe to append to any recipe.
 schemaVersion: 1.0
 
 parameters:
@@ -16,7 +16,7 @@ parameters:
   - RequireSsmAgent:
       type: string
       description: >-
-        Assert the SSM agent is installed and enabled. Set "false" only when
+        Assert the SSM agent is installed and enabled. Set "false" only if
         uninstall_ssm_agent_after_build is deliberately true.
       default: "true"
   - ForbiddenPaths:
@@ -27,9 +27,9 @@ parameters:
       default: "/root/.aws/credentials /root/.ssh/id_rsa /etc/gitlab-runner/config.toml"
 
 phases:
-  # Runs on the BUILD instance. cloud-init regenerates its state on the test
-  # instance's first boot, so this assertion is impossible to make in the test
-  # phase - it failed every build there.
+  # Runs on the build instance. cloud-init regenerates its state when the test
+  # instance first boots, so this one can't be asserted in the test phase - it
+  # fails every build there.
   - name: validate
     steps:
       - name: CloudInitStateCleared
@@ -38,12 +38,12 @@ phases:
           commands:
             - |
               set -euo pipefail
-              # A baked cloud-init instance state makes the first boot from this
-              # AMI skip user-data, because cloud-init believes it has already
-              # run on this instance.
-              # Checks the directory as well as the symlink: removing only
-              # the symlink left instances/<id>/user-data.txt in the image and
-              # still passed a step named CloudInitStateCleared.
+              # Baked cloud-init state makes the first boot from this AMI skip
+              # user-data, because cloud-init thinks it already ran here.
+              #
+              # Directory as well as symlink: removing just the symlink leaves
+              # instances/<id>/user-data.txt in the image and still passes a
+              # step named CloudInitStateCleared.
               RC=0
               for p in /var/lib/cloud/instance /var/lib/cloud/instances /var/lib/amazon/toe; do
                 if [ -e "$p" ]; then
@@ -85,9 +85,8 @@ phases:
                 echo "SSM agent check skipped by parameter."
                 exit 0
               fi
-              # The agent is how an operator reaches an instance without SSH. If
-              # it is missing, the first incident on this image has no access
-              # path at all.
+              # The agent is how anyone reaches an instance without SSH. Missing,
+              # the first incident on this image has no access path at all.
               systemctl is-enabled amazon-ssm-agent 2>/dev/null | grep -qx enabled
 
       - name: NoForbiddenPaths
@@ -111,12 +110,11 @@ phases:
           commands:
             - |
               set -euo pipefail
-              # An AWS access key baked into an AMI is a long-lived credential
-              # handed to everyone who can launch it. Matches the key-id shape
-              # rather than the word "secret", which catches the real thing and
-              # not a variable named after it.
-              # /var included: AWSTOE's own logs under /var/lib/amazon/toe and
-              # cloud-init's user-data copy both live there.
+              # An access key in an AMI is a long-lived credential handed to
+              # everyone who can launch it. Matches the key-id shape rather than
+              # the word "secret", so it catches the real thing and not a
+              # variable named after it. /var is in the list because AWSTOE's
+              # logs and cloud-init's user-data copy both live there.
               HITS="$(grep -rIlE '(AKIA|ASIA)[0-9A-Z]{16}' /etc /var /root /home /opt /srv 2>/dev/null || true)"
               if [ -n "$HITS" ]; then
                 echo "FATAL: AWS access key material found in:" >&2
@@ -130,8 +128,8 @@ phases:
           commands:
             - |
               set -euo pipefail
-              # Excludes the sticky-bit directories where world-writable is
-              # correct (/tmp, /var/tmp) and looks at files only.
+              # Files only, and not the sticky-bit dirs where world-writable is
+              # correct (/tmp, /var/tmp).
               HITS="$(find /etc /usr /opt -xdev -type f -perm -0002 2>/dev/null || true)"
               if [ -n "$HITS" ]; then
                 echo "FATAL: world-writable files in system paths:" >&2
@@ -157,8 +155,8 @@ phases:
           commands:
             - |
               set -euo pipefail
-              # Not an assertion. This lands in the build log so the artifact's
-              # contents are recorded next to the build that produced it.
+              # Not an assertion - it lands in the build log so the artifact's
+              # contents sit next to the build that produced them.
               echo "=== image inventory ==="
               cat /etc/os-release | grep -E '^(NAME|VERSION)='
               uname -r

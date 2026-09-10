@@ -1,8 +1,8 @@
 # Replaces Image Builder's managed workflows. Rarely needed - an empty list
 # leaves the service defaults, which is right for almost every pipeline.
 #
-# Worth it when you need a step the default has no place for: a signing stage
-# between build and test, or distribution gated on an approval.
+# Worth it when you need a step the default has no place for: signing between
+# build and test, or distribution gated on an approval.
 
 locals {
   managed_workflows = { for w in var.workflows : w.name => w if w.arn == "" }
@@ -54,9 +54,9 @@ resource "aws_imagebuilder_workflow" "this" {
     create_before_destroy = true
 
     precondition {
-      # components.tf has this precondition too, but it lives on a resource with
-      # zero instances when every components entry carries an arn - so an
-      # all-arn config with a managed workflow reached CreateWorkflow with an
+      # components.tf has the same check, but that resource has zero instances
+      # when every components entry carries an arn - and then nothing stops an
+      # all-arn config with a managed workflow reaching CreateWorkflow with an
       # empty version.
       condition     = var.auto_version ? true : var.component_version != ""
       error_message = "auto_version = false requires component_version to be set; it doubles as the workflow version and AWS will not accept an empty one."
