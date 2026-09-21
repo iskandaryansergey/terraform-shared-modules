@@ -1,0 +1,95 @@
+{
+  "ChangeProcessingDdlHandlingPolicy": {
+    "HandleSourceTableAltered": true,
+    "HandleSourceTableDropped": true,
+    "HandleSourceTableTruncated": true
+  },
+  "ControlTablesSettings": {
+    "ControlSchema": "dms_control",
+    "HistoryTableEnabled": true,
+    "HistoryTimeslotInMinutes": 5,
+    "StatusTableEnabled": true,
+    "SuspendedTablesTableEnabled": true
+  },
+  "ErrorBehavior": {
+    "ApplyErrorDeletePolicy": "IGNORE_RECORD",
+    "ApplyErrorEscalationCount": 0,
+    "ApplyErrorEscalationPolicy": "LOG_ERROR",
+    "ApplyErrorInsertPolicy": "LOG_ERROR",
+    "ApplyErrorUpdatePolicy": "LOG_ERROR",
+    "DataErrorEscalationCount": 0,
+    "DataErrorEscalationPolicy": "SUSPEND_TABLE",
+    "DataErrorPolicy": "LOG_ERROR",
+    "DataTruncationErrorPolicy": "LOG_ERROR",
+    "FailOnNoTablesCaptured": true,
+    "FailOnTransactionConsistencyBreached": false,
+    "FullLoadIgnoreConflicts": true,
+    "RecoverableErrorCount": -1,
+    "RecoverableErrorInterval": 5,
+    "RecoverableErrorThrottling": true,
+    "RecoverableErrorThrottlingMax": 1800,
+    "TableErrorEscalationCount": 50,
+    "TableErrorEscalationPolicy": "STOP_TASK",
+    "TableErrorPolicy": "SUSPEND_TABLE"
+  },
+  "FullLoadSettings": {
+    "CommitRate": 10000,
+    "CreatePkAfterFullLoad": false,
+    "MaxFullLoadSubTasks": 8,
+    "StopTaskCachedChangesApplied": false,
+    "StopTaskCachedChangesNotApplied": false,
+    "TargetTablePrepMode": "DO_NOTHING",
+    "TransactionConsistencyTimeout": 600
+  },
+  "Logging": {
+    "EnableLogging": true,
+    "LogComponents": [
+      {
+        "Id": "SOURCE_UNLOAD",
+        "Severity": "LOGGER_SEVERITY_DEFAULT"
+      },
+      {
+        "Id": "SOURCE_CAPTURE",
+        "Severity": "LOGGER_SEVERITY_DEFAULT"
+      },
+      {
+        "Id": "TARGET_LOAD",
+        "Severity": "LOGGER_SEVERITY_DEFAULT"
+      },
+      {
+        "Id": "TARGET_APPLY",
+        "Severity": "LOGGER_SEVERITY_DEFAULT"
+      },
+      {
+        "Id": "TASK_MANAGER",
+        "Severity": "LOGGER_SEVERITY_DEFAULT"
+      },
+      {
+        "Id": "VALIDATOR",
+        "Severity": "LOGGER_SEVERITY_DEFAULT"
+      }
+    ]
+  },
+  "TargetMetadata": {
+    "BatchApplyEnabled": false,
+    "FullLobMode": false,
+    "InlineLobMaxSize": 0,
+    "LimitedSizeLobMode": false,
+    "LoadMaxFileSize": 0,
+    "LobChunkSize": 64,
+    "LobMaxSize": 0,
+    "ParallelLoadBufferSize": 0,
+    "ParallelLoadThreads": 0,
+    "SupportLobs": false,
+    "TargetSchema": "",
+    "TaskRecoveryTableEnabled": false
+  },
+  "ValidationSettings": {
+    "EnableValidation": true,
+    "FailureMaxCount": 10000,
+    "HandleCollationDiff": true,
+    "TableFailureMaxCount": 1000,
+    "ThreadCount": 5,
+    "ValidationOnly": false
+  }
+}

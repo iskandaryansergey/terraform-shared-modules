@@ -1,0 +1,27 @@
+{
+  "rules": [
+    {
+      "rule-type": "selection",
+      "rule-id": "1",
+      "rule-name": "include-sales",
+      "object-locator": {
+        "schema-name": "sales",
+        "table-name": "%"
+      },
+      "rule-action": "include",
+      "filters": []
+    },
+    {
+      "rule-type": "transformation",
+      "rule-id": "2",
+      "rule-name": "drop-pii-column",
+      "rule-target": "column",
+      "object-locator": {
+        "schema-name": "sales",
+        "table-name": "customers",
+        "column-name": "national_id"
+      },
+      "rule-action": "remove-column"
+    }
+  ]
+}

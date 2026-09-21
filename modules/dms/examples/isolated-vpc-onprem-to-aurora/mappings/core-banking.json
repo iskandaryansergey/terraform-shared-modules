@@ -1,0 +1,59 @@
+{
+  "rules": [
+    {
+      "rule-type": "selection",
+      "rule-id": "1",
+      "rule-name": "include-core-schema",
+      "object-locator": {
+        "schema-name": "CORE",
+        "table-name": "%"
+      },
+      "rule-action": "include",
+      "filters": []
+    },
+    {
+      "rule-type": "selection",
+      "rule-id": "2",
+      "rule-name": "exclude-staging-tables",
+      "object-locator": {
+        "schema-name": "CORE",
+        "table-name": "STG_%"
+      },
+      "rule-action": "exclude",
+      "filters": []
+    },
+    {
+      "rule-type": "transformation",
+      "rule-id": "3",
+      "rule-name": "schema-to-lowercase",
+      "rule-target": "schema",
+      "object-locator": {
+        "schema-name": "CORE"
+      },
+      "rule-action": "convert-lowercase"
+    },
+    {
+      "rule-type": "transformation",
+      "rule-id": "4",
+      "rule-name": "tables-to-lowercase",
+      "rule-target": "table",
+      "object-locator": {
+        "schema-name": "CORE",
+        "table-name": "%"
+      },
+      "rule-action": "convert-lowercase"
+    },
+    {
+      "rule-type": "transformation",
+      "rule-id": "5",
+      "rule-name": "columns-to-lowercase",
+      "rule-target": "column",
+      "object-locator": {
+        "schema-name": "CORE",
+        "table-name": "%",
+        "column-name": "%"
+      },
+      "rule-action": "convert-lowercase"
+    }
+  ]
+}
