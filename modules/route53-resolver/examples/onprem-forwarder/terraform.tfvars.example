@@ -1,0 +1,12 @@
+vpc_id     = "vpc-xxxxxxxxxxxxxxxxx"
+subnet_ids = ["subnet-xxxxxxxxxxxxxxxxx", "subnet-yyyyyyyyyyyyyyyyy"] # different AZs
+
+# One server works and is a single point of failure for every name in the zone.
+# The module warns about it at plan time. Add a second when one exists.
+onprem_dns_servers = ["10.36.65.179"]
+
+forward_zone = "server.banksvc.net"
+
+# The DNS audit record. Point at a log group, bucket or Firehose - or set
+# acknowledge_no_query_logging = true and be explicit that there is none.
+query_log_destination_arn = "arn:aws:logs:eu-west-2:111122223333:log-group:/aws/route53/resolver"
