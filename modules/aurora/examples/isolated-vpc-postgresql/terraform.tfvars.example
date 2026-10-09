@@ -1,0 +1,14 @@
+# Copy to terraform.tfvars and replace every value. The IDs below are
+# placeholders; none of them exist.
+
+region = "eu-west-2"
+
+vpc_id             = "vpc-0123456789abcdef0"
+subnet_ids         = ["subnet-0aaaaaaaaaaaaaaa1", "subnet-0bbbbbbbbbbbbbbb2"]
+availability_zones = ["eu-west-2a", "eu-west-2b"]
+
+app_security_group_id = "sg-0123456789abcdef0"
+onprem_cidr           = "10.20.0.0/16"
+
+kms_key_arn   = "arn:aws:kms:eu-west-2:111122223333:key/11111111-2222-3333-4444-555555555555"
+sns_topic_arn = "arn:aws:sns:eu-west-2:111122223333:platform-data-alerts"

@@ -1,865 +1,559 @@
-# Native `terraform test` suite for the Aurora module (plan-only).
-# Uses a credential-free provider so no real AWS resources or credentials are
-# required. Exercises happy-path planning and every input validation.
-# Run with: terraform test
+# One file, the module's main paths: the default cluster, each engine and
+# compute shape, bring-your-own, proxy, autoscaling, global roles, create =
+# false, and a sample of the refusals and checks.
+#
+# Plan-only against mock_provider: no AWS account and no credentials. It
+# proves what the module plans, not that AWS accepts it.
 
-provider "aws" {
-  region                      = "us-east-1"
-  access_key                  = "mock"
-  secret_key                  = "mock"
-  skip_credentials_validation = true
-  skip_requesting_account_id  = true
-  skip_metadata_api_check     = true
-}
-
-# --- Happy path: provisioned PostgreSQL cluster plans cleanly -----------------
-run "provisioned_postgres_defaults" {
-  command = plan
-
-  variables {
-    cluster_identifier = "test-pg"
-    engine             = "aurora-postgresql"
-    engine_version     = "15.4"
-    vpc_id             = "vpc-12345678"
-    subnet_ids         = ["subnet-aaaa1111", "subnet-bbbb2222"]
+mock_provider "aws" {
+  mock_data "aws_partition" {
+    defaults = { partition = "aws" }
   }
-
-  assert {
-    condition     = local.port == 5432
-    error_message = "PostgreSQL should default to port 5432"
+  # The module reads the region from endpoint: v6 deprecates name and v5 has
+  # no region attribute.
+  mock_data "aws_region" {
+    defaults = { endpoint = "ec2.eu-west-2.amazonaws.com" }
   }
-
-  assert {
-    condition     = aws_rds_cluster.main.engine_mode == "provisioned"
-    error_message = "Engine mode should default to provisioned"
+  mock_data "aws_caller_identity" {
+    defaults = { account_id = "111122223333" }
   }
-
-  assert {
-    condition     = local.subnet_group_name == "test-pg-subnet-group"
-    error_message = "Subnet group name should derive from the cluster identifier"
-  }
-
-  assert {
-    condition     = length(aws_db_subnet_group.main) == 1
-    error_message = "A subnet group should be created by default"
-  }
-
-  assert {
-    condition     = length(aws_rds_cluster_instance.instances) == 1
-    error_message = "The default writer instance should be planned"
-  }
-}
-
-# --- MySQL gets the right default port ----------------------------------------
-run "mysql_default_port" {
-  command = plan
-
-  variables {
-    cluster_identifier = "test-mysql"
-    engine             = "aurora-mysql"
-    engine_version     = "8.0"
-    vpc_id             = "vpc-12345678"
-    subnet_ids         = ["subnet-aaaa1111", "subnet-bbbb2222"]
-  }
-
-  assert {
-    condition     = local.port == 3306
-    error_message = "MySQL should default to port 3306"
-  }
-}
-
-# --- Managed master password nulls out the static password -------------------
-run "managed_master_password" {
-  command = plan
-
-  variables {
-    cluster_identifier          = "test-pg"
-    engine                      = "aurora-postgresql"
-    engine_version              = "15.4"
-    vpc_id                      = "vpc-12345678"
-    subnet_ids                  = ["subnet-aaaa1111", "subnet-bbbb2222"]
-    manage_master_user_password = true
-  }
-
-  assert {
-    condition     = aws_rds_cluster.main.manage_master_user_password == true
-    error_message = "manage_master_user_password should be forwarded to the cluster"
-  }
-
-  assert {
-    condition     = aws_rds_cluster.main.master_password == null
-    error_message = "master_password must be null when RDS manages the secret"
-  }
-}
-
-# --- Bring-your-own subnet group skips creation ------------------------------
-run "byo_subnet_group" {
-  command = plan
-
-  variables {
-    cluster_identifier     = "test-pg"
-    engine                 = "aurora-postgresql"
-    engine_version         = "15.4"
-    vpc_id                 = "vpc-12345678"
-    create_db_subnet_group = false
-    db_subnet_group_name   = "preexisting-subnet-group"
-  }
-
-  assert {
-    condition     = length(aws_db_subnet_group.main) == 0
-    error_message = "No subnet group should be created when reusing an existing one"
-  }
-
-  assert {
-    condition     = local.db_subnet_group_name == "preexisting-subnet-group"
-    error_message = "Cluster should attach to the provided subnet group"
-  }
-}
-
-# --- Custom endpoints and role associations are planned ----------------------
-run "custom_endpoints_and_roles" {
-  command = plan
-
-  variables {
-    cluster_identifier = "test-pg"
-    engine             = "aurora-postgresql"
-    engine_version     = "15.4"
-    vpc_id             = "vpc-12345678"
-    subnet_ids         = ["subnet-aaaa1111", "subnet-bbbb2222"]
-    instances = {
-      writer = { instance_class = "db.r6g.large", promotion_tier = 0 }
-      reader = { instance_class = "db.r6g.large", promotion_tier = 1 }
-    }
-    cluster_endpoints = {
-      analytics = { type = "READER", static_members = ["test-pg-reader"] }
-    }
-    iam_role_associations = {
-      s3import = { role_arn = "arn:aws:iam::123456789012:role/aurora-s3", feature_name = "s3Import" }
+  mock_resource "aws_rds_cluster" {
+    defaults = {
+      id  = "test-cluster"
+      arn = "arn:aws:rds:eu-west-2:111122223333:cluster:test-cluster"
+      master_user_secret = [{
+        secret_arn    = "arn:aws:secretsmanager:eu-west-2:111122223333:secret:rds!cluster-abc"
+        kms_key_id    = "arn:aws:kms:eu-west-2:111122223333:key/11111111-2222-3333-4444-555555555555"
+        secret_status = "active"
+      }]
+      engine_lifecycle_support = "open-source-rds-extended-support-disabled"
     }
   }
-
-  assert {
-    condition     = length(aws_rds_cluster_endpoint.custom) == 1
-    error_message = "One custom endpoint should be planned"
-  }
-
-  assert {
-    condition     = aws_rds_cluster_endpoint.custom["analytics"].cluster_endpoint_identifier == "test-pg-analytics"
-    error_message = "Custom endpoint identifier should be prefixed with the cluster identifier"
-  }
-
-  assert {
-    condition     = length(aws_rds_cluster_role_association.this) == 1
-    error_message = "One IAM role association should be planned"
-  }
-}
-
-# --- BYO monitoring role: no role is created ---------------------------------
-run "byo_monitoring_role" {
-  command = plan
-
-  variables {
-    cluster_identifier  = "test-pg"
-    engine              = "aurora-postgresql"
-    engine_version      = "15.4"
-    vpc_id              = "vpc-12345678"
-    subnet_ids          = ["subnet-aaaa1111", "subnet-bbbb2222"]
-    monitoring_interval = 60
-    monitoring_role_arn = "arn:aws:iam::123456789012:role/existing-monitoring"
-  }
-
-  assert {
-    condition     = length(aws_iam_role.enhanced_monitoring) == 0
-    error_message = "No monitoring role should be created when one is supplied"
-  }
-
-  assert {
-    condition     = local.monitoring_role_arn == "arn:aws:iam::123456789012:role/existing-monitoring"
-    error_message = "The supplied monitoring role ARN should be used"
-  }
-}
-
-# ============================================================================
-# VALIDATION FAILURES
-# ============================================================================
-
-# --- Invalid cluster identifier ----------------------------------------------
-run "invalid_cluster_identifier_fails" {
-  command = plan
-
-  variables {
-    cluster_identifier = "1-bad-start"
-    engine             = "aurora-postgresql"
-    engine_version     = "15.4"
-    vpc_id             = "vpc-12345678"
-    subnet_ids         = ["subnet-aaaa1111", "subnet-bbbb2222"]
-  }
-
-  expect_failures = [var.cluster_identifier]
-}
-
-# --- Serverless mode requires a scaling configuration ------------------------
-run "serverless_requires_scaling_fails" {
-  command = plan
-
-  variables {
-    cluster_identifier = "test-pg"
-    engine             = "aurora-postgresql"
-    engine_version     = "15.4"
-    engine_mode        = "serverless"
-    vpc_id             = "vpc-12345678"
-    subnet_ids         = ["subnet-aaaa1111", "subnet-bbbb2222"]
-  }
-
-  expect_failures = [var.serverless_scaling_configuration]
-}
-
-# --- Backtrack window only valid for aurora-mysql ----------------------------
-run "backtrack_postgres_fails" {
-  command = plan
-
-  variables {
-    cluster_identifier = "test-pg"
-    engine             = "aurora-postgresql"
-    engine_version     = "15.4"
-    vpc_id             = "vpc-12345678"
-    subnet_ids         = ["subnet-aaaa1111", "subnet-bbbb2222"]
-    backtrack_window   = 3600
-  }
-
-  expect_failures = [var.backtrack_window]
-}
-
-# --- Data API (HTTP endpoint) is allowed on a provisioned cluster ------------
-run "http_endpoint_on_provisioned_ok" {
-  command = plan
-
-  variables {
-    cluster_identifier   = "test-pg"
-    engine               = "aurora-postgresql"
-    engine_version       = "15.4"
-    vpc_id               = "vpc-12345678"
-    subnet_ids           = ["subnet-aaaa1111", "subnet-bbbb2222"]
-    enable_http_endpoint = true
-  }
-
-  assert {
-    condition     = aws_rds_cluster.main.enable_http_endpoint == true
-    error_message = "Data API should be enableable on a provisioned cluster"
-  }
-}
-
-# --- Parameter-group family is derived correctly per engine ------------------
-run "parameter_group_family_postgres" {
-  command = plan
-
-  variables {
-    cluster_identifier = "test-pg"
-    engine             = "aurora-postgresql"
-    engine_version     = "15.4"
-    vpc_id             = "vpc-12345678"
-    subnet_ids         = ["subnet-aaaa1111", "subnet-bbbb2222"]
-  }
-
-  assert {
-    condition     = local.cluster_parameter_group_family == "aurora-postgresql15"
-    error_message = "PostgreSQL family should be aurora-postgresql<major>"
-  }
-}
-
-run "parameter_group_family_mysql" {
-  command = plan
-
-  variables {
-    cluster_identifier = "test-mysql"
-    engine             = "aurora-mysql"
-    engine_version     = "8.0"
-    vpc_id             = "vpc-12345678"
-    subnet_ids         = ["subnet-aaaa1111", "subnet-bbbb2222"]
-  }
-
-  assert {
-    condition     = local.cluster_parameter_group_family == "aurora-mysql8.0"
-    error_message = "MySQL family should be aurora-mysql<major>.<minor> (e.g. aurora-mysql8.0)"
-  }
-
-  assert {
-    condition     = local.db_parameter_group_family == "aurora-mysql8.0"
-    error_message = "MySQL DB parameter group family should also be aurora-mysql8.0"
-  }
-}
-
-# --- Invalid storage type ----------------------------------------------------
-run "invalid_storage_type_fails" {
-  command = plan
-
-  variables {
-    cluster_identifier = "test-pg"
-    engine             = "aurora-postgresql"
-    engine_version     = "15.4"
-    vpc_id             = "vpc-12345678"
-    subnet_ids         = ["subnet-aaaa1111", "subnet-bbbb2222"]
-    storage_type       = "io2"
-  }
-
-  expect_failures = [var.storage_type]
-}
-
-# --- Managed password conflicts with a static master password ----------------
-run "managed_and_static_password_conflict_fails" {
-  command = plan
-
-  variables {
-    cluster_identifier          = "test-pg"
-    engine                      = "aurora-postgresql"
-    engine_version              = "15.4"
-    vpc_id                      = "vpc-12345678"
-    subnet_ids                  = ["subnet-aaaa1111", "subnet-bbbb2222"]
-    manage_master_user_password = true
-    master_password             = "SuperSecret123"
-  }
-
-  expect_failures = [var.manage_master_user_password]
-}
-
-# --- Reusing a subnet group requires its name --------------------------------
-run "byo_subnet_group_without_name_fails" {
-  command = plan
-
-  variables {
-    cluster_identifier     = "test-pg"
-    engine                 = "aurora-postgresql"
-    engine_version         = "15.4"
-    vpc_id                 = "vpc-12345678"
-    create_db_subnet_group = false
-  }
-
-  expect_failures = [var.create_db_subnet_group]
-}
-
-# --- Activity stream requires a KMS key --------------------------------------
-run "activity_stream_without_kms_fails" {
-  command = plan
-
-  variables {
-    cluster_identifier     = "test-pg"
-    engine                 = "aurora-postgresql"
-    engine_version         = "15.4"
-    vpc_id                 = "vpc-12345678"
-    subnet_ids             = ["subnet-aaaa1111", "subnet-bbbb2222"]
-    enable_activity_stream = true
-  }
-
-  expect_failures = [var.enable_activity_stream]
-}
-
-# --- Custom endpoint with an invalid type ------------------------------------
-run "invalid_custom_endpoint_type_fails" {
-  command = plan
-
-  variables {
-    cluster_identifier = "test-pg"
-    engine             = "aurora-postgresql"
-    engine_version     = "15.4"
-    vpc_id             = "vpc-12345678"
-    subnet_ids         = ["subnet-aaaa1111", "subnet-bbbb2222"]
-    cluster_endpoints = {
-      bad = { type = "WRITER" }
+  mock_resource "aws_rds_global_cluster" {
+    defaults = {
+      id  = "orders-global"
+      arn = "arn:aws:rds::111122223333:global-cluster:orders-global"
     }
   }
-
-  expect_failures = [var.cluster_endpoints]
+  mock_resource "aws_iam_role" {
+    defaults = { arn = "arn:aws:iam::111122223333:role/mock" }
+  }
+  # The proxy target validates target_group_name; AWS calls it "default".
+  mock_resource "aws_db_proxy_default_target_group" {
+    defaults = { name = "default" }
+  }
 }
 
-# --- Custom endpoint cannot set both member lists ----------------------------
-run "custom_endpoint_both_member_lists_fails" {
-  command = plan
+# A fully configured cluster that trips no advisory check: terraform test
+# fails a run on any check it does not expect.
+variables {
+  name = "test-cluster"
 
-  variables {
-    cluster_identifier = "test-pg"
-    engine             = "aurora-postgresql"
-    engine_version     = "15.4"
-    vpc_id             = "vpc-12345678"
-    subnet_ids         = ["subnet-aaaa1111", "subnet-bbbb2222"]
-    cluster_endpoints = {
-      bad = { type = "READER", static_members = ["a"], excluded_members = ["b"] }
-    }
+  tags = {
+    Environment = "test"
+    CostCentre  = "cc-1234"
+    Owner       = "data-platform"
+  }
+  required_tag_keys = ["CostCentre", "Owner"]
+
+  engine         = "aurora-postgresql"
+  engine_version = "16.4"
+  instance_class = "db.r7g.large"
+  instances = {
+    "1" = {}
+    "2" = {}
   }
 
-  expect_failures = [var.cluster_endpoints]
-}
+  database_name = "app"
+  kms_key_arn   = "arn:aws:kms:eu-west-2:111122223333:key/11111111-2222-3333-4444-555555555555"
 
-# --- A writer (promotion_tier 0) is required ---------------------------------
-run "no_writer_instance_fails" {
-  command = plan
-
-  variables {
-    cluster_identifier = "test-pg"
-    engine             = "aurora-postgresql"
-    engine_version     = "15.4"
-    vpc_id             = "vpc-12345678"
-    subnet_ids         = ["subnet-aaaa1111", "subnet-bbbb2222"]
-    instances = {
-      reader = { instance_class = "db.r6g.large", promotion_tier = 1 }
-    }
+  vpc_id     = "vpc-0123456789abcdef0"
+  subnet_ids = ["subnet-0123456789abcdef0", "subnet-0123456789abcdef1", "subnet-0123456789abcdef2"]
+  ingress_rules = {
+    app    = { referenced_security_group_id = "sg-0123456789abcdef0", description = "orders service" }
+    onprem = { cidr_ipv4 = "10.20.0.0/16", description = "data centre via DX" }
   }
 
-  expect_failures = [var.instances]
+  enabled_cloudwatch_logs_exports = ["postgresql"]
+  sns_topic_arn                   = "arn:aws:sns:eu-west-2:111122223333:db-alerts"
+
+  # Runs that deviate from the baseline for another reason acknowledge every
+  # check, so an incidental warning is not mistaken for the thing under test.
+  every_check = [
+    "cluster_survives_an_az", "instances_are_spread_across_azs", "somebody_hears_a_failover",
+    "deleting_the_cluster_is_protected", "deleting_the_cluster_leaves_a_snapshot", "backups_cover_a_week",
+    "query_level_metrics_exist", "database_logs_leave_the_instance", "log_retention_is_bounded",
+    "tls_is_enforced_where_the_module_can_see", "the_module_controls_who_connects",
+    "ingress_stays_inside_private_address_space", "something_can_connect", "credentials_are_not_in_state",
+    "engine_version_is_exact", "minor_upgrades_do_not_fight_the_pin", "extended_support_matches_the_setting",
+    "extended_support_is_a_decision", "auto_pause_has_an_engine_that_supports_it", "the_proxy_has_clients",
+    "the_proxy_can_reach_secrets_manager", "the_proxy_can_decrypt_its_secrets",
+    "master_secret_key_is_the_one_configured", "performance_insights_key_is_the_one_configured",
+    "activity_stream_key_is_the_one_configured", "database_insights_advanced_on_a_global_member",
+    "major_upgrade_applies_immediately", "reader_autoscaling_has_a_reader",
+    "mysql_log_exports_have_their_switches", "parameter_group_family_matches_the_engine",
+  ]
 }
 
-# --- Fewer than two subnets is rejected when creating a subnet group ---------
-run "insufficient_subnets_fails" {
+# ---------------------------------------------------------------------------
+# The default cluster
+# ---------------------------------------------------------------------------
+
+run "the_default_cluster_has_the_expected_resources" {
   command = plan
 
-  variables {
-    cluster_identifier = "test-pg"
-    engine             = "aurora-postgresql"
-    engine_version     = "15.4"
-    vpc_id             = "vpc-12345678"
-    subnet_ids         = ["subnet-aaaa1111"]
-  }
-
-  expect_failures = [var.subnet_ids]
-}
-
-# --- vpc_id is required when the module creates a security group --------------
-run "missing_vpc_with_security_group_fails" {
-  command = plan
-
-  variables {
-    cluster_identifier = "test-pg"
-    engine             = "aurora-postgresql"
-    engine_version     = "15.4"
-    subnet_ids         = ["subnet-aaaa1111", "subnet-bbbb2222"]
-  }
-
-  expect_failures = [var.vpc_id]
-}
-
-# ============================================================================
-# FEATURE BEHAVIOUR (plan assertions)
-# ============================================================================
-
-# --- I/O-Optimized storage is accepted ---------------------------------------
-run "io_optimized_storage_accepted" {
-  command = plan
-
-  variables {
-    cluster_identifier = "test-pg"
-    engine             = "aurora-postgresql"
-    engine_version     = "15.4"
-    vpc_id             = "vpc-12345678"
-    subnet_ids         = ["subnet-aaaa1111", "subnet-bbbb2222"]
-    storage_type       = "aurora-iopt1"
+  assert {
+    condition = alltrue([
+      length(aws_rds_cluster.this) == 1,
+      length(aws_rds_cluster_instance.this) == 2,
+      length(aws_rds_global_cluster.this) == 0,
+      length(aws_db_subnet_group.this) == 1,
+      length(aws_security_group.this) == 1,
+      length(aws_vpc_security_group_ingress_rule.this) == 2,
+      length(aws_vpc_security_group_egress_rule.this) == 0,
+      length(aws_rds_cluster_parameter_group.this) == 1,
+      length(aws_db_parameter_group.this) == 1,
+      length(aws_iam_role.monitoring) == 1,
+      length(aws_cloudwatch_log_group.this) == 1,
+    ])
+    error_message = "a default cluster is one cluster, two instances, a subnet group, a security group with one rule per ingress_rules key and no egress, both parameter groups, the monitoring role and a log group per export."
   }
 
   assert {
-    condition     = aws_rds_cluster.main.storage_type == "aurora-iopt1"
-    error_message = "storage_type aurora-iopt1 should be forwarded to the cluster"
+    condition = alltrue([
+      length(aws_db_proxy.this) == 0,
+      length(aws_rds_cluster_activity_stream.this) == 0,
+      length(aws_appautoscaling_target.readers) == 0,
+      length(aws_rds_cluster_endpoint.this) == 0,
+    ])
+    error_message = "proxy, activity stream, reader autoscaling and custom endpoints are opt-in."
+  }
+
+  assert {
+    condition = alltrue([
+      length(aws_cloudwatch_metric_alarm.writer_cpu) == 1,
+      length(aws_cloudwatch_metric_alarm.reader_cpu) == 1,
+      length(aws_cloudwatch_metric_alarm.replica_lag) == 1,
+      length(aws_cloudwatch_metric_alarm.transaction_ids) == 1,
+      length(aws_cloudwatch_metric_alarm.freeable_memory) == 2,
+      length(aws_db_event_subscription.cluster) == 1,
+      length(aws_db_event_subscription.instances) == 1,
+    ])
+    error_message = "the default alarms and both event subscriptions are created."
   }
 }
 
-# --- Serverless v2 runs on a provisioned cluster with a scaling block --------
-run "serverless_v2_scaling_block" {
+run "the_default_cluster_is_secure" {
+  command = plan
+
+  assert {
+    condition = alltrue([
+      aws_rds_cluster.this[0].storage_encrypted,
+      aws_rds_cluster.this[0].kms_key_id == var.kms_key_arn,
+      aws_rds_cluster.this[0].deletion_protection,
+      !aws_rds_cluster.this[0].skip_final_snapshot,
+      aws_rds_cluster.this[0].manage_master_user_password,
+      aws_rds_cluster.this[0].master_password == null,
+    ])
+    error_message = "encrypted with the given key, deletion-protected, a final snapshot, and the password held by RDS in Secrets Manager rather than in state."
+  }
+
+  assert {
+    condition     = contains([for p in aws_rds_cluster_parameter_group.this[0].parameter : "${p.name}=${p.value}"], "rds.force_ssl=1")
+    error_message = "TLS is enforced in the cluster parameter group."
+  }
+
+  assert {
+    condition     = alltrue([for i in aws_rds_cluster_instance.this : !i.publicly_accessible])
+    error_message = "no instance is publicly accessible."
+  }
+}
+
+run "names_and_tags_follow_the_inputs" {
+  command = plan
+
+  assert {
+    condition = alltrue([
+      aws_rds_cluster.this[0].cluster_identifier == "test-cluster",
+      aws_rds_cluster_instance.this["1"].identifier == "test-cluster-1",
+      aws_rds_cluster_instance.this["2"].identifier == "test-cluster-2",
+      aws_db_subnet_group.this[0].name == "test-cluster",
+      aws_rds_cluster_parameter_group.this[0].name == "test-cluster-cluster-aurora-postgresql16",
+      aws_rds_cluster_parameter_group.this[0].family == "aurora-postgresql16",
+    ])
+    error_message = "the cluster, instances, subnet group and parameter groups are named from name, the groups for the engine family."
+  }
+
+  assert {
+    condition = alltrue([
+      aws_rds_cluster.this[0].tags["CostCentre"] == "cc-1234",
+      aws_rds_cluster.this[0].tags["ManagedBy"] == "Terraform",
+      aws_rds_cluster_instance.this["1"].tags["Owner"] == "data-platform",
+      aws_rds_cluster_instance.this["1"].tags["Name"] == "test-cluster-1",
+    ])
+    error_message = "caller tags and the module's own reach the cluster and its instances."
+  }
+}
+
+# ---------------------------------------------------------------------------
+# Engines and compute
+# ---------------------------------------------------------------------------
+
+run "aurora_mysql_gets_its_port_family_and_tls_parameter" {
   command = plan
 
   variables {
-    cluster_identifier = "test-sv2"
-    engine             = "aurora-postgresql"
-    engine_version     = "15.4"
-    vpc_id             = "vpc-12345678"
-    subnet_ids         = ["subnet-aaaa1111", "subnet-bbbb2222"]
-    serverless_scaling_configuration = {
-      min_capacity = 0.5
-      max_capacity = 16
-    }
-    instances = {
-      writer = { instance_class = "db.serverless", promotion_tier = 0 }
+    engine                          = "aurora-mysql"
+    engine_version                  = "8.0.mysql_aurora.3.08.0"
+    enabled_cloudwatch_logs_exports = ["error"]
+  }
+
+  assert {
+    condition = alltrue([
+      aws_rds_cluster.this[0].port == 3306,
+      aws_rds_cluster_parameter_group.this[0].family == "aurora-mysql8.0",
+      contains([for p in aws_rds_cluster_parameter_group.this[0].parameter : "${p.name}=${p.value}"], "require_secure_transport=ON"),
+    ])
+    error_message = "aurora-mysql listens on 3306, uses the aurora-mysql8.0 family and enforces TLS with require_secure_transport."
+  }
+
+  assert {
+    condition     = length(aws_cloudwatch_metric_alarm.transaction_ids) == 0
+    error_message = "transaction ID wraparound is a PostgreSQL alarm."
+  }
+}
+
+run "serverless_v2_gets_a_scaling_range_and_acu_alarms" {
+  command = plan
+
+  variables {
+    instance_class                     = "db.serverless"
+    serverlessv2_scaling_configuration = { min_capacity = 0.5, max_capacity = 4 }
+  }
+
+  assert {
+    condition = alltrue([
+      aws_rds_cluster.this[0].serverlessv2_scaling_configuration[0].min_capacity == 0.5,
+      aws_rds_cluster.this[0].serverlessv2_scaling_configuration[0].max_capacity == 4,
+    ])
+    error_message = "the scaling range reaches the cluster."
+  }
+
+  assert {
+    condition     = length(aws_cloudwatch_metric_alarm.acu_utilization) == 2 && length(aws_cloudwatch_metric_alarm.free_local_storage) == 0
+    error_message = "serverless instances get an ACU alarm each and no local-storage alarm (AWS does not publish it for them)."
+  }
+}
+
+run "reader_autoscaling_targets_the_cluster" {
+  command = plan
+
+  variables {
+    reader_autoscaling = { enabled = true, min_capacity = 1, max_capacity = 3 }
+  }
+
+  assert {
+    condition = alltrue([
+      aws_appautoscaling_target.readers[0].resource_id == "cluster:test-cluster",
+      aws_appautoscaling_target.readers[0].max_capacity == 3,
+      length(aws_appautoscaling_policy.readers) == 1,
+    ])
+    error_message = "reader autoscaling scales this cluster's replica count with one target-tracking policy."
+  }
+}
+
+# ---------------------------------------------------------------------------
+# Bring your own
+# ---------------------------------------------------------------------------
+
+run "brought_network_and_parameter_groups_are_used_not_created" {
+  command = plan
+
+  variables {
+    acknowledged_checks            = var.every_check
+    create_db_subnet_group         = false
+    db_subnet_group_name           = "corp-db"
+    create_security_group          = false
+    vpc_security_group_ids         = ["sg-0123456789abcdef9"]
+    ingress_rules                  = {}
+    create_cluster_parameter_group = false
+    cluster_parameter_group_name   = "corp-cluster-pg"
+    create_db_parameter_group      = false
+    db_parameter_group_name        = "corp-instance-pg"
+  }
+
+  assert {
+    condition = alltrue([
+      length(aws_db_subnet_group.this) == 0,
+      length(aws_security_group.this) == 0,
+      length(aws_rds_cluster_parameter_group.this) == 0,
+      length(aws_db_parameter_group.this) == 0,
+    ])
+    error_message = "with create_* = false the module creates none of these."
+  }
+
+  assert {
+    condition = alltrue([
+      aws_rds_cluster.this[0].db_subnet_group_name == "corp-db",
+      aws_rds_cluster.this[0].db_cluster_parameter_group_name == "corp-cluster-pg",
+      aws_rds_cluster_instance.this["1"].db_parameter_group_name == "corp-instance-pg",
+      length(aws_rds_cluster.this[0].vpc_security_group_ids) == 1,
+      contains(aws_rds_cluster.this[0].vpc_security_group_ids, "sg-0123456789abcdef9"),
+    ])
+    error_message = "the brought names and IDs reach the cluster and the instances."
+  }
+}
+
+# ---------------------------------------------------------------------------
+# RDS Proxy
+# ---------------------------------------------------------------------------
+
+run "the_proxy_fronts_the_cluster_with_its_own_group" {
+  command = plan
+
+  variables {
+    proxy = {
+      enabled           = true
+      use_master_secret = true
+      ingress_rules     = { app = { referenced_security_group_id = "sg-0123456789abcdef0", description = "orders service" } }
+      egress_rules      = { secrets = { referenced_security_group_id = "sg-0123456789abcdef5", port = 443, description = "Secrets Manager endpoint" } }
     }
   }
 
   assert {
-    condition     = aws_rds_cluster.main.engine_mode == "provisioned"
-    error_message = "Serverless v2 should keep the provisioned engine mode"
+    condition = alltrue([
+      length(aws_db_proxy.this) == 1,
+      length(aws_db_proxy_target.this) == 1,
+      length(aws_db_proxy_endpoint.reader) == 1,
+      length(aws_iam_role.proxy) == 1,
+      length(aws_security_group.proxy) == 1,
+      length(aws_vpc_security_group_egress_rule.proxy_to_cluster) == 1,
+      length(aws_vpc_security_group_ingress_rule.from_proxy) == 1,
+    ])
+    error_message = "the proxy, its target, reader endpoint, role and security group, and the proxy-to-database rules in both groups."
   }
 
   assert {
-    condition     = length(aws_rds_cluster.main.serverlessv2_scaling_configuration) == 1
-    error_message = "A serverlessv2 scaling block should be emitted when a config is provided"
+    condition = alltrue([
+      aws_db_proxy.this[0].engine_family == "POSTGRESQL",
+      aws_db_proxy.this[0].require_tls,
+      aws_db_proxy_target.this[0].db_cluster_identifier == "test-cluster",
+    ])
+    error_message = "a PostgreSQL proxy requiring TLS, targeting this cluster."
+  }
+}
+
+# ---------------------------------------------------------------------------
+# Global database
+# ---------------------------------------------------------------------------
+
+run "a_global_primary_creates_the_global_cluster" {
+  command = plan
+
+  variables {
+    acknowledged_checks         = var.every_check
+    global_cluster_role         = "primary"
+    global_cluster_identifier   = "orders-global"
+    manage_master_user_password = false
+    master_password             = "correct-horse-battery"
+    allow_plaintext_credentials = true
   }
 
   assert {
-    condition     = aws_rds_cluster.main.serverlessv2_scaling_configuration[0].max_capacity == 16
-    error_message = "Max capacity should match the supplied configuration"
-  }
-}
-
-# --- Serverless v2 scale-to-zero honours seconds_until_auto_pause ------------
-run "serverless_v2_scale_to_zero" {
-  command = plan
-
-  variables {
-    cluster_identifier = "test-sv2-zero"
-    engine             = "aurora-postgresql"
-    engine_version     = "15.4"
-    vpc_id             = "vpc-12345678"
-    subnet_ids         = ["subnet-aaaa1111", "subnet-bbbb2222"]
-    serverless_scaling_configuration = {
-      min_capacity             = 0
-      max_capacity             = 8
-      seconds_until_auto_pause = 900
-    }
-    instances = {
-      writer = { instance_class = "db.serverless", promotion_tier = 0 }
-    }
+    condition = alltrue([
+      length(aws_rds_global_cluster.this) == 1,
+      aws_rds_global_cluster.this[0].global_cluster_identifier == "orders-global",
+      aws_rds_global_cluster.this[0].storage_encrypted,
+    ])
+    error_message = "a primary creates the encrypted global cluster."
   }
 
   assert {
-    condition     = aws_rds_cluster.main.serverlessv2_scaling_configuration[0].min_capacity == 0
-    error_message = "min_capacity 0 (scale-to-zero) should be accepted"
+    condition     = length(aws_cloudwatch_metric_alarm.writer_cpu) == 1 && length(aws_cloudwatch_metric_alarm.global_rpo_lag) == 0
+    error_message = "a primary has a writer; RPO lag is a secondary-region alarm."
+  }
+}
+
+run "a_headless_secondary_has_no_writer_alarms" {
+  command = plan
+
+  variables {
+    acknowledged_checks         = var.every_check
+    global_cluster_role         = "secondary"
+    global_cluster_identifier   = "orders-global"
+    manage_master_user_password = false
+    database_name               = ""
+    instances                   = {}
   }
 
   assert {
-    condition     = aws_rds_cluster.main.serverlessv2_scaling_configuration[0].seconds_until_auto_pause == 900
-    error_message = "seconds_until_auto_pause should be honoured when min_capacity is 0"
-  }
-}
-
-# --- A default final snapshot name is derived when not skipping --------------
-run "final_snapshot_default_name" {
-  command = plan
-
-  variables {
-    cluster_identifier  = "test-pg"
-    engine              = "aurora-postgresql"
-    engine_version      = "15.4"
-    vpc_id              = "vpc-12345678"
-    subnet_ids          = ["subnet-aaaa1111", "subnet-bbbb2222"]
-    skip_final_snapshot = false
+    condition = alltrue([
+      length(aws_rds_global_cluster.this) == 0,
+      length(aws_rds_cluster_instance.this) == 0,
+      aws_rds_cluster.this[0].global_cluster_identifier == "orders-global",
+    ])
+    error_message = "a headless secondary joins the global cluster with no instances and creates no global cluster of its own."
   }
 
   assert {
-    condition     = aws_rds_cluster.main.final_snapshot_identifier == "test-pg-final-snapshot"
-    error_message = "Final snapshot name should default to '<cluster>-final-snapshot'"
+    condition = alltrue([
+      length(aws_cloudwatch_metric_alarm.writer_cpu) == 0,
+      length(aws_cloudwatch_metric_alarm.replica_lag) == 0,
+      length(aws_cloudwatch_metric_alarm.global_rpo_lag) == 1,
+    ])
+    error_message = "a secondary has no writer, so no writer alarms - but it watches its RPO lag."
   }
 }
 
-# --- Skipping the final snapshot nulls the snapshot name ----------------------
-run "skip_final_snapshot_nulls_name" {
+# ---------------------------------------------------------------------------
+# create = false
+# ---------------------------------------------------------------------------
+
+run "create_false_plans_nothing" {
   command = plan
 
   variables {
-    cluster_identifier  = "test-pg"
-    engine              = "aurora-postgresql"
-    engine_version      = "15.4"
-    vpc_id              = "vpc-12345678"
-    subnet_ids          = ["subnet-aaaa1111", "subnet-bbbb2222"]
-    skip_final_snapshot = true
+    create = false
   }
 
   assert {
-    condition     = aws_rds_cluster.main.final_snapshot_identifier == null
-    error_message = "No final snapshot name should be set when skip_final_snapshot is true"
-  }
-}
-
-# --- Operational toggles are forwarded to the cluster ------------------------
-run "operational_toggles_forwarded" {
-  command = plan
-
-  variables {
-    cluster_identifier            = "test-pg"
-    engine                        = "aurora-postgresql"
-    engine_version                = "15.4"
-    vpc_id                        = "vpc-12345678"
-    subnet_ids                    = ["subnet-aaaa1111", "subnet-bbbb2222"]
-    apply_immediately             = true
-    allow_major_version_upgrade   = true
-    enable_local_write_forwarding = true
-    network_type                  = "DUAL"
-    snapshot_identifier           = "arn:aws:rds:us-east-1:123456789012:cluster-snapshot:seed"
+    condition = alltrue([
+      length(aws_rds_cluster.this) == 0,
+      length(aws_rds_cluster_instance.this) == 0,
+      length(aws_security_group.this) == 0,
+      length(aws_iam_role.monitoring) == 0,
+      length(aws_cloudwatch_metric_alarm.writer_cpu) == 0,
+    ])
+    error_message = "create = false must plan no resources."
   }
 
   assert {
-    condition     = aws_rds_cluster.main.apply_immediately == true
-    error_message = "apply_immediately should be forwarded"
+    condition     = output.connection == null && output.governance == null && output.cluster_endpoint == null
+    error_message = "create = false must leave the outputs null."
+  }
+}
+
+# ---------------------------------------------------------------------------
+# Contract outputs
+# ---------------------------------------------------------------------------
+
+run "the_contract_outputs_describe_the_cluster" {
+  command = plan
+
+  assert {
+    condition = alltrue([
+      output.connection.port == 5432,
+      output.connection.engine == "aurora-postgresql",
+      output.connection.tls_required,
+    ])
+    error_message = "connection carries the port, the engine and that TLS is required."
   }
 
   assert {
-    condition     = aws_rds_cluster.main.network_type == "DUAL"
-    error_message = "network_type should be forwarded"
+    condition = alltrue([
+      output.governance.credential_source == "rds-managed secret",
+      output.governance.tls_enforced == "yes",
+      output.governance.deletion_protection,
+      length(output.governance.purposes_without_cmk) == 0,
+      output.governance.instance_count == 2,
+    ])
+    error_message = "governance reports the managed secret, TLS, deletion protection, every purpose on the CMK and the instance count."
+  }
+}
+
+# ---------------------------------------------------------------------------
+# A sample of what the module refuses
+# ---------------------------------------------------------------------------
+
+run "a_name_rds_cannot_use_is_rejected" {
+  command = plan
+
+  variables {
+    name = "Orders_DB"
+  }
+
+  expect_failures = [var.name]
+}
+
+run "ingress_from_anywhere_is_rejected" {
+  command = plan
+
+  variables {
+    ingress_rules = { anywhere = { cidr_ipv4 = "0.0.0.0/0", description = "everyone" } }
+  }
+
+  expect_failures = [var.ingress_rules]
+}
+
+run "a_plaintext_password_needs_its_acknowledgement" {
+  command = plan
+
+  variables {
+    acknowledged_checks         = var.every_check
+    manage_master_user_password = false
+    master_password             = "correct-horse-battery"
+  }
+
+  expect_failures = [aws_rds_cluster.this]
+}
+
+run "a_public_cluster_needs_its_acknowledgement" {
+  command = plan
+
+  variables {
+    acknowledged_checks = var.every_check
+    publicly_accessible = true
+  }
+
+  expect_failures = [aws_rds_cluster.this]
+}
+
+run "turning_tls_off_needs_its_acknowledgement" {
+  command = plan
+
+  variables {
+    acknowledged_checks = var.every_check
+    enforce_tls         = false
+  }
+
+  expect_failures = [aws_rds_cluster.this]
+}
+
+run "alarms_without_a_topic_are_refused" {
+  command = plan
+
+  variables {
+    acknowledged_checks = var.every_check
+    sns_topic_arn       = ""
+  }
+
+  expect_failures = [aws_rds_cluster.this]
+}
+
+# ---------------------------------------------------------------------------
+# Advisory checks warn, and can be acknowledged
+# ---------------------------------------------------------------------------
+
+run "a_single_instance_warns" {
+  command = plan
+
+  variables {
+    instances = { "1" = {} }
+  }
+
+  expect_failures = [check.cluster_survives_an_az]
+}
+
+run "an_acknowledged_check_is_silent" {
+  command = plan
+
+  variables {
+    instances           = { "1" = {} }
+    acknowledged_checks = ["cluster_survives_an_az"]
   }
 
   assert {
-    condition     = aws_rds_cluster.main.enable_local_write_forwarding == true
-    error_message = "enable_local_write_forwarding should be forwarded"
+    condition     = contains(output.governance.acknowledged_checks, "cluster_survives_an_az")
+    error_message = "the acknowledgement is recorded in governance for the reviewer."
   }
-
-  assert {
-    condition     = aws_rds_cluster.main.snapshot_identifier == "arn:aws:rds:us-east-1:123456789012:cluster-snapshot:seed"
-    error_message = "snapshot_identifier should be forwarded for restore"
-  }
-}
-
-# --- No security group means vpc_id can be omitted ---------------------------
-run "no_security_group_without_vpc_ok" {
-  command = plan
-
-  variables {
-    cluster_identifier     = "test-pg"
-    engine                 = "aurora-postgresql"
-    engine_version         = "15.4"
-    subnet_ids             = ["subnet-aaaa1111", "subnet-bbbb2222"]
-    create_security_group  = false
-    vpc_security_group_ids = ["sg-existing01"]
-  }
-
-  assert {
-    condition     = length(aws_security_group.aurora) == 0
-    error_message = "No security group should be created when create_security_group is false"
-  }
-}
-
-# --- Activity stream resource is planned when enabled ------------------------
-run "activity_stream_enabled" {
-  command = plan
-
-  variables {
-    cluster_identifier         = "test-pg"
-    engine                     = "aurora-postgresql"
-    engine_version             = "15.4"
-    vpc_id                     = "vpc-12345678"
-    subnet_ids                 = ["subnet-aaaa1111", "subnet-bbbb2222"]
-    enable_activity_stream     = true
-    activity_stream_kms_key_id = "arn:aws:kms:us-east-1:123456789012:key/abcd"
-    activity_stream_mode       = "sync"
-  }
-
-  assert {
-    condition     = length(aws_rds_cluster_activity_stream.this) == 1
-    error_message = "Activity stream should be planned when enabled"
-  }
-
-  assert {
-    condition     = aws_rds_cluster_activity_stream.this[0].mode == "sync"
-    error_message = "Activity stream mode should be forwarded"
-  }
-}
-
-# ============================================================================
-# ADDITIONAL VALIDATION FAILURES (edge cases)
-# ============================================================================
-
-# --- Serverless v2 min capacity below 0.5 ------------------------------------
-run "serverless_min_capacity_too_low_fails" {
-  command = plan
-
-  variables {
-    cluster_identifier = "test-pg"
-    engine             = "aurora-postgresql"
-    engine_version     = "15.4"
-    vpc_id             = "vpc-12345678"
-    subnet_ids         = ["subnet-aaaa1111", "subnet-bbbb2222"]
-    serverless_scaling_configuration = {
-      min_capacity = 0.1
-      max_capacity = 4
-    }
-  }
-
-  expect_failures = [var.serverless_scaling_configuration]
-}
-
-# --- Serverless v2 max capacity below min ------------------------------------
-run "serverless_max_less_than_min_fails" {
-  command = plan
-
-  variables {
-    cluster_identifier = "test-pg"
-    engine             = "aurora-postgresql"
-    engine_version     = "15.4"
-    vpc_id             = "vpc-12345678"
-    subnet_ids         = ["subnet-aaaa1111", "subnet-bbbb2222"]
-    serverless_scaling_configuration = {
-      min_capacity = 8
-      max_capacity = 2
-    }
-  }
-
-  expect_failures = [var.serverless_scaling_configuration]
-}
-
-# --- Invalid engine version format -------------------------------------------
-run "invalid_engine_version_fails" {
-  command = plan
-
-  variables {
-    cluster_identifier = "test-pg"
-    engine             = "aurora-postgresql"
-    engine_version     = "not-a-version"
-    vpc_id             = "vpc-12345678"
-    subnet_ids         = ["subnet-aaaa1111", "subnet-bbbb2222"]
-  }
-
-  expect_failures = [var.engine_version]
-}
-
-# --- Weak master password ----------------------------------------------------
-run "weak_master_password_fails" {
-  command = plan
-
-  variables {
-    cluster_identifier = "test-pg"
-    engine             = "aurora-postgresql"
-    engine_version     = "15.4"
-    vpc_id             = "vpc-12345678"
-    subnet_ids         = ["subnet-aaaa1111", "subnet-bbbb2222"]
-    master_password    = "weak"
-  }
-
-  expect_failures = [var.master_password]
-}
-
-# --- Invalid backup window format --------------------------------------------
-run "invalid_backup_window_fails" {
-  command = plan
-
-  variables {
-    cluster_identifier      = "test-pg"
-    engine                  = "aurora-postgresql"
-    engine_version          = "15.4"
-    vpc_id                  = "vpc-12345678"
-    subnet_ids              = ["subnet-aaaa1111", "subnet-bbbb2222"]
-    preferred_backup_window = "2am-3am"
-  }
-
-  expect_failures = [var.preferred_backup_window]
-}
-
-# --- Invalid monitoring interval ---------------------------------------------
-run "invalid_monitoring_interval_fails" {
-  command = plan
-
-  variables {
-    cluster_identifier  = "test-pg"
-    engine              = "aurora-postgresql"
-    engine_version      = "15.4"
-    vpc_id              = "vpc-12345678"
-    subnet_ids          = ["subnet-aaaa1111", "subnet-bbbb2222"]
-    monitoring_interval = 45
-  }
-
-  expect_failures = [var.monitoring_interval]
-}
-
-# --- Invalid network type ----------------------------------------------------
-run "invalid_network_type_fails" {
-  command = plan
-
-  variables {
-    cluster_identifier = "test-pg"
-    engine             = "aurora-postgresql"
-    engine_version     = "15.4"
-    vpc_id             = "vpc-12345678"
-    subnet_ids         = ["subnet-aaaa1111", "subnet-bbbb2222"]
-    network_type       = "IPV6"
-  }
-
-  expect_failures = [var.network_type]
-}
-
-# --- Invalid activity stream mode --------------------------------------------
-run "invalid_activity_stream_mode_fails" {
-  command = plan
-
-  variables {
-    cluster_identifier   = "test-pg"
-    engine               = "aurora-postgresql"
-    engine_version       = "15.4"
-    vpc_id               = "vpc-12345678"
-    subnet_ids           = ["subnet-aaaa1111", "subnet-bbbb2222"]
-    activity_stream_mode = "fast"
-  }
-
-  expect_failures = [var.activity_stream_mode]
-}
-
-# --- IOPS is only valid for aurora-postgresql --------------------------------
-run "iops_on_mysql_fails" {
-  command = plan
-
-  variables {
-    cluster_identifier = "test-mysql"
-    engine             = "aurora-mysql"
-    engine_version     = "8.0"
-    vpc_id             = "vpc-12345678"
-    subnet_ids         = ["subnet-aaaa1111", "subnet-bbbb2222"]
-    iops               = 5000
-  }
-
-  expect_failures = [var.iops]
-}
-
-# --- Invalid database name ---------------------------------------------------
-run "invalid_database_name_fails" {
-  command = plan
-
-  variables {
-    cluster_identifier = "test-pg"
-    engine             = "aurora-postgresql"
-    engine_version     = "15.4"
-    vpc_id             = "vpc-12345678"
-    subnet_ids         = ["subnet-aaaa1111", "subnet-bbbb2222"]
-    database_name      = "1-invalid-name"
-  }
-
-  expect_failures = [var.database_name]
-}
-
-# --- Port outside the allowed range ------------------------------------------
-run "invalid_port_fails" {
-  command = plan
-
-  variables {
-    cluster_identifier = "test-pg"
-    engine             = "aurora-postgresql"
-    engine_version     = "15.4"
-    vpc_id             = "vpc-12345678"
-    subnet_ids         = ["subnet-aaaa1111", "subnet-bbbb2222"]
-    port               = 80
-  }
-
-  expect_failures = [var.port]
-}
-
-# --- Backup retention outside 1..35 ------------------------------------------
-run "invalid_backup_retention_fails" {
-  command = plan
-
-  variables {
-    cluster_identifier      = "test-pg"
-    engine                  = "aurora-postgresql"
-    engine_version          = "15.4"
-    vpc_id                  = "vpc-12345678"
-    subnet_ids              = ["subnet-aaaa1111", "subnet-bbbb2222"]
-    backup_retention_period = 40
-  }
-
-  expect_failures = [var.backup_retention_period]
-}
-
-# --- Invalid global cluster identifier ---------------------------------------
-run "invalid_global_cluster_identifier_fails" {
-  command = plan
-
-  variables {
-    cluster_identifier        = "test-pg"
-    engine                    = "aurora-postgresql"
-    engine_version            = "15.4"
-    vpc_id                    = "vpc-12345678"
-    subnet_ids                = ["subnet-aaaa1111", "subnet-bbbb2222"]
-    enable_global_cluster     = true
-    global_cluster_identifier = "1-bad-global"
-  }
-
-  expect_failures = [var.global_cluster_identifier]
 }

@@ -1,444 +1,1071 @@
-# Aurora
+# terraform-aws-aurora
 
-A focused, production-ready Terraform module for **Amazon Aurora** (PostgreSQL and
-MySQL compatible). It manages an Aurora DB cluster, its instances, networking
-(DB subnet group + security group), parameter groups, observability, and the
-higher-order Aurora features — and deliberately nothing else. The surface area
-stays Aurora-shaped so the module is easy to reason about and safe to upgrade.
+Terraform module for Amazon Aurora PostgreSQL and Aurora MySQL clusters in
+private, regulated environments. It manages the cluster, its instances and every
+supporting resource (subnet group, security groups, parameter groups, IAM roles,
+log groups, alarms, event subscriptions, RDS Proxy, autoscaling, global
+database membership). Each supporting resource can be created by the module or
+supplied by the caller. Unsafe configurations are refused at plan time,
+risky-but-valid postures are reported by `check` blocks, and the integration
+points the module cannot own (KMS key policies, SNS topic policies, VPC
+endpoints) are emitted as structured outputs for their owners.
 
-## Features
+[Costs](https://github.com/ivasik-k7/terraform-shared-modules/blob/aurora-v2.0.0/modules/aurora/COSTS.md) ·
+[Changelog](https://github.com/ivasik-k7/terraform-shared-modules/blob/aurora-v2.0.0/modules/aurora/CHANGELOG.md) ·
+[Examples](#examples) ·
+[Issues](https://github.com/ivasik-k7/terraform-shared-modules/issues)
 
-- **Provisioned and Serverless v2** clusters (`engine_mode`, `serverless_scaling_configuration`).
-- **PostgreSQL and MySQL** compatibility with sensible engine-aware defaults (port, parameter-group family).
-- **Flexible instance topology** — any number of writer/reader instances via the `instances` map, with per-instance class, promotion tier, Performance Insights, and CA certificate.
-- **Networking** — creates a DB subnet group and a least-privilege security group, or **bring your own** of either.
-- **Custom cluster endpoints** — dedicated `READER`/`ANY` endpoints (e.g. an analytics reader pool).
-- **Credentials** — supply a master password, or let **RDS manage it in Secrets Manager** (`manage_master_user_password`).
-- **Parameter groups** — cluster- and instance-level, created by the module or referenced externally.
-- **Backups & restore** — automated backups, restore from snapshot, and named final snapshots.
-- **Security** — encryption at rest (KMS), IAM database authentication, IPv4 + IPv6 ingress, deletion protection.
-- **Observability** — Enhanced Monitoring (created or BYO role), Performance Insights, CloudWatch log exports, and opinionated CloudWatch alarms.
-- **Aurora extras** — Global Database, IAM role associations (S3 import/export), I/O-Optimized storage, local write forwarding, and Database Activity Streams.
+## Contents
 
-## Resources created
+1. [Quick start](#quick-start)
+2. [Requirements and compatibility](#requirements-and-compatibility)
+3. [Architecture](#architecture)
+4. [Resource inventory](#resource-inventory)
+5. [Design and mechanics](#design-and-mechanics)
+6. [Validation model](#validation-model)
+7. [Configuration recipes](#configuration-recipes)
+8. [Inputs](#inputs)
+9. [Outputs](#outputs)
+10. [Operations](#operations)
+11. [Limitations](#limitations)
+12. [Versioning, testing and support](#versioning-testing-and-support)
 
-Depending on the inputs, the module manages: `aws_rds_cluster`,
-`aws_rds_cluster_instance` (per instance), `aws_db_subnet_group`,
-`aws_rds_cluster_parameter_group`, `aws_db_parameter_group`,
-`aws_security_group` + ingress/egress rules, `aws_rds_cluster_endpoint` (custom
-endpoints), `aws_rds_cluster_role_association`, `aws_rds_cluster_activity_stream`,
-`aws_rds_global_cluster`, `aws_iam_role` (+ attachment) for Enhanced Monitoring,
-`aws_cloudwatch_metric_alarm` (×4), and `aws_cloudwatch_log_group` (per exported log).
+---
 
-## Usage
-
-### Minimal PostgreSQL cluster
-
-```hcl
-module "aurora" {
-  source = "../../modules/aurora"
-
-  cluster_identifier = "app-postgres"
-  engine             = "aurora-postgresql"
-  engine_version     = "15.4"
-
-  vpc_id     = "vpc-0123456789abcdef0"
-  subnet_ids = ["subnet-aaa", "subnet-bbb", "subnet-ccc"]
-
-  master_username = "app_admin"
-  master_password = var.db_password # mark sensitive in the caller
-
-  instances = {
-    writer = { instance_class = "db.r6g.large", promotion_tier = 0 }
-  }
-}
-```
-
-### Production HA cluster with managed credentials and observability
+## Quick start
 
 ```hcl
-module "aurora" {
-  source = "../../modules/aurora"
+module "orders_db" {
+  source  = "app.terraform.io/citadel-hub/aurora/aws"
+  version = "~> 2.0"
 
-  cluster_identifier = "payments-prod"
-  engine             = "aurora-postgresql"
-  engine_version     = "15.4"
-  storage_type       = "aurora-iopt1" # I/O-Optimized
-
-  vpc_id     = module.network.vpc_id
-  subnet_ids = module.network.database_subnet_ids
-
-  # Let RDS create & rotate the master secret in Secrets Manager
-  manage_master_user_password   = true
-  master_user_secret_kms_key_id = module.kms.key_arn
-
-  storage_encrypted = true
-  kms_key_id        = module.kms.key_arn
-
+  name           = "orders"
+  engine         = "aurora-postgresql"
+  engine_version = "17.9"
+  instance_class = "db.r7g.large"
   instances = {
-    writer  = { instance_class = "db.r6g.2xlarge", promotion_tier = 0 }
-    reader1 = { instance_class = "db.r6g.2xlarge", promotion_tier = 1 }
-    reader2 = { instance_class = "db.r6g.2xlarge", promotion_tier = 2 }
+    a = { promotion_tier = 0 }
+    b = { promotion_tier = 1 }
   }
 
-  # Access control
-  allowed_security_groups = [module.app.security_group_id]
+  vpc_id     = var.vpc_id
+  subnet_ids = var.private_subnet_ids
+  ingress_rules = {
+    app = { referenced_security_group_id = var.app_sg_id, description = "orders service" }
+  }
 
-  # Observability
-  monitoring_interval             = 60
-  performance_insights_enabled    = true
-  performance_insights_kms_key_id = module.kms.key_arn
+  sns_topic_arn                   = var.alerts_topic_arn
   enabled_cloudwatch_logs_exports = ["postgresql"]
-  create_alarms                   = true
-
-  deletion_protection = true
-
-  tags = {
-    Environment = "prod"
-    CostCenter  = "payments"
-  }
 }
 ```
 
-### Aurora Serverless v2
+This plans 22 resources and raises no advisory check:
 
-Serverless v2 runs on a **provisioned** cluster (leave `engine_mode` at its
-default) using `db.serverless` instance classes plus a scaling configuration:
+| Resource | Count | Configuration |
+|---|---:|---|
+| `aws_rds_cluster.this` | 1 | Encrypted (`aws/rds`), deletion protection, RDS-managed master secret, Performance Insights 7 days, backups 7 days |
+| `aws_rds_cluster_instance.this` | 2 | `orders-a`, `orders-b`, Enhanced Monitoring at 60 s, not publicly accessible |
+| `aws_db_subnet_group.this` | 1 | `orders`, from `subnet_ids` |
+| `aws_security_group.this` + ingress rules | 1 + 1 | TCP 5432 from `ingress_rules` only, no egress |
+| `aws_rds_cluster_parameter_group.this` | 1 | `orders-cluster-aurora-postgresql17`, `rds.force_ssl = 1` plus logging parameters |
+| `aws_db_parameter_group.this` | 1 | `orders-instance-aurora-postgresql17` |
+| `aws_iam_role.monitoring` + inline policy | 1 + 1 | `orders-<region>-monitor`, scoped to `RDSOSMetrics` |
+| `aws_cloudwatch_log_group.this` | 1 | `/aws/rds/cluster/orders/postgresql`, 30 days |
+| `aws_cloudwatch_metric_alarm.*` | 8 | Writer CPU, reader CPU, replica lag, transaction ID age, memory × 2, local storage × 2 |
+| `aws_db_event_subscription.*` | 2 | Cluster and instance events to `sns_topic_arn` |
+| `terraform_data.created_at` | 1 | Creation timestamp for the final snapshot name |
 
-```hcl
-module "aurora_serverless" {
-  source = "../../modules/aurora"
+Clients connect with `module.orders_db.connection` (host, port, secret ARN,
+TLS requirement). The password is read from Secrets Manager; it is never in
+Terraform state.
 
-  cluster_identifier = "reporting"
-  engine             = "aurora-postgresql"
-  engine_version     = "15.4"
+---
 
-  vpc_id     = module.network.vpc_id
-  subnet_ids = module.network.database_subnet_ids
+## Requirements and compatibility
 
-  serverless_scaling_configuration = {
-    min_capacity = 0.5
-    max_capacity = 16
-  }
+| Component | Supported | Tested in CI |
+|---|---|---|
+| Terraform | `>= 1.7.0` | 1.7.5 and the latest release |
+| `hashicorp/aws` | `>= 5.90.0, < 7.0.0` | 5.100.0 and the latest 6.x |
 
-  instances = {
-    writer = { instance_class = "db.serverless", promotion_tier = 0 }
-  }
+How the module stays compatible with both ends of those ranges:
+
+| Constraint | Consequence in the code |
+|---|---|
+| Terraform 1.7 validations can reference only their own variable | Every rule that compares two inputs is a `precondition` on `aws_rds_cluster.this`, evaluated at plan |
+| Terraform < 1.12 evaluates both operands of `\|\|` and `&&` | Conditions use nested ternaries, `can()` and `try()`; `tests/lint_validations.py` enforces it in CI |
+| Terraform 1.7 has no write-only or ephemeral arguments | A static password uses `master_password`, gated by `allow_plaintext_credentials` |
+| `data.aws_region.name` is deprecated in v6; `region` does not exist in v5 | The region is parsed from `data.aws_region.current.endpoint` (`ec2.<region>.amazonaws.com`) |
+
+A root module with wider constraints (for example `aws = ">= 5.0"`) needs no
+change. A committed `.terraform.lock.hcl` that pins the provider below 5.90
+needs one `terraform init -upgrade`.
+
+---
+
+## Architecture
+
+```
+                      ┌──────────── caller-owned ─────────────┐
+                      │ VPC, subnets, VPC endpoints           │
+                      │ KMS keys + key policies               │
+                      │ SNS topic + topic policy              │
+                      └───────────────────────────────────────┘
+                                   ▲  network_contract,
+                                   │  kms_key_policy_requirements,
+                                   │  sns_topic_policy_requirement
+ clients ──TLS──► [proxy SG] ──► RDS Proxy ──┐              (optional)
+    │                             │ reads    │
+    │                             ▼          │
+    │                   Secrets Manager ◄────┼── RDS-managed master secret
+    │                   (proxy.secret_arns)  │   (+ rotation schedule)
+    │                                        ▼
+    └──TLS──► [DB SG] ──► aws_rds_cluster.this ◄── cluster parameter group (TLS, logging)
+                            │   storage: KMS (kms_key_arn)
+                            │   global: aws_rds_global_cluster.this (primary) or join (secondary)
+                            ├── aws_rds_cluster_instance.this["<key>"] ◄── instance parameter group
+                            │      └── Enhanced Monitoring role ──► RDSOSMetrics
+                            ├── aws_rds_cluster_endpoint.this["<key>"]
+                            ├── Application Auto Scaling (reader replicas, outside state)
+                            ├── role associations / activity stream ──► Kinesis
+                            └── logs    ──► /aws/rds/cluster/<name>/<type>
+                                metrics ──► CloudWatch alarms ──► SNS
+                                events  ──► RDS event subscriptions ──► SNS
+```
+
+### File layout
+
+| File | Responsibility |
+|---|---|
+| `main.tf` | Global cluster, `terraform_data.created_at`, `aws_rds_cluster.this` and all cross-input preconditions |
+| `instances.tf` | Instances, custom endpoints, reader autoscaling target and policy |
+| `network.tf` | Subnet group, database and proxy security groups and every rule |
+| `parameter-groups.tf` | Cluster and instance parameter groups |
+| `credentials.tf` | Rotation schedule of the RDS-managed master secret |
+| `iam.tf` | Enhanced Monitoring and RDS Proxy roles with inline policies |
+| `proxy.tf` | RDS Proxy, default target group, target, read-only endpoint |
+| `integrations.tf` | IAM role associations (PostgreSQL) and Database Activity Streams |
+| `observability.tf` | Log groups, event subscriptions, alarms |
+| `checks.tf` | The 30 advisory `check` blocks |
+| `locals.tf` | Derived values: family, port, KMS fallbacks, credential path, posture |
+| `data.tf` | Partition, region and caller identity, count-gated on `create` |
+| `moved.tf` | Address migrations, kept permanently |
+| `outputs.tf` | Resource outputs and the contract outputs |
+
+---
+
+## Resource inventory
+
+Every resource the module can create. `<name>` is `var.name`; `<family>` is the
+parameter group family with dots replaced by hyphens (`aurora-postgresql17`,
+`aurora-mysql8-0`).
+
+| Address | Created when | Name |
+|---|---|---|
+| `aws_rds_cluster.this` | `create` | `<name>` |
+| `aws_rds_cluster_instance.this[key]` | one per `instances` key | `<name>-<key>` |
+| `aws_rds_global_cluster.this` | `global_cluster_role = "primary"` and `create_global_cluster` | `global_cluster_identifier` |
+| `terraform_data.created_at` | `final_snapshot_identifier = ""` | — |
+| `aws_db_subnet_group.this` | `create_db_subnet_group` | `db_subnet_group_name`, else `<name>` |
+| `aws_security_group.this` | `create_security_group` | prefix `<name>-db-` |
+| `aws_vpc_security_group_ingress_rule.this[key]` | one per `ingress_rules` key | tag `<name>-db-<key>` |
+| `aws_vpc_security_group_egress_rule.this[key]` | one per `egress_rules` key | tag `<name>-db-<key>` |
+| `aws_rds_cluster_parameter_group.this` | `create_cluster_parameter_group` | `<name>-cluster-<family>` |
+| `aws_db_parameter_group.this` | `create_db_parameter_group` | `<name>-instance-<family>` |
+| `aws_secretsmanager_secret_rotation.master` | managed secret and a `master_password_rotation` schedule | — |
+| `aws_iam_role.monitoring`, `aws_iam_role_policy.monitoring` | `enhanced_monitoring_interval > 0` and `create_monitoring_role` | `<name>-<region>-monitor` |
+| `aws_rds_cluster_endpoint.this[key]` | one per `custom_endpoints` key | `<name>-<key>` |
+| `aws_appautoscaling_target.readers`, `aws_appautoscaling_policy.readers` | `reader_autoscaling.enabled` | `<name>-readers` |
+| `aws_rds_cluster_role_association.this[key]` | aurora-postgresql, one per `cluster_iam_roles` key | — |
+| `aws_rds_cluster_activity_stream.this` | `activity_stream.enabled` | — |
+| `aws_db_proxy.this`, `aws_db_proxy_default_target_group.this`, `aws_db_proxy_target.this` | `proxy.enabled` | `<name>-proxy` |
+| `aws_db_proxy_endpoint.reader` | `proxy.enabled` and `proxy.create_reader_endpoint` | `<name>-proxy-ro` |
+| `aws_iam_role.proxy`, `aws_iam_role_policy.proxy` | `proxy.enabled` and `proxy.create_role` | `<name>-<region>-proxy` |
+| `aws_security_group.proxy`, `aws_vpc_security_group_ingress_rule.proxy[key]`, `aws_vpc_security_group_egress_rule.proxy[key]` | `proxy.enabled` and `proxy.create_security_group` | prefix `<name>-proxy-` |
+| `aws_vpc_security_group_egress_rule.proxy_to_cluster`, `aws_vpc_security_group_ingress_rule.from_proxy` | both security groups module-created | — |
+| `aws_vpc_security_group_egress_rule.proxy_to_brought_groups[i]` | proxy group module-created, database groups brought | — |
+| `aws_cloudwatch_log_group.this[type]` | `create_log_groups`, one per exported log type | `/aws/rds/cluster/<name>/<type>` |
+| `aws_db_event_subscription.cluster`, `aws_db_event_subscription.instances` | `create_event_subscriptions` | `<name>-cluster`, `<name>-instances` |
+| `aws_cloudwatch_metric_alarm.*` | `create_alarms`, see [Alarms](#alarms) | `<name>-…` |
+
+Every taggable resource gets `merge(var.tags, { ManagedBy = "Terraform", Module
+= "aurora", DatabaseCluster = <name> })` plus a `Name` tag. The module's keys
+are merged last and cannot be overridden. Instances also merge
+`instances[key].tags` before the module's keys.
+
+---
+
+## Design and mechanics
+
+### Replacement safety
+
+A replaced `aws_rds_cluster` is a new, empty database. The module limits what a
+plan that replaces it can destroy:
+
+- **Dependents reference the cluster by `cluster_identifier`, never by `id` or
+  `arn`.** `cluster_identifier` is set from `var.name`, so it stays known while
+  a replacement is planned. Instances, custom endpoints, the proxy target, role
+  associations, autoscaling and event subscriptions keep known arguments and
+  are not planned for replacement alongside the cluster.
+- **`local.cluster_arn` is built from partition, region, account and name**
+  rather than read from the resource, for the same reason. The activity stream
+  uses it.
+- **`deletion_protection = true` by default.** A plan that replaces the cluster
+  fails at the cluster's delete, with every instance still serving.
+- Inputs that force replacement are listed in
+  [What replaces resources](#what-replaces-resources).
+
+### Creation-time attributes
+
+AWS fixes some attributes when the cluster is created. Sending them again later
+forces a replacement or is refused by AWS, so the module sets them once and
+ignores them afterwards. Where it matters, a `check` compares the running value
+with the input.
+
+| Resource | Ignored attribute | Reason | Difference reported by |
+|---|---|---|---|
+| `aws_rds_cluster` | `snapshot_identifier`, `restore_to_point_in_time` | The restore source only applies at create | — |
+| | `master_username`, `database_name` | ForceNew; inherited from a snapshot, PITR source or primary | `connection` reports the actual values |
+| | `engine_lifecycle_support` | No modify API | `extended_support_matches_the_setting` |
+| | `master_user_secret_kms_key_id` | Fixed once RDS owns the secret | `master_secret_key_is_the_one_configured` |
+| | `performance_insights_kms_key_id` | Fixed once Performance Insights is on | `performance_insights_key_is_the_one_configured` |
+| | `replication_source_identifier`, `source_region` | Not managed by this module | — |
+| `aws_rds_cluster_instance` | `performance_insights_kms_key_id` | As above | As above |
+| `aws_rds_global_cluster` | `engine_version`, `engine_lifecycle_support` | The provider upgrades a global cluster with major upgrades always allowed | Upgrades go through `modify-global-cluster` |
+| `aws_rds_cluster_activity_stream` | `kms_key_id` | The API returns an ARN or a key ID; the attribute is ForceNew | `activity_stream_key_is_the_one_configured` |
+| `terraform_data.created_at` | `input` | Keeps the first `plantimestamp()` | — |
+
+### Plan-time determinism
+
+`count` and `for_each` depend only on booleans and on map keys the caller
+writes (`create_*`, `*.enabled`, `instances`, `ingress_rules`, …), never on
+whether an ARN or ID is empty. An ARN produced by a resource in the same
+configuration is unknown at plan, so every bring-your-own input can come from
+resources the caller creates in the same run.
+
+### Instances and the writer
+
+- `instances` is a map whose key is part of the identifier (`<name>-<key>`).
+  Adding or removing a key creates or destroys only that instance.
+- Per-instance overrides: `instance_class`, `availability_zone`,
+  `promotion_tier`, `ca_cert_identifier`, `preferred_maintenance_window`,
+  `tags`. Empty values fall back to the module-level input.
+- `engine_version` is not set on instances; the cluster owns it.
+- **AWS chooses the initial writer**: the first instance to become available.
+  `promotion_tier` orders failover only. The intended writer is
+  `local.failover_target`: the lowest `promotion_tier`, then the first key in
+  lexical order. `verify_commands.move_the_writer` fails over to it.
+
+### Credentials
+
+`governance.credential_source` is derived as follows. The managed secret and a
+static password are mutually exclusive, and a precondition refuses both or
+neither.
+
+| Condition | `credential_source` | Arguments sent on the cluster |
+|---|---|---|
+| `global_cluster_role = "secondary"` | `replicated from the global primary` | No user, password or database |
+| `manage_master_user_password = true` | `rds-managed secret` | `manage_master_user_password = true`, `master_user_secret_kms_key_id` |
+| `master_password` set | `plaintext in terraform state` | `master_password` (requires `allow_plaintext_credentials`) |
+| `snapshot_identifier` set | `inherited from snapshot` | No user or database |
+| `restore_to_point_in_time` set | `inherited from point-in-time source` | No user or database |
+
+`aws_secretsmanager_secret_rotation.master` replaces RDS's default 7-day
+rotation with `master_password_rotation.schedule_expression` or
+`automatically_after_days`. `rotate_immediately` defaults to `false`, so setting
+a schedule does not rotate the password during the apply.
+
+### Encryption
+
+Storage encryption is always on. Each purpose resolves its key as below; an
+empty result means the AWS-managed key for that service.
+
+| Purpose | Input | Fallback | Under `require_cmk`, an empty key is |
+|---|---|---|---|
+| Cluster storage | `kms_key_arn` | `aws/rds` | Refused |
+| Master secret | `master_user_secret_kms_key_arn` | `kms_key_arn`, then `aws/secretsmanager` | Refused when the managed secret is on |
+| Performance Insights | `performance_insights_kms_key_arn` | `kms_key_arn`, then `aws/rds` | Refused when enabled |
+| Log groups | `cloudwatch_logs_kms_key_arn` | `kms_key_arn`, then the CloudWatch default | Refused when exporting; `create_log_groups = false` is always refused |
+| Activity stream | `activity_stream.kms_key_arn` | `kms_key_arn` | Refused whenever the stream is on |
+| Proxy secrets | `proxy.secret_kms_key_arn` | The master secret's key with `use_master_secret` | Not covered |
+
+Every key and `sns_topic_arn` must be in the cluster's region; a precondition
+matches `:<region>:` in each ARN. `kms_key_policy_requirements` lists, for each
+key, the principal, actions and `kms:ViaService` condition its policy must
+allow.
+
+### Parameter groups and TLS
+
+**Family.** `aurora-postgresql<major>` from `"17.9"`; `aurora-mysql<major.minor>`
+from `"8.0.mysql_aurora.3.10.4"`. `parameter_group_family` overrides it, and
+`parameter_group_family_matches_the_engine` warns on a mismatch.
+
+**Merge order** of the cluster parameter group; later entries win:
+
+1. `recommended_parameters` (on by default):
+   - PostgreSQL: `log_min_duration_statement = 5000`, `log_lock_waits = 1`, `log_autovacuum_min_duration = 10000`
+   - MySQL: `slow_query_log = 1`, `long_query_time = 5`, `log_output = FILE`, `innodb_print_all_deadlocks = 1`
+2. `cluster_parameters` (default `apply_method = "pending-reboot"`)
+3. With `enforce_tls`: `rds.force_ssl = 1` or `require_secure_transport = ON`, `immediate`
+
+A `cluster_parameters` value for the TLS parameter other than `1`, `on` or
+`true` is refused rather than silently overwritten. `effective_parameters`
+outputs the merged result.
+
+**Naming and major upgrades.** Groups are named after the family
+(`<name>-cluster-<family>`) and use `create_before_destroy`. A major upgrade
+changes the family, and therefore the name, so the new groups are created
+beside the old ones. With `allow_major_version_upgrade = true` the cluster also
+sends `db_instance_parameter_group_name` (the new instance group) on the
+`ModifyDBCluster` call, which AWS requires for a major upgrade; the provider
+omits it on other modifications.
+
+### Network
+
+The database security group has exactly the configured rules. Terraform
+removes the default allow-all egress rule from groups it creates.
+
+| Rule | Source → destination | Port | Created when |
+|---|---|---|---|
+| `ingress_rule.this[key]` | `ingress_rules` source → DB SG | `port` (5432/3306 by default) | DB SG module-created |
+| `egress_rule.this[key]` | DB SG → `egress_rules` destination | `egress_rules[key].port`, TCP or UDP | DB SG module-created |
+| `ingress_rule.proxy[key]` | `proxy.ingress_rules` source → proxy SG | engine default port | proxy SG module-created |
+| `egress_rule.proxy[key]` | proxy SG → `proxy.egress_rules` destination (Secrets Manager on 443) | as configured | proxy SG module-created |
+| `egress_rule.proxy_to_cluster` + `ingress_rule.from_proxy` | proxy SG ↔ DB SG | `port` | both module-created |
+| `egress_rule.proxy_to_brought_groups[i]` | proxy SG → each `vpc_security_group_ids` | `port` | proxy SG module-created, DB SGs brought |
+
+Rules are keyed by caller labels or list position, never by an ID, so IDs
+unknown at plan are safe. With a brought group on either side, the missing half
+is listed in `network_contract.rules_you_must_add`. `ingress_rules` and
+`egress_rules` are refused when the module does not create the group they would
+go into.
+
+### IAM
+
+**Enhanced Monitoring role** (`<name>-<region>-monitor`). The region is part of
+the name because IAM is global and a global database often reuses the cluster
+name in both regions.
+
+```json
+{
+  "AssumeRole": { "Service": "monitoring.rds.amazonaws.com",
+                  "Condition": { "StringEquals": { "aws:SourceAccount": "<account>" } } },
+  "Policy": [
+    { "Action": ["logs:CreateLogGroup", "logs:PutRetentionPolicy"],
+      "Resource": ["arn:<partition>:logs:<region>:<account>:log-group:RDSOSMetrics",
+                   "arn:<partition>:logs:<region>:<account>:log-group:RDSOSMetrics:*"] },
+    { "Action": ["logs:CreateLogStream", "logs:PutLogEvents", "logs:DescribeLogStreams", "logs:GetLogEvents"],
+      "Resource": ["arn:<partition>:logs:<region>:<account>:log-group:RDSOSMetrics:log-stream:*"] }
+  ]
 }
 ```
 
-### Reuse an existing DB subnet group and security group
+**RDS Proxy role** (`<name>-<region>-proxy`):
 
-```hcl
-module "aurora" {
-  source = "../../modules/aurora"
-
-  cluster_identifier = "shared-db"
-  engine             = "aurora-mysql"
-  engine_version     = "8.0"
-
-  # Don't create networking — attach to existing infra
-  create_db_subnet_group = false
-  db_subnet_group_name   = "platform-db-subnets"
-
-  create_security_group  = false
-  vpc_security_group_ids = ["sg-0123456789abcdef0"]
-
-  master_password = var.db_password
+```json
+{
+  "AssumeRole": { "Service": "rds.amazonaws.com" },
+  "Policy": [
+    { "Action": ["secretsmanager:GetSecretValue"], "Resource": ["<each proxy secret ARN>"] },
+    { "Action": ["kms:Decrypt"], "Resource": ["<proxy secret key>"],
+      "Condition": { "StringEquals": { "kms:ViaService": "secretsmanager.<region>.amazonaws.com" } } }
+  ]
 }
 ```
 
-### Custom reader endpoint + S3 import role
+The `kms:Decrypt` statement exists only when a proxy secret key is known
+(`proxy.secret_kms_key_arn`, or the master secret's key). Both roles take
+`permissions_boundary_arn` and `iam_role_path`.
+
+### Global database
+
+| Role | Behaviour |
+|---|---|
+| `primary` | Creates `aws_rds_global_cluster.this`, or joins `global_cluster_identifier` with `create_global_cluster = false`. Needs a static password, because AWS does not support the managed secret on global members |
+| `secondary` | Joins `global_cluster_identifier` with no user, password or database name. Needs its own `kms_key_arn` in its region. Supports `enable_global_write_forwarding`, and can be headless (`instances = {}`) |
+
+**Ordering.** `output.global_cluster_identifier` has `depends_on` on the primary
+cluster **and its instances**. A secondary that reads it from the primary's
+module call is created only once the primary can accept replication, and on
+destroy the two are not torn down concurrently.
+
+The major version of a global database is changed on the global cluster with
+`modify-global-cluster`; members refuse `allow_major_version_upgrade`.
+
+### Final snapshot naming
+
+A fixed `<name>-final` collides the second time a cluster with the same name is
+deleted. With `final_snapshot_identifier = ""` the name is
+`<name>-final-<YYYYMMDDhhmm>`. The timestamp is `plantimestamp()`, captured once
+in `terraform_data.created_at` (`ignore_changes = [input]`). That resource's
+`triggers_replace` are the inputs that replace the cluster, so a new cluster
+gets a new timestamp.
+
+### Serverless v2
+
+`serverlessv2_scaling_configuration` is sent only when at least one instance is
+`db.serverless`. `min_capacity = 0` enables auto-pause after
+`seconds_until_auto_pause` (300 to 86400). Auto-pause needs aurora-postgresql
+13.15, 14.12, 15.7 or 16.3 and later (every 17.x), or aurora-mysql 3.08 and
+later; `auto_pause_has_an_engine_that_supports_it` checks exact versions. When
+the cluster can pause, the writer CPU alarm treats missing data as not
+breaching.
+
+### RDS Proxy
+
+- Engine family `POSTGRESQL` or `MYSQL`. The proxy listens on the engine's
+  default port, whatever `port` is.
+- One `auth` block per secret: `proxy.secret_arns`, or the RDS-managed master
+  secret with `proxy.use_master_secret = true`. Without either the plan is
+  refused, because every client would act as the master user.
+- `require_tls = true` and `iam_auth = "DISABLED"` by default. Connection pool
+  settings go on the default target group; `debug_logging` is off.
+- The target is the cluster, by identifier, after the instances exist. An
+  optional `READ_ONLY` endpoint is named `<name>-proxy-ro`.
+
+### Observability
+
+**Log groups** are created before the cluster (`depends_on`), so retention,
+class and key apply before RDS first writes. Otherwise RDS creates
+`/aws/rds/cluster/<name>/<type>` itself, with no expiry and the default key.
+
+**Performance Insights** is set explicitly on the cluster and on every instance
+from one input. The provider treats an unset cluster value as `false`, not as
+"whatever AWS reports". `database_insights_mode = "advanced"` needs a retention
+of exactly 465 days.
+
+#### Alarms
+
+Created with `create_alarms` (default on); every action goes to `sns_topic_arn`.
+
+| Alarm | Metric | Dimensions | Statistic, period × evaluations | Fires when (default) | Missing data | Created when |
+|---|---|---|---|---|---|---|
+| `<name>-writer-cpu` | `CPUUtilization` | `DBClusterIdentifier`, `Role=WRITER` | Average, 300 s × 3 | > `alarm_cpu_percent` (80) | Breaching; not breaching if the cluster can pause | Not a secondary |
+| `<name>-reader-cpu` | `CPUUtilization` | `DBClusterIdentifier`, `Role=READER` | Average, 300 s × 3 | > `alarm_cpu_percent` | Not breaching; on a secondary, as writer CPU | Readers exist, or a secondary |
+| `<name>-<key>-freeable-memory` | `FreeableMemory` | `DBInstanceIdentifier` | Minimum, 300 s × 2 | < `alarm_freeable_memory_bytes` (256 MiB) | Not breaching | Per instance |
+| `<name>-<key>-free-local-storage` | `FreeLocalStorage` | `DBInstanceIdentifier` | Minimum, 300 s × 2 | < `alarm_free_local_storage_bytes` (2 GiB) | Not breaching | Per provisioned instance |
+| `<name>-replica-lag` | `AuroraReplicaLagMaximum` | `DBClusterIdentifier`, `Role=WRITER` | Maximum, 60 s × 5 | > `alarm_replica_lag_ms` (2000) | Not breaching | Readers exist, not a secondary |
+| `<name>-<key>-acu-utilization` | `ACUUtilization` | `DBInstanceIdentifier` | Average, 300 s × 3 | > `alarm_acu_utilization_percent` (90) | Not breaching | Per `db.serverless` instance |
+| `<name>-writer-connections` | `DatabaseConnections` | `DBClusterIdentifier`, `Role=WRITER` | Maximum, 300 s × 2 | > `alarm_connections` | Not breaching | `alarm_connections > 0` |
+| `<name>-transaction-id-age` | `MaximumUsedTransactionIDs` | `DBClusterIdentifier`, `Role=WRITER` | Maximum, 300 s × 1 | > `alarm_transaction_ids` (1e9) | Not breaching | aurora-postgresql, not a secondary |
+| `<name>-volume-size` | `VolumeBytesUsed` | `DBClusterIdentifier` | Maximum, 3600 s × 1 | > `alarm_volume_bytes` | Not breaching | `alarm_volume_bytes > 0` |
+| `<name>-global-rpo-lag` | `AuroraGlobalDBRPOLag` | Metrics Insights: `SELECT MAX(AuroraGlobalDBRPOLag) FROM "AWS/RDS" WHERE DBClusterIdentifier = '<name>'` | 60 s × 5 | > `alarm_global_rpo_lag_ms` (10000) | Breaching; missing when headless | A secondary |
+
+Writer CPU, reader CPU on a secondary, and RPO lag also send OK actions. The RPO
+alarm uses a Metrics Insights query so that it matches the series whether or
+not AWS publishes it with an extra `SourceRegion` dimension.
+
+**Event subscriptions**: `<name>-cluster` (`source_type = db-cluster`,
+`cluster_event_categories`) and `<name>-instances` (`db-instance`, the
+identifiers in `instances`, `instance_event_categories`).
+
+---
+
+## Validation model
+
+Three layers, all evaluated during `terraform plan`:
+
+| Layer | Count | Scope | Effect | Error shown as |
+|---|---:|---|---|---|
+| Variable `validation` | 114 | One variable | Plan fails | `Invalid value for variable` |
+| Resource `precondition` | 43 | Any combination of inputs | Plan fails before any resource is created | `Resource precondition failed` on `aws_rds_cluster.this[0]` (two are on child resources) |
+| `check` block | 30 | Inputs and planned or known state | Warning; the plan continues | `Check block assertion failed` |
+
+Forty-three preconditions and 114 validations refuse configurations that would
+fail at apply after partial creation, or that are unsafe without an explicit
+acknowledgement:
+
+| Refused | Reason |
+|---|---|
+| Both or neither of the managed secret and `master_password` | AWS rejects the create after the network and parameter groups exist |
+| `master_password` without `allow_plaintext_credentials` | Stored in state in plaintext |
+| The managed secret on a global member | Not supported by AWS |
+| `enforce_tls = false` without `allow_insecure_transport`; a TLS-disabling value in `cluster_parameters` | Cleartext credentials; a contradicting value would be overwritten |
+| `publicly_accessible` without `allow_public_access` | Public addresses on every instance |
+| `create_security_group = false` with no `vpc_security_group_ids` | RDS would attach the VPC's default group |
+| `ingress_rules` or `egress_rules` without the module's group; the same for the proxy | The rules would be dropped |
+| `0.0.0.0/0` or `::/0` ingress; all-traffic egress | — |
+| More than 5 security groups on the cluster | RDS limit |
+| A KMS key or SNS topic ARN in another region | Fails at apply after other resources exist |
+| `require_cmk` with any purpose on an AWS-managed key | The message lists the purposes |
+| Alarms or event subscriptions without `sns_topic_arn` | Notifications would go nowhere |
+| Empty `instances` (except on a secondary); fewer than two subnets for a created subnet group | No compute; RDS needs two AZs |
+| An `engine_version` of the other engine; log types the engine does not publish; `cluster_iam_roles` feature names on the wrong engine | API errors at apply |
+| More than one data source (snapshot, PITR, secondary) | — |
+| A secondary without its own key, or with a database name or password; a primary created from a restore | Unsupported topologies |
+| `allow_major_version_upgrade`, backtrack or reader autoscaling on global members; write forwarding outside a secondary | Not supported by AWS |
+| Advanced Database Insights without Performance Insights at 465 days | API constraint |
+| An activity stream on `db.serverless` or `db.t*`, or without a customer-managed key | API constraint |
+| A proxy with fewer than two subnets, without `vpc_id` for its group, or logging in as the master user without `use_master_secret` | — |
+| Custom endpoint members that are not `instances` keys | — |
+| A `name` longer than 41 characters; reserved master usernames; Aurora MySQL 2 | Identifier length; RDS restrictions |
+
+### Advisory checks
+
+Thirty `check` blocks warn without blocking the plan. In HCP Terraform, health
+assessments re-evaluate them, so a cluster that drifts into a warned state is
+reported without a new run. Adding a check's name to `acknowledged_checks`
+silences it and records the decision in `governance.acknowledged_checks`. Every
+check is silent when `create = false`.
+
+| Check | Warns when |
+|---|---|
+| `cluster_survives_an_az` | No reader to fail over to (not on a global secondary) |
+| `instances_are_spread_across_azs` | Every instance pinned to the same AZ |
+| `somebody_hears_a_failover` | `create_alarms` and `create_event_subscriptions` both false |
+| `deleting_the_cluster_is_protected` | `deletion_protection = false` |
+| `deleting_the_cluster_leaves_a_snapshot` | `skip_final_snapshot = true` |
+| `backups_cover_a_week` | `backup_retention_days` below 7 |
+| `query_level_metrics_exist` | Performance Insights off |
+| `database_logs_leave_the_instance` | `enabled_cloudwatch_logs_exports` empty |
+| `log_retention_is_bounded` | Module-created log groups that never expire |
+| `tls_is_enforced_where_the_module_can_see` | `enforce_tls` with a brought cluster parameter group |
+| `the_module_controls_who_connects` | `create_security_group = false` |
+| `ingress_stays_inside_private_address_space` | Ingress outside RFC 1918, 100.64.0.0/10 and IPv6 unique-local |
+| `something_can_connect` | The module's group has no ingress, no other group and no proxy |
+| `credentials_are_not_in_state` | A plaintext `master_password` |
+| `engine_version_is_exact` | A major-only `engine_version` |
+| `minor_upgrades_do_not_fight_the_pin` | An exact version with `auto_minor_version_upgrade = true` |
+| `extended_support_matches_the_setting` | The running cluster's Extended Support setting differs from `engine_lifecycle_support` |
+| `extended_support_is_a_decision` | `engine_lifecycle_support` enables Extended Support |
+| `auto_pause_has_an_engine_that_supports_it` | `min_capacity = 0` on a minor too old to pause |
+| `the_proxy_has_clients` | Module-created proxy group with no `proxy.ingress_rules` |
+| `the_proxy_can_reach_secrets_manager` | Module-created proxy group with no egress on 443 |
+| `the_proxy_can_decrypt_its_secrets` | Module-created proxy role, own `proxy.secret_arns` and no `proxy.secret_kms_key_arn` |
+| `master_secret_key_is_the_one_configured` | The master secret's key differs from the one configured |
+| `performance_insights_key_is_the_one_configured` | The Performance Insights key differs from the one configured |
+| `activity_stream_key_is_the_one_configured` | The activity stream runs with another key than the one configured |
+| `database_insights_advanced_on_a_global_member` | Advanced Database Insights on a global member at create |
+| `major_upgrade_applies_immediately` | `allow_major_version_upgrade` with `apply_immediately = false` |
+| `reader_autoscaling_has_a_reader` | Autoscaling that can never act: one instance and `min_capacity = 0` |
+| `mysql_log_exports_have_their_switches` | `audit` or `general` exported with the engine switch off |
+| `parameter_group_family_matches_the_engine` | `parameter_group_family` names another engine or major |
+
+---
+
+## Configuration recipes
+
+Each fragment goes inside the [quick start](#quick-start) module block.
+
+**Customer-managed keys for every purpose**
 
 ```hcl
-module "aurora" {
-  source = "../../modules/aurora"
+  kms_key_arn        = var.db_kms_key_arn # storage, and the fallback for every purpose
+  require_cmk        = true
+  log_retention_days = 90
+```
 
-  cluster_identifier = "analytics"
-  engine             = "aurora-postgresql"
-  engine_version     = "15.4"
-  vpc_id             = module.network.vpc_id
-  subnet_ids         = module.network.database_subnet_ids
-  master_password    = var.db_password
+**Serverless v2 that scales to zero**
 
-  instances = {
-    writer = { instance_class = "db.r6g.large", promotion_tier = 0 }
-    bi     = { instance_class = "db.r6g.xlarge", promotion_tier = 5 }
+```hcl
+  instance_class      = "db.serverless"
+  instances           = { a = {} }
+  acknowledged_checks = ["cluster_survives_an_az"]
+  serverlessv2_scaling_configuration = {
+    min_capacity             = 0
+    max_capacity             = 4
+    seconds_until_auto_pause = 1800
   }
+```
 
-  # A dedicated endpoint that only routes to the BI reader
-  cluster_endpoints = {
-    bi = { type = "READER", static_members = ["analytics-bi"] }
-  }
+**RDS Proxy with application users**
 
-  # Allow the cluster to COPY from S3
-  iam_role_associations = {
-    s3import = {
-      role_arn     = aws_iam_role.aurora_s3.arn
-      feature_name = "s3Import"
+```hcl
+  proxy = {
+    enabled            = true
+    secret_arns        = [var.app_user_secret_arn]
+    secret_kms_key_arn = var.app_secret_kms_key_arn
+    ingress_rules = {
+      app = { referenced_security_group_id = var.app_sg_id, description = "orders service" }
+    }
+    egress_rules = {
+      secrets = { prefix_list_id = var.secretsmanager_endpoint_pl, port = 443, description = "Secrets Manager endpoint" }
     }
   }
-}
 ```
 
-### Global Database (primary region)
+**Global database**
 
 ```hcl
-module "aurora_primary" {
-  source = "../../modules/aurora"
+module "primary" {
+  # quick-start inputs, in the primary region
+  global_cluster_role         = "primary"
+  global_cluster_identifier   = "orders-global"
+  manage_master_user_password = false
+  master_password             = var.db_password # from a sensitive workspace variable
+  allow_plaintext_credentials = true
+  acknowledged_checks         = ["credentials_are_not_in_state"]
+}
 
-  cluster_identifier        = "global-primary"
-  engine                    = "aurora-postgresql"
-  engine_version            = "15.4"
-  vpc_id                    = module.network.vpc_id
-  subnet_ids                = module.network.database_subnet_ids
-  master_password           = var.db_password
-
-  enable_global_cluster     = true
-  global_cluster_identifier = "my-global-db"
-  is_primary_region         = true
+module "secondary" {
+  providers = { aws = aws.dr }
+  # quick-start inputs, with the secondary region's network
+  global_cluster_role         = "secondary"
+  global_cluster_identifier   = module.primary.global_cluster_identifier
+  manage_master_user_password = false
+  kms_key_arn                 = var.dr_kms_key_arn
 }
 ```
 
-## Backward compatibility & upgrade notes
+**Bring your own network and parameter groups**
 
-This module preserves its existing input contract — no previously required
-variable was removed or renamed, and defaults are unchanged. Enrichments are
-additive and opt-in:
-
-- **DB subnet group is now conditional.** A `moved` block migrates the existing
-  `aws_db_subnet_group.main` to `aws_db_subnet_group.main[0]` automatically, so
-  upgrading callers see **no replacement** on the next plan.
-- **`vpc_id` and `subnet_ids` are now optional**, validated only when the module
-  actually needs them (`create_security_group` / `create_db_subnet_group`).
-  Existing callers that pass them keep working.
-- **`storage_type` validation was relaxed** to accept `aurora`, `aurora-iopt1`,
-  and the previously allowed `gp3`.
-- **Enhanced Monitoring** now accepts a pre-existing `monitoring_role_arn`;
-  behaviour is unchanged when it is left `null`.
-
-Two corrections were also made that may affect callers:
-
-- **`backup_encryption_key_id` was removed.** It was never wired to any
-  resource — Aurora backups are encrypted with the cluster's `kms_key_id`.
-  Remove it from any call that still sets it.
-- **`enable_http_endpoint` no longer requires `engine_mode = "serverless"`.**
-  The RDS Data API now works on provisioned and Serverless v2 clusters, so the
-  module defers engine/region eligibility to AWS.
-- **`serverless_scaling_configuration.auto_pause` was removed.** Serverless v2
-  has no such argument — auto-pause is expressed by `min_capacity = 0` plus
-  `seconds_until_auto_pause`. Drop `auto_pause` from any call that set it.
-
-## Security notes
-
-- Storage encryption is **on by default** (`storage_encrypted = true`); supply
-  `kms_key_id` to use a customer-managed key.
-- Prefer `manage_master_user_password = true` so the credential never lives in
-  Terraform state; otherwise mark `master_password` as sensitive in the caller.
-- `deletion_protection` defaults to `true`. The module also writes a final
-  snapshot on destroy unless `skip_final_snapshot = true`.
-- The created security group is least-privilege: ingress only from
-  `allowed_cidr_blocks` / `allowed_ipv6_cidr_blocks` / `allowed_security_groups`
-  on the database port.
-
-## Testing
-
-Native `terraform test` suites live in [`tests/`](./tests) and run fully offline
-(mocked AWS provider — no account or credentials needed):
-
-- `tests/aurora.tftest.hcl` — plan-only happy paths and every input validation.
-- `tests/apply.tftest.hcl` — full-stack apply against a mocked provider.
-
-```bash
-cd modules/aurora
-terraform init -backend=false
-terraform test
+```hcl
+  create_db_subnet_group         = false
+  db_subnet_group_name           = "corp-db"
+  create_security_group          = false
+  vpc_security_group_ids         = [var.db_sg_id]
+  ingress_rules                  = {}
+  create_cluster_parameter_group = false
+  cluster_parameter_group_name   = "corp-aurora-postgresql17"
+  acknowledged_checks            = ["the_module_controls_who_connects", "tls_is_enforced_where_the_module_can_see"]
 ```
 
-<!-- BEGIN_TF_DOCS -->
-## Requirements
+### Examples
 
-| Name | Version |
-|------|---------|
-| <a name="requirement_terraform"></a> [terraform](#requirement\_terraform) | >= 1.5.0 |
-| <a name="requirement_aws"></a> [aws](#requirement\_aws) | ~> 5.0 |
+| Example | Shows |
+|---|---|
+| [isolated-vpc-postgresql](https://github.com/ivasik-k7/terraform-shared-modules/tree/aurora-v2.0.0/modules/aurora/examples/isolated-vpc-postgresql) | Two AZs, one CMK with `require_cmk`, IAM authentication, alarms, contract outputs |
+| [proxy-and-readers](https://github.com/ivasik-k7/terraform-shared-modules/tree/aurora-v2.0.0/modules/aurora/examples/proxy-and-readers) | Aurora MySQL, a reporting reader behind a custom endpoint, reader autoscaling, RDS Proxy |
+| [global-database](https://github.com/ivasik-k7/terraform-shared-modules/tree/aurora-v2.0.0/modules/aurora/examples/global-database) | A primary in eu-west-2 and a secondary in eu-west-1 with its own key |
+| [serverless-v2-dev](https://github.com/ivasik-k7/terraform-shared-modules/tree/aurora-v2.0.0/modules/aurora/examples/serverless-v2-dev) | One pausing `db.serverless` instance with its checks acknowledged |
 
-## Providers
-
-| Name | Version |
-|------|---------|
-| <a name="provider_aws"></a> [aws](#provider\_aws) | ~> 5.0 |
-
-## Modules
-
-No modules.
-
-## Resources
-
-| Name | Type |
-|------|------|
-| [aws_cloudwatch_log_group.aurora_logs](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/cloudwatch_log_group) | resource |
-| [aws_cloudwatch_metric_alarm.cpu_utilization](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/cloudwatch_metric_alarm) | resource |
-| [aws_cloudwatch_metric_alarm.database_connections](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/cloudwatch_metric_alarm) | resource |
-| [aws_cloudwatch_metric_alarm.database_free_storage_space](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/cloudwatch_metric_alarm) | resource |
-| [aws_cloudwatch_metric_alarm.database_replica_lag](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/cloudwatch_metric_alarm) | resource |
-| [aws_db_parameter_group.main](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/db_parameter_group) | resource |
-| [aws_db_subnet_group.main](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/db_subnet_group) | resource |
-| [aws_iam_role.enhanced_monitoring](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/iam_role) | resource |
-| [aws_iam_role_policy_attachment.enhanced_monitoring](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/iam_role_policy_attachment) | resource |
-| [aws_rds_cluster.main](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/rds_cluster) | resource |
-| [aws_rds_cluster_activity_stream.this](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/rds_cluster_activity_stream) | resource |
-| [aws_rds_cluster_endpoint.custom](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/rds_cluster_endpoint) | resource |
-| [aws_rds_cluster_instance.instances](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/rds_cluster_instance) | resource |
-| [aws_rds_cluster_parameter_group.main](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/rds_cluster_parameter_group) | resource |
-| [aws_rds_cluster_role_association.this](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/rds_cluster_role_association) | resource |
-| [aws_rds_global_cluster.main](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/rds_global_cluster) | resource |
-| [aws_security_group.aurora](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/security_group) | resource |
-| [aws_vpc_security_group_egress_rule.allow_all](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/vpc_security_group_egress_rule) | resource |
-| [aws_vpc_security_group_ingress_rule.from_cidr](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/vpc_security_group_ingress_rule) | resource |
-| [aws_vpc_security_group_ingress_rule.from_ipv6_cidr](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/vpc_security_group_ingress_rule) | resource |
-| [aws_vpc_security_group_ingress_rule.from_security_group](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/vpc_security_group_ingress_rule) | resource |
+---
 
 ## Inputs
 
-| Name | Description | Type | Default | Required |
-|------|-------------|------|---------|:--------:|
-| <a name="input_activity_stream_audit_fields_included"></a> [activity\_stream\_audit\_fields\_included](#input\_activity_stream_audit_fields_included) | Whether engine-native audit fields are included in the activity stream | `bool` | `false` | no |
-| <a name="input_activity_stream_kms_key_id"></a> [activity\_stream\_kms\_key\_id](#input\_activity_stream_kms_key_id) | KMS key ID/ARN used to encrypt the activity stream. Required when enable_activity_stream is true. | `string` | `null` | no |
-| <a name="input_activity_stream_mode"></a> [activity\_stream\_mode](#input\_activity_stream_mode) | Activity stream mode: 'async' (lower latency, best effort) or 'sync' (guaranteed delivery) | `string` | `"async"` | no |
-| <a name="input_alarm_connections_threshold"></a> [alarm\_connections\_threshold](#input\_alarm_connections_threshold) | Database connections threshold for CloudWatch alarm | `number` | `80` | no |
-| <a name="input_alarm_cpu_threshold_percent"></a> [alarm\_cpu\_threshold\_percent](#input\_alarm_cpu_threshold_percent) | CPU utilization threshold for CloudWatch alarm (percent) | `number` | `80` | no |
-| <a name="input_alarm_free_storage_space_bytes"></a> [alarm\_free\_storage\_space\_bytes](#input\_alarm_free_storage_space_bytes) | Free storage space threshold in bytes for CloudWatch alarm (default: 1 GB) | `number` | `1073741824` | no |
-| <a name="input_alarm_replica_lag_milliseconds"></a> [alarm\_replica\_lag\_milliseconds](#input\_alarm_replica_lag_milliseconds) | Replica lag threshold in milliseconds for CloudWatch alarm (default: 1000ms) | `number` | `1000` | no |
-| <a name="input_allow_major_version_upgrade"></a> [allow\_major\_version\_upgrade](#input\_allow_major_version_upgrade) | Allow major engine version upgrades when changing engine_version | `bool` | `false` | no |
-| <a name="input_allowed_cidr_blocks"></a> [allowed\_cidr\_blocks](#input\_allowed_cidr_blocks) | IPv4 CIDR blocks allowed to access Aurora | `list(string)` | `[]` | no |
-| <a name="input_allowed_ipv6_cidr_blocks"></a> [allowed\_ipv6\_cidr\_blocks](#input\_allowed_ipv6_cidr_blocks) | IPv6 CIDR blocks allowed to access Aurora | `list(string)` | `[]` | no |
-| <a name="input_allowed_security_groups"></a> [allowed\_security\_groups](#input\_allowed_security_groups) | Security group IDs allowed to access Aurora | `list(string)` | `[]` | no |
-| <a name="input_apply_immediately"></a> [apply\_immediately](#input\_apply_immediately) | Apply changes immediately instead of during the next maintenance window | `bool` | `false` | no |
-| <a name="input_auto_minor_version_upgrade"></a> [auto\_minor\_version\_upgrade](#input\_auto_minor_version_upgrade) | Indicates that minor engine upgrades will be applied automatically | `bool` | `true` | no |
-| <a name="input_availability_zones"></a> [availability\_zones](#input\_availability_zones) | List of AZs for Aurora instances. If not specified, uses subnets' AZs | `list(string)` | `null` | no |
-| <a name="input_backtrack_window"></a> [backtrack\_window](#input\_backtrack_window) | Target backtrack window in seconds for Aurora MySQL. Only available for aurora-mysql | `number` | `null` | no |
-| <a name="input_backup_retention_period"></a> [backup\_retention\_period](#input\_backup_retention_period) | The days to retain backups for | `number` | `7` | no |
-| <a name="input_cloudwatch_log_retention_days"></a> [cloudwatch\_log\_retention\_days](#input\_cloudwatch_log_retention_days) | CloudWatch log retention period in days | `number` | `7` | no |
-| <a name="input_cluster_endpoints"></a> [cluster\_endpoints](#input\_cluster_endpoints) | Map of additional custom Aurora cluster endpoints (e.g. dedicated analytics readers). Key becomes the endpoint identifier suffix. Use either static_members or excluded_members, not both. Members are full instance identifiers (e.g. '<cluster_identifier>-<instance_key>'). | <pre>map(object({<br>&nbsp;&nbsp;&nbsp;&nbsp;type&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; = string<br>&nbsp;&nbsp;&nbsp;&nbsp;static_members&nbsp;&nbsp; = optional(list(string), [])<br>&nbsp;&nbsp;&nbsp;&nbsp;excluded_members = optional(list(string), [])<br>&nbsp;&nbsp;}))</pre> | `{}` | no |
-| <a name="input_cluster_identifier"></a> [cluster\_identifier](#input\_cluster_identifier) | The cluster identifier for Aurora cluster (up to 63 chars) | `string` | n/a | yes |
-| <a name="input_cluster_parameter_group_family"></a> [cluster\_parameter\_group\_family](#input\_cluster_parameter_group_family) | The family of the cluster parameter group | `string` | `null` | no |
-| <a name="input_cluster_parameter_group_name"></a> [cluster\_parameter\_group\_name](#input\_cluster_parameter_group_name) | Name of the cluster parameter group to use | `string` | `null` | no |
-| <a name="input_cluster_parameters"></a> [cluster\_parameters](#input\_cluster_parameters) | A list of cluster parameters to apply | <pre>list(object({<br>&nbsp;&nbsp;&nbsp;&nbsp;name&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; = string<br>&nbsp;&nbsp;&nbsp;&nbsp;value&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;= string<br>&nbsp;&nbsp;&nbsp;&nbsp;apply_method = optional(string, "immediate")<br>&nbsp;&nbsp;}))</pre> | `[]` | no |
-| <a name="input_cluster_tags"></a> [cluster\_tags](#input\_cluster_tags) | Additional tags for the Aurora cluster | `map(string)` | `{}` | no |
-| <a name="input_copy_tags_to_snapshot"></a> [copy\_tags\_to\_snapshot](#input\_copy_tags_to_snapshot) | Copy all cluster tags to snapshots | `bool` | `true` | no |
-| <a name="input_create_alarms"></a> [create\_alarms](#input\_create_alarms) | Whether to create CloudWatch alarms | `bool` | `true` | no |
-| <a name="input_create_cluster_parameter_group"></a> [create\_cluster\_parameter\_group](#input\_create_cluster_parameter_group) | Whether to create a cluster parameter group | `bool` | `true` | no |
-| <a name="input_create_db_parameter_group"></a> [create\_db\_parameter\_group](#input\_create_db_parameter_group) | Whether to create instance parameter group | `bool` | `true` | no |
-| <a name="input_create_db_subnet_group"></a> [create\_db\_subnet\_group](#input\_create_db_subnet_group) | Whether to create a DB subnet group. Set to false to attach the cluster to a pre-existing subnet group named by db_subnet_group_name. | `bool` | `true` | no |
-| <a name="input_create_monitoring_role"></a> [create\_monitoring\_role](#input\_create_monitoring_role) | Create IAM role for enhanced monitoring. Ignored when monitoring_role_arn is set. | `bool` | `true` | no |
-| <a name="input_create_security_group"></a> [create\_security\_group](#input\_create_security_group) | Whether to create security group for Aurora | `bool` | `true` | no |
-| <a name="input_database_name"></a> [database\_name](#input\_database_name) | The name of the database to create when the DB cluster is created | `string` | `null` | no |
-| <a name="input_db_parameter_group_family"></a> [db\_parameter\_group\_family](#input\_db_parameter_group_family) | The family of the DB parameter group | `string` | `null` | no |
-| <a name="input_db_parameter_group_name"></a> [db\_parameter\_group\_name](#input\_db_parameter_group_name) | Name of the DB parameter group to use | `string` | `null` | no |
-| <a name="input_db_parameters"></a> [db\_parameters](#input\_db_parameters) | A list of DB parameters to apply | <pre>list(object({<br>&nbsp;&nbsp;&nbsp;&nbsp;name&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; = string<br>&nbsp;&nbsp;&nbsp;&nbsp;value&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;= string<br>&nbsp;&nbsp;&nbsp;&nbsp;apply_method = optional(string, "pending-reboot")<br>&nbsp;&nbsp;}))</pre> | `[]` | no |
-| <a name="input_db_subnet_group_description"></a> [db\_subnet\_group\_description](#input\_db_subnet_group_description) | Description for the created DB subnet group | `string` | `null` | no |
-| <a name="input_db_subnet_group_name"></a> [db\_subnet\_group\_name](#input\_db_subnet_group_name) | Name of the DB subnet group. When create_db_subnet_group is true this overrides the generated name; when false it must reference an existing subnet group. | `string` | `null` | no |
-| <a name="input_deletion_protection"></a> [deletion\_protection](#input\_deletion_protection) | If the DB cluster should have deletion protection enabled | `bool` | `true` | no |
-| <a name="input_enable_activity_stream"></a> [enable\_activity\_stream](#input\_enable_activity_stream) | Enable a Database Activity Stream for the cluster (provisioned Aurora only) | `bool` | `false` | no |
-| <a name="input_enable_automated_backup"></a> [enable\_automated\_backup](#input\_enable_automated_backup) | Enable or disable automated backups | `bool` | `true` | no |
-| <a name="input_enable_global_cluster"></a> [enable\_global\_cluster](#input\_enable_global_cluster) | Whether to create a global Aurora database cluster | `bool` | `false` | no |
-| <a name="input_enable_http_endpoint"></a> [enable\_http\_endpoint](#input\_enable_http_endpoint) | Enable the RDS Data API (HTTP endpoint). Supported on Aurora Serverless v1 (engine_mode 'serverless') and, via the newer RDS Data API, on Serverless v2 and provisioned Aurora. Engine/version/region availability is enforced by AWS. | `bool` | `false` | no |
-| <a name="input_enable_local_write_forwarding"></a> [enable\_local\_write\_forwarding](#input\_enable_local_write_forwarding) | Enable local write forwarding so reader instances forward writes to the writer (Aurora MySQL and PostgreSQL) | `bool` | `false` | no |
-| <a name="input_enabled_cloudwatch_logs_exports"></a> [enabled\_cloudwatch\_logs\_exports](#input\_enabled_cloudwatch_logs_exports) | List of log types to export to CloudWatch | `list(string)` | `[]` | no |
-| <a name="input_engine"></a> [engine](#input\_engine) | The Aurora database engine to use | `string` | `"aurora-postgresql"` | no |
-| <a name="input_engine_mode"></a> [engine\_mode](#input\_engine_mode) | The database engine mode. For Aurora: 'provisioned' or 'serverless' | `string` | `"provisioned"` | no |
-| <a name="input_engine_version"></a> [engine\_version](#input\_engine_version) | The engine version to use | `string` | n/a | yes |
-| <a name="input_final_snapshot_identifier"></a> [final\_snapshot\_identifier](#input\_final_snapshot_identifier) | Name of the final snapshot taken on deletion. Defaults to '<cluster_identifier>-final-snapshot' when skip_final_snapshot is false. | `string` | `null` | no |
-| <a name="input_global_cluster_identifier"></a> [global\_cluster\_identifier](#input\_global_cluster_identifier) | The global cluster identifier for Aurora Global Database. Required when enable_global_cluster = true | `string` | `null` | no |
-| <a name="input_iam_database_authentication_enabled"></a> [iam\_database\_authentication\_enabled](#input\_iam_database_authentication_enabled) | Specifies whether IAM Database authentication is enabled | `bool` | `false` | no |
-| <a name="input_iam_role_associations"></a> [iam\_role\_associations](#input\_iam_role_associations) | Map of IAM roles to associate with the cluster for Aurora features such as S3 import/export. Key is a free-form label; feature_name is the Aurora feature (e.g. 's3Import', 's3Export'). | <pre>map(object({<br>&nbsp;&nbsp;&nbsp;&nbsp;role_arn&nbsp;&nbsp;&nbsp;&nbsp; = string<br>&nbsp;&nbsp;&nbsp;&nbsp;feature_name = string<br>&nbsp;&nbsp;}))</pre> | `{}` | no |
-| <a name="input_instance_tags"></a> [instance\_tags](#input\_instance_tags) | Additional tags for Aurora instances | `map(string)` | `{}` | no |
-| <a name="input_instances"></a> [instances](#input\_instances) | Map of Aurora instances to create. Key is instance identifier | <pre>map(object({<br>&nbsp;&nbsp;&nbsp;&nbsp;instance_class&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;= string<br>&nbsp;&nbsp;&nbsp;&nbsp;promotion_tier&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;= optional(number, 1)<br>&nbsp;&nbsp;&nbsp;&nbsp;publicly_accessible&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; = optional(bool, false)<br>&nbsp;&nbsp;&nbsp;&nbsp;performance_insights_enabled&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;= optional(bool, false)<br>&nbsp;&nbsp;&nbsp;&nbsp;performance_insights_retention_period = optional(number, 7)<br>&nbsp;&nbsp;&nbsp;&nbsp;ca_cert_identifier&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;= optional(string)<br>&nbsp;&nbsp;&nbsp;&nbsp;tags&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;= optional(map(string), {})<br>&nbsp;&nbsp;}))</pre> | <pre>{<br>&nbsp;&nbsp;&nbsp;&nbsp;"writer" = {<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;instance_class&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;= "db.t3.medium"<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;promotion_tier&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;= 0<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;publicly_accessible = false<br>&nbsp;&nbsp;&nbsp;&nbsp;}<br>&nbsp;&nbsp;}</pre> | no |
-| <a name="input_iops"></a> [iops](#input\_iops) | The amount of provisioned IOPS for Aurora PostgreSQL with gp3 storage | `number` | `null` | no |
-| <a name="input_is_primary_region"></a> [is\_primary\_region](#input\_is_primary_region) | Whether this is the primary region for the global cluster | `bool` | `true` | no |
-| <a name="input_kms_key_id"></a> [kms\_key\_id](#input\_kms_key_id) | The ARN for the KMS encryption key | `string` | `null` | no |
-| <a name="input_manage_master_user_password"></a> [manage\_master\_user\_password](#input\_manage_master_user_password) | Let RDS generate and manage the master user password in AWS Secrets Manager. Mutually exclusive with master_password. | `bool` | `false` | no |
-| <a name="input_master_password"></a> [master\_password](#input\_master_password) | Password for the master DB user | `string` | `null` | no |
-| <a name="input_master_user_secret_kms_key_id"></a> [master\_user\_secret\_kms\_key\_id](#input\_master_user_secret_kms_key_id) | KMS key ID/ARN to encrypt the RDS-managed master user secret. Defaults to the AWS-managed aws/secretsmanager key when null. | `string` | `null` | no |
-| <a name="input_master_username"></a> [master\_username](#input\_master_username) | Username for the master DB user | `string` | `"admin"` | no |
-| <a name="input_monitoring_interval"></a> [monitoring\_interval](#input\_monitoring_interval) | The interval, in seconds, between points when Enhanced Monitoring metrics are collected | `number` | `0` | no |
-| <a name="input_monitoring_role_arn"></a> [monitoring\_role\_arn](#input\_monitoring_role_arn) | ARN of a pre-existing IAM role for enhanced monitoring. When set, no role is created. | `string` | `null` | no |
-| <a name="input_network_type"></a> [network\_type](#input\_network_type) | Network type of the cluster: 'IPV4' or 'DUAL' (dual-stack) | `string` | `null` | no |
-| <a name="input_performance_insights_enabled"></a> [performance\_insights\_enabled](#input\_performance_insights_enabled) | Specifies whether Performance Insights are enabled for all instances | `bool` | `false` | no |
-| <a name="input_performance_insights_kms_key_id"></a> [performance\_insights\_kms\_key\_id](#input\_performance_insights_kms_key_id) | KMS key ID/ARN used to encrypt Performance Insights data | `string` | `null` | no |
-| <a name="input_performance_insights_retention_period"></a> [performance\_insights\_retention\_period](#input\_performance_insights_retention_period) | Amount of time in days to retain Performance Insights data | `number` | `7` | no |
-| <a name="input_port"></a> [port](#input\_port) | The port on which the DB accepts connections | `number` | `null` | no |
-| <a name="input_preferred_backup_window"></a> [preferred\_backup\_window](#input\_preferred_backup_window) | The daily time range during which automated backups are created | `string` | `"02:00-03:00"` | no |
-| <a name="input_preferred_maintenance_window"></a> [preferred\_maintenance\_window](#input\_preferred_maintenance_window) | The window to perform maintenance in | `string` | `"sun:03:00-sun:04:00"` | no |
-| <a name="input_publicly_accessible"></a> [publicly\_accessible](#input\_publicly_accessible) | Bool to control if cluster is publicly accessible | `bool` | `false` | no |
-| <a name="input_security_group_name"></a> [security\_group\_name](#input\_security_group_name) | Name prefix for the security group | `string` | `null` | no |
-| <a name="input_security_group_tags"></a> [security\_group\_tags](#input\_security_group_tags) | Additional tags for the security group | `map(string)` | `{}` | no |
-| <a name="input_serverless_scaling_configuration"></a> [serverless\_scaling\_configuration](#input\_serverless_scaling_configuration) | Aurora Serverless v2 scaling configuration. Provide this (with db.serverless instance classes) to enable Serverless v2. min_capacity must be >= 0.5 and max_capacity >= min_capacity. | <pre>object({<br>&nbsp;&nbsp;&nbsp;&nbsp;min_capacity&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; = number<br>&nbsp;&nbsp;&nbsp;&nbsp;max_capacity&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; = number<br>&nbsp;&nbsp;&nbsp;&nbsp;seconds_until_auto_pause = optional(number, 300)<br>&nbsp;&nbsp;})</pre> | `null` | no |
-| <a name="input_skip_final_snapshot"></a> [skip\_final\_snapshot](#input\_skip_final_snapshot) | Determines whether a final DB snapshot is created before the DB cluster is deleted | `bool` | `false` | no |
-| <a name="input_snapshot_identifier"></a> [snapshot\_identifier](#input\_snapshot_identifier) | Snapshot or cluster snapshot ARN to restore the cluster from on creation | `string` | `null` | no |
-| <a name="input_source_db_cluster_identifier"></a> [source\_db\_cluster\_identifier](#input\_source_db_cluster_identifier) | The DB cluster identifier of the source cluster for secondary region | `string` | `null` | no |
-| <a name="input_source_region"></a> [source\_region](#input\_source_region) | Source region for Aurora Global Database secondary cluster | `string` | `null` | no |
-| <a name="input_storage_encrypted"></a> [storage\_encrypted](#input\_storage_encrypted) | Specifies whether the DB cluster is encrypted | `bool` | `true` | no |
-| <a name="input_storage_type"></a> [storage\_type](#input\_storage_type) | Aurora cluster storage type. Use 'aurora-iopt1' for Aurora I/O-Optimized, or leave null for standard Aurora storage. 'gp3' remains accepted for backward compatibility. | `string` | `null` | no |
-| <a name="input_subnet_ids"></a> [subnet\_ids](#input\_subnet_ids) | A list of VPC subnet IDs (minimum 2 for HA). Required only when create_db_subnet_group is true. | `list(string)` | `[]` | no |
-| <a name="input_tags"></a> [tags](#input\_tags) | A mapping of tags to assign to all resources | `map(string)` | `{}` | no |
-| <a name="input_timeouts"></a> [timeouts](#input\_timeouts) | Define timeouts for Aurora operations | <pre>object({<br>&nbsp;&nbsp;&nbsp;&nbsp;create = optional(string, "120m")<br>&nbsp;&nbsp;&nbsp;&nbsp;update = optional(string, "120m")<br>&nbsp;&nbsp;&nbsp;&nbsp;delete = optional(string, "120m")<br>&nbsp;&nbsp;})</pre> | <pre>{<br>&nbsp;&nbsp;&nbsp;&nbsp;create = "120m"<br>&nbsp;&nbsp;&nbsp;&nbsp;update = "120m"<br>&nbsp;&nbsp;&nbsp;&nbsp;delete = "120m"<br>&nbsp;&nbsp;}</pre> | no |
-| <a name="input_vpc_id"></a> [vpc\_id](#input\_vpc_id) | VPC ID where the Aurora cluster will be created. Required only when create_security_group is true. | `string` | `null` | no |
-| <a name="input_vpc_security_group_ids"></a> [vpc\_security\_group\_ids](#input\_vpc_security_group_ids) | List of VPC security groups to associate | `list(string)` | `[]` | no |
+### Module
+
+| Name | Type | Default | Description |
+|---|---|---|---|
+| `create` | `bool` | `true` | Master switch. `false` plans nothing; on a live deployment that is a destroy |
+| `name` | `string` | required | Cluster identifier and the prefix of every name; 1–41 characters |
+| `tags` | `map(string)` | `{}` | Tags for every resource |
+| `required_tag_keys` | `list(string)` | `[]` | Keys that must be present and non-empty in `tags` |
+| `acknowledged_checks` | `list(string)` | `[]` | Advisory checks accepted on purpose |
+
+### Engine
+
+| Name | Type | Default | Description |
+|---|---|---|---|
+| `engine` | `string` | required | `aurora-postgresql` or `aurora-mysql` |
+| `engine_version` | `string` | required | Exact version, such as `"17.9"` or `"8.0.mysql_aurora.3.10.4"` |
+| `parameter_group_family` | `string` | `""` | Overrides the derived family |
+| `auto_minor_version_upgrade` | `bool` | `false` | Let AWS apply minor versions |
+| `allow_major_version_upgrade` | `bool` | `false` | Permit a major version change |
+| `engine_lifecycle_support` | `string` | `"open-source-rds-extended-support-disabled"` | Extended Support at end of standard support; creation-time only |
+
+### Instances
+
+| Name | Type | Default | Description |
+|---|---|---|---|
+| `instance_class` | `string` | required | Default class; `db.serverless` for Serverless v2 |
+| `instances` | `map(object)` | required | Instances keyed by a stable name (schema below) |
+| `serverlessv2_scaling_configuration` | `object` | `{ min_capacity = 0.5, max_capacity = 4, seconds_until_auto_pause = 3600 }` | ACU range for `db.serverless` instances |
+| `ca_cert_identifier` | `string` | `"rds-ca-rsa2048-g1"` | Server CA, overridable per instance |
+| `publicly_accessible` | `bool` | `false` | Public addresses; needs `allow_public_access` |
+| `allow_public_access` | `bool` | `false` | Acknowledges `publicly_accessible` |
+| `apply_immediately` | `bool` | `false` | Apply modifications now instead of in the maintenance window |
+
+```hcl
+instances = map(object({
+  instance_class               = optional(string, "")  # "" = var.instance_class
+  availability_zone            = optional(string, "")  # "" = AWS places it; changing it replaces the instance
+  promotion_tier               = optional(number, 1)   # 0-15, failover order
+  ca_cert_identifier           = optional(string, "")
+  preferred_maintenance_window = optional(string, "")
+  tags                         = optional(map(string), {})
+}))  # keys match ^[a-z0-9][a-z0-9-]{0,19}$
+```
+
+### Storage and encryption
+
+| Name | Type | Default | Description |
+|---|---|---|---|
+| `storage_type` | `string` | `"aurora"` | `aurora` (billed per I/O) or `aurora-iopt1` (I/O-Optimized) |
+| `kms_key_arn` | `string` | `""` | Storage key and the fallback for every purpose; changing it replaces the cluster |
+| `require_cmk` | `bool` | `false` | Refuse any purpose on an AWS-managed key |
+
+### Credentials
+
+| Name | Type | Default | Description |
+|---|---|---|---|
+| `database_name` | `string` | `""` | Initial database; creation-time only |
+| `master_username` | `string` | `"dbadmin"` | Master user; creation-time only |
+| `manage_master_user_password` | `bool` | `true` | RDS-managed secret in Secrets Manager |
+| `master_user_secret_kms_key_arn` | `string` | `""` | Key for the managed secret |
+| `master_password_rotation` | `object` | `{}` | Rotation schedule (schema below) |
+| `master_password` | `string`, sensitive | `""` | Static password: 8–128 characters, none of `/`, `@`, `"` or space |
+| `allow_plaintext_credentials` | `bool` | `false` | Acknowledges a static password in state |
+| `iam_database_authentication_enabled` | `bool` | `false` | IAM token authentication |
+
+```hcl
+master_password_rotation = object({
+  schedule_expression      = optional(string, "")  # "rate(N days)" or "cron(...)"
+  automatically_after_days = optional(number, 0)   # 1-1000; exclusive with schedule_expression
+  duration                 = optional(string, "")  # rotation window, "1h" to "24h"
+  rotate_immediately       = optional(bool, false)
+})
+```
+
+### Restore
+
+| Name | Type | Default | Description |
+|---|---|---|---|
+| `snapshot_identifier` | `string` | `""` | Cluster snapshot name or ARN, including `rds:` and `awsbackup:` names |
+| `restore_to_point_in_time` | `object` | `{}` | Point-in-time copy of another cluster (schema below) |
+
+```hcl
+restore_to_point_in_time = object({
+  source_cluster_identifier  = optional(string, "")   # set either this...
+  source_cluster_resource_id = optional(string, "")   # ...or this (cluster-XXXX), for a deleted source
+  restore_to_time            = optional(string, "")   # RFC 3339 UTC; exclusive with the next
+  use_latest_restorable_time = optional(bool, false)
+  restore_type               = optional(string, "full-copy")  # or copy-on-write
+})
+```
+
+### Global database
+
+| Name | Type | Default | Description |
+|---|---|---|---|
+| `global_cluster_role` | `string` | `"none"` | `none`, `primary` or `secondary` |
+| `global_cluster_identifier` | `string` | `""` | Global cluster to create or join |
+| `create_global_cluster` | `bool` | `true` | On a primary, create the global cluster |
+| `enable_global_write_forwarding` | `bool` | `false` | On a secondary, forward writes to the primary |
+
+### Network
+
+| Name | Type | Default | Description |
+|---|---|---|---|
+| `create_db_subnet_group` | `bool` | `true` | Create the subnet group from `subnet_ids` |
+| `db_subnet_group_name` | `string` | `""` | Name of the created group, or the existing group |
+| `subnet_ids` | `list(string)` | `[]` | Subnets in at least two AZs; also the proxy's default |
+| `vpc_id` | `string` | `""` | VPC for the module-created security groups |
+| `create_security_group` | `bool` | `true` | Create the database security group |
+| `vpc_security_group_ids` | `list(string)` | `[]` | Existing groups to attach; at most 5 groups in total |
+| `ingress_rules` | `map(object)` | `{}` | Ingress on the database port, keyed by label |
+| `egress_rules` | `map(object)` | `{}` | Egress from the database group |
+| `port` | `number` | `0` | Database port; `0` means the engine default |
+| `network_type` | `string` | `"IPV4"` | `IPV4` or `DUAL` |
+
+```hcl
+ingress_rules = map(object({
+  description                  = string
+  cidr_ipv4                    = optional(string, "")  # exactly one source; /0 is refused
+  cidr_ipv6                    = optional(string, "")
+  referenced_security_group_id = optional(string, "")  # sg-..., or <account>/sg-... across a peering
+  prefix_list_id               = optional(string, "")
+}))
+
+egress_rules = map(object({
+  description                  = string
+  port                         = number                  # 1-65535
+  protocol                     = optional(string, "tcp") # tcp or udp
+  cidr_ipv4                    = optional(string, "")    # exactly one destination
+  cidr_ipv6                    = optional(string, "")
+  referenced_security_group_id = optional(string, "")
+  prefix_list_id               = optional(string, "")
+}))
+```
+
+### Parameters
+
+| Name | Type | Default | Description |
+|---|---|---|---|
+| `create_cluster_parameter_group` | `bool` | `true` | Create the cluster parameter group |
+| `cluster_parameter_group_name` | `string` | `""` | Existing cluster parameter group |
+| `create_db_parameter_group` | `bool` | `true` | Create the instance parameter group |
+| `db_parameter_group_name` | `string` | `""` | Existing instance parameter group |
+| `cluster_parameters` | `map(object({ value = string, apply_method = optional(string, "pending-reboot") }))` | `{}` | Cluster parameters by name |
+| `db_parameters` | same as `cluster_parameters` | `{}` | Instance parameters by name |
+| `enforce_tls` | `bool` | `true` | Write the TLS parameter |
+| `allow_insecure_transport` | `bool` | `false` | Acknowledges `enforce_tls = false` |
+| `recommended_parameters` | `bool` | `true` | Merge the logging parameters |
+
+### Backup, maintenance and deletion
+
+| Name | Type | Default | Description |
+|---|---|---|---|
+| `backup_retention_days` | `number` | `7` | 1–35 |
+| `preferred_backup_window` | `string` | `"02:00-03:00"` | UTC |
+| `preferred_maintenance_window` | `string` | `"sun:04:00-sun:05:00"` | UTC; also applied to instances |
+| `backtrack_window_seconds` | `number` | `0` | aurora-mysql only; up to 259200 |
+| `deletion_protection` | `bool` | `true` | Refuse cluster deletion |
+| `skip_final_snapshot` | `bool` | `false` | Delete without a final snapshot |
+| `final_snapshot_identifier` | `string` | `""` | `""` gives `<name>-final-<timestamp>` |
+| `delete_automated_backups` | `bool` | `false` | Delete automated backups with the cluster |
+| `copy_tags_to_snapshot` | `bool` | `true` | Copy cluster tags to snapshots |
+
+### Features
+
+| Name | Type | Default | Description |
+|---|---|---|---|
+| `enable_data_api` | `bool` | `false` | RDS Data API (HTTP endpoint) |
+| `enable_local_write_forwarding` | `bool` | `false` | Readers forward writes to the writer |
+| `cluster_iam_roles` | `map(object({ role_arn = string, feature_name = optional(string, "") }))` | `{}` | Roles for S3, Lambda, SageMaker, Comprehend or Bedrock; `feature_name` is required on PostgreSQL and empty on MySQL |
+| `activity_stream` | `object({ enabled = optional(bool, false), mode = optional(string, "async"), kms_key_arn = optional(string, "") })` | `{}` | Database Activity Streams |
+| `custom_endpoints` | `map(object({ type = optional(string, "READER"), static_members = optional(list(string), []), excluded_members = optional(list(string), []) }))` | `{}` | Members are `instances` keys |
+| `timeouts` | `object({ create, update, delete })` | `"120m"` each | Cluster and instance timeouts |
+
+### Reader autoscaling
+
+```hcl
+reader_autoscaling = object({
+  enabled            = optional(bool, false)
+  min_capacity       = optional(number, 1)    # 0 <= min <= max <= 15
+  max_capacity       = optional(number, 3)
+  metric             = optional(string, "RDSReaderAverageCPUUtilization")  # or RDSReaderAverageDatabaseConnections
+  target_value       = optional(number, 70)
+  scale_in_cooldown  = optional(number, 300)
+  scale_out_cooldown = optional(number, 300)
+  disable_scale_in   = optional(bool, false)
+})
+```
+
+### RDS Proxy
+
+```hcl
+proxy = object({
+  enabled                      = optional(bool, false)
+  require_tls                  = optional(bool, true)
+  iam_auth                     = optional(string, "DISABLED")  # or REQUIRED
+  client_password_auth_type    = optional(string, "")          # MYSQL_NATIVE_PASSWORD, MYSQL_CACHING_SHA2_PASSWORD,
+                                                               # POSTGRES_SCRAM_SHA_256, POSTGRES_MD5
+  idle_client_timeout          = optional(number, 1800)        # 1-28800 seconds
+  debug_logging                = optional(bool, false)
+  max_connections_percent      = optional(number, 90)
+  max_idle_connections_percent = optional(number, 50)
+  connection_borrow_timeout    = optional(number, 120)
+  session_pinning_filters      = optional(list(string), [])    # EXCLUDE_VARIABLE_SETS
+  init_query                   = optional(string, "")
+  create_reader_endpoint       = optional(bool, true)
+  create_role                  = optional(bool, true)
+  role_arn                     = optional(string, "")          # with create_role = false
+  secret_arns                  = optional(list(string), [])
+  use_master_secret            = optional(bool, false)
+  secret_kms_key_arn           = optional(string, "")
+  create_security_group        = optional(bool, true)
+  security_group_ids           = optional(list(string), [])    # with create_security_group = false
+  subnet_ids                   = optional(list(string), [])    # [] means var.subnet_ids
+  ingress_rules                = optional(map(object), {})     # same schema as ingress_rules
+  egress_rules                 = optional(map(object), {})     # same schema as egress_rules
+})
+```
+
+### Observability
+
+| Name | Type | Default | Description |
+|---|---|---|---|
+| `sns_topic_arn` | `string` | `""` | Topic for alarms and events; required while either is on |
+| `create_alarms` | `bool` | `true` | CloudWatch alarms |
+| `create_event_subscriptions` | `bool` | `true` | RDS event subscriptions |
+| `cluster_event_categories` | `list(string)` | `["failover", "failure", "maintenance", "notification", "global-failover"]` | Cluster events |
+| `instance_event_categories` | `list(string)` | `["availability", "failover", "failure", "low storage", "maintenance", "recovery"]` | Instance events |
+| `alarm_cpu_percent` | `number` | `80` | Writer CPU, or reader CPU on a secondary |
+| `alarm_freeable_memory_bytes` | `number` | `268435456` | 256 MiB |
+| `alarm_free_local_storage_bytes` | `number` | `2147483648` | 2 GiB |
+| `alarm_replica_lag_ms` | `number` | `2000` | Maximum replica lag |
+| `alarm_acu_utilization_percent` | `number` | `90` | Serverless only |
+| `alarm_connections` | `number` | `0` | `0` disables |
+| `alarm_transaction_ids` | `number` | `1000000000` | aurora-postgresql only |
+| `alarm_global_rpo_lag_ms` | `number` | `10000` | Global secondary only |
+| `alarm_volume_bytes` | `number` | `0` | `0` disables |
+| `enabled_cloudwatch_logs_exports` | `list(string)` | `[]` | PostgreSQL: `postgresql`, `iam-db-auth-error`, `instance`. MySQL: `audit`, `error`, `general`, `slowquery`, `iam-db-auth-error`, `instance` |
+| `create_log_groups` | `bool` | `true` | Create the log groups before the cluster |
+| `log_retention_days` | `number` | `30` | A CloudWatch retention value; `0` never expires |
+| `log_group_class` | `string` | `"STANDARD"` | Or `INFREQUENT_ACCESS`; changing it replaces the groups |
+| `log_group_skip_destroy` | `bool` | `false` | Keep the log groups when Terraform would delete them |
+| `cloudwatch_logs_kms_key_arn` | `string` | `""` | Key for the log groups |
+| `enhanced_monitoring_interval` | `number` | `60` | `0`, `1`, `5`, `10`, `15`, `30` or `60` seconds |
+| `create_monitoring_role` | `bool` | `true` | Create the Enhanced Monitoring role |
+| `monitoring_role_arn` | `string` | `""` | Existing role, with `create_monitoring_role = false` |
+| `performance_insights_enabled` | `bool` | `true` | On the cluster and every instance |
+| `performance_insights_retention_days` | `number` | `7` | 7, a multiple of 31 up to 713, or 731 |
+| `performance_insights_kms_key_arn` | `string` | `""` | Key for Performance Insights |
+| `database_insights_mode` | `string` | `"standard"` | `advanced` needs 465 days of retention |
+
+### IAM
+
+| Name | Type | Default | Description |
+|---|---|---|---|
+| `permissions_boundary_arn` | `string` | `""` | Permissions boundary for every created role |
+| `iam_role_path` | `string` | `"/"` | Path for every created role |
+
+---
 
 ## Outputs
 
+### Resource outputs
+
 | Name | Description |
-|------|-------------|
-| <a name="output_activity_stream_kinesis_stream_name"></a> [activity\_stream\_kinesis\_stream\_name](#output\_activity_stream_kinesis_stream_name) | Name of the Kinesis stream backing the database activity stream (null when disabled) |
-| <a name="output_alarm_high_connections"></a> [alarm\_high\_connections](#output\_alarm_high_connections) | CloudWatch alarm for high database connections |
-| <a name="output_alarm_high_cpu"></a> [alarm\_high\_cpu](#output\_alarm_high_cpu) | CloudWatch alarm for high CPU utilization |
-| <a name="output_alarm_high_replica_lag"></a> [alarm\_high\_replica\_lag](#output\_alarm_high_replica_lag) | CloudWatch alarm for high replica lag |
-| <a name="output_alarm_low_storage"></a> [alarm\_low\_storage](#output\_alarm_low_storage) | CloudWatch alarm for low free storage space |
-| <a name="output_availability_zones"></a> [availability\_zones](#output\_availability_zones) | Availability zones used by the cluster |
-| <a name="output_backup_retention_period"></a> [backup\_retention\_period](#output\_backup_retention_period) | The backup retention period in days |
-| <a name="output_cloudwatch_log_groups"></a> [cloudwatch\_log\_groups](#output\_cloudwatch_log_groups) | Map of CloudWatch log group names that are enabled |
-| <a name="output_cluster_arn"></a> [cluster\_arn](#output\_cluster_arn) | Amazon Resource Name (ARN) of cluster |
-| <a name="output_cluster_database_name"></a> [cluster\_database\_name](#output\_cluster_database_name) | The database name created when the cluster was created |
-| <a name="output_cluster_endpoint"></a> [cluster\_endpoint](#output\_cluster_endpoint) | The cluster endpoint for the primary writer instance |
-| <a name="output_cluster_engine"></a> [cluster\_engine](#output\_cluster_engine) | The database engine type |
-| <a name="output_cluster_engine_mode"></a> [cluster\_engine\_mode](#output\_cluster_engine_mode) | The database engine mode (provisioned or serverless) |
-| <a name="output_cluster_engine_version"></a> [cluster\_engine\_version](#output\_cluster_engine_version) | The database engine version |
-| <a name="output_cluster_id"></a> [cluster\_id](#output\_cluster_id) | The RDS Cluster Identifier |
-| <a name="output_cluster_instance_arns"></a> [cluster\_instance\_arns](#output\_cluster_instance_arns) | Amazon Resource Names (ARNs) of the cluster instances |
-| <a name="output_cluster_instance_endpoints"></a> [cluster\_instance\_endpoints](#output\_cluster_instance_endpoints) | Endpoints of the cluster instances |
-| <a name="output_cluster_instance_ids"></a> [cluster\_instance\_ids](#output\_cluster_instance_ids) | List of RDS Cluster Instance Identifiers |
-| <a name="output_cluster_master_username"></a> [cluster\_master\_username](#output\_cluster_master_username) | The master username for the database |
-| <a name="output_cluster_members"></a> [cluster\_members](#output\_cluster_members) | List of RDS Instances that are part of this cluster |
-| <a name="output_cluster_parameter_group_arn"></a> [cluster\_parameter\_group\_arn](#output\_cluster_parameter_group_arn) | The ARN of the cluster parameter group |
-| <a name="output_cluster_parameter_group_id"></a> [cluster\_parameter\_group\_id](#output\_cluster_parameter_group_id) | The cluster parameter group ID |
-| <a name="output_cluster_port"></a> [cluster\_port](#output\_cluster_port) | The port on which the database accepts connections |
-| <a name="output_cluster_reader_endpoint"></a> [cluster\_reader\_endpoint](#output\_cluster_reader_endpoint) | The read-only endpoint for read-only replicas |
-| <a name="output_cluster_resource_id"></a> [cluster\_resource\_id](#output\_cluster_resource_id) | The RDS Cluster Resource ID |
-| <a name="output_custom_endpoint_arns"></a> [custom\_endpoint\_arns](#output\_custom_endpoint_arns) | Map of custom cluster endpoint identifiers to their ARNs |
-| <a name="output_custom_endpoints"></a> [custom\_endpoints](#output\_custom_endpoints) | Map of custom cluster endpoint identifiers to their DNS addresses |
-| <a name="output_db_parameter_group_arn"></a> [db\_parameter\_group\_arn](#output\_db_parameter_group_arn) | The ARN of the DB parameter group |
-| <a name="output_db_parameter_group_id"></a> [db\_parameter\_group\_id](#output\_db_parameter_group_id) | The DB parameter group ID |
-| <a name="output_db_subnet_group_arn"></a> [db\_subnet\_group\_arn](#output\_db_subnet_group_arn) | ARN of the database subnet group (null when an existing subnet group is reused) |
-| <a name="output_db_subnet_group_id"></a> [db\_subnet\_group\_id](#output\_db_subnet_group_id) | The database subnet group ID (null when an existing subnet group is reused) |
-| <a name="output_db_subnet_group_name"></a> [db\_subnet\_group\_name](#output\_db_subnet_group_name) | The database subnet group name the cluster is attached to |
-| <a name="output_db_subnet_ids"></a> [db\_subnet\_ids](#output\_db_subnet_ids) | List of subnet IDs in the database subnet group (empty when an existing subnet group is reused) |
-| <a name="output_enhanced_monitoring_role_arn"></a> [enhanced\_monitoring\_role\_arn](#output\_enhanced_monitoring_role_arn) | ARN of the IAM role used for enhanced monitoring (created or provided) |
-| <a name="output_enhanced_monitoring_role_name"></a> [enhanced\_monitoring\_role\_name](#output\_enhanced_monitoring_role_name) | Name of the IAM role for enhanced monitoring (only when created by this module) |
-| <a name="output_global_cluster_arn"></a> [global\_cluster\_arn](#output\_global_cluster_arn) | The ARN of the global cluster |
-| <a name="output_global_cluster_id"></a> [global\_cluster\_id](#output\_global_cluster_id) | The global cluster identifier |
-| <a name="output_global_cluster_members"></a> [global\_cluster\_members](#output\_global_cluster_members) | List of global cluster members |
-| <a name="output_iam_database_authentication_enabled"></a> [iam\_database\_authentication\_enabled](#output\_iam_database_authentication_enabled) | Whether IAM database authentication is enabled |
-| <a name="output_iam_role_associations"></a> [iam\_role\_associations](#output\_iam_role_associations) | Map of associated IAM role labels to their role ARNs |
-| <a name="output_kms_key_id"></a> [kms\_key\_id](#output\_kms_key_id) | The ARN of the KMS encryption key used for encryption |
-| <a name="output_master_user_secret_arn"></a> [master\_user\_secret\_arn](#output\_master_user_secret_arn) | ARN of the RDS-managed master user secret in Secrets Manager (null unless manage_master_user_password is true) |
-| <a name="output_master_user_secret_kms_key_id"></a> [master\_user\_secret\_kms\_key\_id](#output\_master_user_secret_kms_key_id) | KMS key ID used to encrypt the RDS-managed master user secret |
-| <a name="output_preferred_backup_window"></a> [preferred\_backup\_window](#output\_preferred_backup_window) | The preferred backup window |
-| <a name="output_preferred_maintenance_window"></a> [preferred\_maintenance\_window](#output\_preferred_maintenance_window) | The preferred maintenance window |
-| <a name="output_reader_connection_string"></a> [reader\_connection\_string](#output\_reader_connection_string) | Connection string for the read-only endpoint |
-| <a name="output_security_group_id"></a> [security\_group\_id](#output\_security_group_id) | Security group ID created for Aurora cluster (if created) |
-| <a name="output_security_group_name"></a> [security\_group\_name](#output\_security_group_name) | Security group name created for Aurora cluster |
-| <a name="output_storage_encrypted"></a> [storage\_encrypted](#output\_storage_encrypted) | Whether the database is encrypted |
-| <a name="output_writer_connection_string"></a> [writer\_connection\_string](#output\_writer_connection_string) | Connection string for the writer endpoint |
-<!-- END_TF_DOCS -->
+|---|---|
+| `cluster_identifier` | Cluster identifier (equal to `name`) |
+| `cluster_arn` | Cluster ARN |
+| `cluster_resource_id` | `cluster-XXXX`; used in IAM database authentication policies and for a PITR of a deleted cluster |
+| `cluster_endpoint` | Writer endpoint |
+| `cluster_reader_endpoint` | Reader endpoint |
+| `cluster_port` | Database port |
+| `cluster_hosted_zone_id` | Route 53 zone of the endpoints |
+| `engine_version_actual` | Engine version running |
+| `master_user_secret_arn` | Managed master secret ARN, or null |
+| `master_user_secret_kms_key_id` | Key of the managed secret, or null |
+| `global_cluster_identifier` | Global cluster, or null; waits for the cluster and its instances |
+| `global_cluster_arn` | ARN of the module-created global cluster |
+| `instance_identifiers` | Identifier per instance key |
+| `instance_arns` | ARN per instance key |
+| `instance_endpoints` | Endpoint per instance key |
+| `writer_instance_key` | Key of the writer as of the last refresh |
+| `custom_endpoints` | Endpoint per custom endpoint key |
+| `security_group_id` | Module-created database security group, or null |
+| `security_group_ids` | Every security group on the cluster |
+| `db_subnet_group_name` | Subnet group in use |
+| `cluster_parameter_group_name` | Cluster parameter group in use |
+| `db_parameter_group_name` | Instance parameter group in use |
+| `effective_parameters` | `{ cluster, instance }` parameters the module wrote; null for brought groups |
+| `monitoring_role_arn` | Enhanced Monitoring role in use |
+| `log_group_names` | Log group per exported type |
+| `log_group_arns` | ARN per module-created log group |
+| `alarm_arns` | ARN by alarm name |
+| `activity_stream_kinesis_stream_name` | Kinesis stream of the activity stream |
+| `proxy_arn` | RDS Proxy ARN, or null |
+| `proxy_endpoint` | Read/write proxy endpoint |
+| `proxy_reader_endpoint` | Read-only proxy endpoint, or null |
+| `proxy_role_arn` | Proxy role in use |
+| `proxy_security_group_id` | Module-created proxy security group, or null |
+
+### Contract outputs
+
+Structured, non-sensitive outputs for other teams. Each is null when
+`create = false`, and each passes through `tfe_outputs.nonsensitive_values`.
+
+| Output | Shape |
+|---|---|
+| `connection` | `{ host, reader_host, proxy_host, proxy_reader_host, port, proxy_port, engine, database, username, secret_arn, secret_kms_key_arn, ca_cert_identifiers, tls_required, iam_auth, security_group_id }` |
+| `network_contract` | `{ subnet_group, subnet_ids, security_group_ids, database_port, proxy_port, rules_you_must_add[], vpc_endpoints[], notes[] }` |
+| `kms_key_policy_requirements` | `[{ key, principal, actions[], condition, why }]`, one entry per customer-managed key in use |
+| `sns_topic_policy_requirement` | `{ topic, statements[{ principal, action, condition, why }] }` for `events.rds.amazonaws.com` and `cloudwatch.amazonaws.com` |
+| `governance` | Credentials and transport, network, encryption (`keys`, `purposes_without_cmk`), resilience, versions (the actual `engine_lifecycle_support`), observability, `acknowledged_checks`, data egress paths, `cost_drivers` |
+| `verify_commands` | AWS CLI commands: `cluster_is_available`, `writer_is_where_you_expect`, `move_the_writer`, `parameters_are_applied`, `tls_is_enforced`, `plaintext_is_refused`, `master_secret`, `extended_support_is_off`, `alarms_have_a_target`, `proxy_targets_are_available` |
+
+`connection.database` and `connection.username` are read from the cluster, not
+from the inputs, so they are correct after a restore.
+`network_contract.vpc_endpoints` lists the interface and gateway endpoints an
+isolated VPC needs for the features in use: Secrets Manager, S3, Lambda,
+Bedrock, SageMaker, Comprehend and the RDS Data API.
+
+Both policy outputs can be read in the first plan, before anything is applied,
+when the key and topic ARNs are known at plan time. Send them to the key and
+topic owners then: a wrong key policy fails the apply part way, and a wrong
+topic policy loses notifications silently.
+
+---
+
+## Operations
+
+### Day-2 changes
+
+| Change | Procedure |
+|---|---|
+| Minor upgrade | Change `engine_version`; applied in the maintenance window unless `apply_immediately` |
+| Major upgrade | `engine_version`, `allow_major_version_upgrade = true` and `apply_immediately = true` in one apply; set both flags back to `false` afterwards |
+| Major upgrade of a global database | `aws rds modify-global-cluster --global-cluster-identifier <id> --engine-version <exact> --allow-major-version-upgrade`, then update `engine_version` in every region |
+| Add or remove an instance | Edit `instances`; only that instance changes |
+| Move the writer | Run `verify_commands.move_the_writer`; open connections are dropped |
+| Rotation window | `master_password_rotation.schedule_expression = "cron(0 3 ? * SUN *)"` |
+| Disable reader autoscaling | Set `min_capacity = 0` and `max_capacity = 0`, apply, wait until `writer_is_where_you_expect` lists only the `instances`, then disable |
+| Pending modifications | With `apply_immediately = false` they appear in every plan until the maintenance window; this is not drift |
+| Destroy | Set `deletion_protection = false` and apply, then destroy; the final snapshot remains, and is billed |
+
+### What replaces resources
+
+| Input change | Effect |
+|---|---|
+| `name`, `engine`, `kms_key_arn` | **Cluster replaced** (blocked by deletion protection) |
+| The subnet group name (`create_db_subnet_group`, `db_subnet_group_name`) | **Cluster and instances replaced** |
+| An `instances` key, or its `availability_zone` | That instance replaced |
+| A `custom_endpoints` key | That endpoint replaced |
+| The proxy's subnets | Proxy replaced |
+| `activity_stream.mode` | Stream restarted |
+| `log_group_class` | Log groups, and the logs in them, replaced |
+| `instance_class`, `port`, `network_type`, `storage_type`, parameters | In place |
+| `global_cluster_role` from `none` to a global role on an existing cluster | Refused by the provider. Create the global cluster with `aws rds create-global-cluster --source-db-cluster-identifier`, then use `create_global_cluster = false` |
+
+### Verification
+
+`verify_commands` holds ready-to-run AWS CLI commands for CloudShell in the
+cluster's account and region. `plaintext_is_refused` needs a host inside the
+VPC.
+
+---
+
+## Limitations
+
+- **Not yet applied against real AWS.** Verified with a mocked provider on both
+  provider majors and against the provider schema.
+- **Alarm dimensions are documented, not observed.** A metric published under
+  different dimensions leaves its alarm in `INSUFFICIENT_DATA`, or in `ALARM`
+  where missing data is breaching.
+- **Turning on Performance Insights or the managed secret on an existing
+  cluster uses the AWS-managed key**, even when a customer-managed key is
+  configured, because the key attribute is in `ignore_changes`. AWS cannot
+  change it afterwards, so set both at creation.
+- **Alarms follow `global_cluster_role`, not the cluster's current role.** After
+  a global switchover or failover, swap the roles in code.
+- **An existing regional cluster cannot join a global database** through the
+  module, and global upgrades run outside Terraform.
+- **Autoscaled readers are outside Terraform state.** They get no per-instance
+  alarms or instance events, and must be scaled to zero before autoscaling is
+  disabled or the cluster is destroyed.
+- **`activity_stream.mode = "sync"` is accepted on aurora-mysql**, which supports
+  only `async`; AWS refuses it at apply.
+- **The activity stream entry in `kms_key_policy_requirements`** puts a
+  `kms:ViaService` condition on consumer access. Consumers decrypt with KMS
+  directly, so they need a grant on the `aws:rds:dbc-id` encryption context
+  instead.
+- **The proxy port** is the engine default, **Performance Insights** has no
+  per-instance setting, and **TLS in a brought parameter group** is not visible
+  to the module.
+
+### Not in scope
+
+VPC, subnets and VPC endpoints; KMS keys, SNS topics and their policies;
+database users, schemas and grants; DNS records (RDS endpoints are not Route 53
+alias targets, so use a CNAME); AWS Backup plans (select the cluster by
+`cluster_arn`); blue/green deployments, zero-ETL, Aurora Limitless and
+Serverless v1; global failover and switchover.
+
+---
+
+## Versioning, testing and support
+
+**Versioning.** Semantic versioning, tagged `aurora-vX.Y.Z`. A major release is
+anything that changes what an unchanged configuration plans: a removed or
+renamed input or output, a new required input, a changed default, a change
+that turns an update into a replacement, an address change, or a raised
+Terraform or provider floor. Minor releases add optional inputs, outputs,
+checks, alarms or resources; patches change no plan. Deprecated inputs keep
+working until the next major release. `moved` blocks are never removed, so
+versions can be skipped.
+
+**Testing.**
+
+| Layer | Coverage |
+|---|---|
+| `tests/aurora.tftest.hcl` | 20 mocked plan runs: default resource set and posture, naming and tags, both engines, Serverless v2, autoscaling, bring-your-own, proxy, global primary and secondary, `create = false`, contract outputs, refusals and checks |
+| `tests/check_consistency.py` | Check names, the counts quoted here, variables, locals and examples agree with the code |
+| `tests/check_plan.py <plan.json>` | Gate for a real plan: no cluster or instance deleted or replaced, encryption, deletion protection, TLS, no public instance, no `/0` rule, no password in state; plus `--require-cmk` and `--required-tags` |
+| `tests/lint_validations.py` | No condition depends on short-circuit evaluation |
+| CI | Terraform 1.7.5 and the latest release; AWS provider 5.100.0 and the latest 6.x; TFLint |
+
+```sh
+cd modules/aurora
+terraform init -backend=false && terraform test
+python3 tests/check_consistency.py
+terraform show -json plan.tfplan > plan.json && python3 tests/check_plan.py plan.json --require-cmk
+```
+
+**Support.** Open an issue on
+[ivasik-k7/terraform-shared-modules](https://github.com/ivasik-k7/terraform-shared-modules/issues)
+titled `aurora: …`, with the plan output for a bug.
+
+**License.** MIT; see [LICENSE](https://github.com/ivasik-k7/terraform-shared-modules/blob/main/LICENSE).
