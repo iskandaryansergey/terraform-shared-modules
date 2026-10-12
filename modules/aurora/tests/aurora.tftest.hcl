@@ -84,14 +84,16 @@ variables {
     "deleting_the_cluster_is_protected", "deleting_the_cluster_leaves_a_snapshot", "backups_cover_a_week",
     "query_level_metrics_exist", "database_logs_leave_the_instance", "log_retention_is_bounded",
     "tls_is_enforced_where_the_module_can_see", "the_module_controls_who_connects",
-    "ingress_stays_inside_private_address_space", "something_can_connect", "credentials_are_not_in_state",
+    "ingress_stays_inside_private_address_space", "egress_stays_inside_private_address_space", "something_can_connect", "credentials_are_not_in_state",
     "engine_version_is_exact", "minor_upgrades_do_not_fight_the_pin", "extended_support_matches_the_setting",
     "extended_support_is_a_decision", "auto_pause_has_an_engine_that_supports_it", "the_proxy_has_clients",
-    "the_proxy_can_reach_secrets_manager", "the_proxy_can_decrypt_its_secrets",
+    "the_proxy_can_reach_secrets_manager", "the_proxy_can_decrypt_its_secrets", "the_proxy_requires_tls",
     "master_secret_key_is_the_one_configured", "performance_insights_key_is_the_one_configured",
     "activity_stream_key_is_the_one_configured", "database_insights_advanced_on_a_global_member",
     "major_upgrade_applies_immediately", "reader_autoscaling_has_a_reader",
     "mysql_log_exports_have_their_switches", "parameter_group_family_matches_the_engine",
+    "iam_auth_failures_are_logged", "iam_auth_has_memory_headroom", "master_user_keeps_its_password",
+    "audit_logs_are_retained",
   ]
 }
 

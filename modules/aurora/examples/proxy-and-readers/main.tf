@@ -128,6 +128,21 @@ variable "app_secret_arn" {
   }
 }
 
+variable "app_secret_kms_key_arn" {
+  description = <<-EOT
+    Customer-managed key the app secret is encrypted with. The module grants
+    the proxy role kms:Decrypt on exactly this key, through Secrets Manager.
+    Without it the proxy cannot read a secret on a customer-managed key and
+    its targets stay UNAVAILABLE.
+  EOT
+  type        = string
+
+  validation {
+    condition     = can(regex("^arn:aws[a-z-]*:kms:[a-z0-9-]+:[0-9]{12}:key/", var.app_secret_kms_key_arn))
+    error_message = "app_secret_kms_key_arn must be a KMS key ARN."
+  }
+}
+
 variable "secretsmanager_endpoint_security_group_id" {
   description = "Security group of the Secrets Manager interface VPC endpoint. The proxy is allowed to reach it on 443; the endpoint's own group must allow the proxy's group in."
   type        = string
@@ -260,6 +275,7 @@ module "aurora" {
     create_role            = true
     create_security_group  = true
     secret_arns            = [var.app_secret_arn]
+    secret_kms_key_arn     = var.app_secret_kms_key_arn
     ingress_rules = {
       app = { referenced_security_group_id = var.app_security_group_id, description = "Catalogue application tier" }
     }

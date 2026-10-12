@@ -26,7 +26,7 @@
 #     Set connect timeouts to 30 seconds or more for anything pointed at this.
 #   - An engine older than 16.3 (or the equivalent minor in 13 to 15) cannot
 #     pause. The module's auto_pause check warns; AWS refuses the scaling
-#     configuration at apply. A major-only version avoids it.
+#     configuration at apply. Pin an exact recent minor (16.3+, or any 17.x).
 #   - Everything scaled to max_capacity is billed at max_capacity. 4 ACU is the
 #     ceiling on the bill, and the alarm that would tell you about it needs a
 #     topic this example does not have.

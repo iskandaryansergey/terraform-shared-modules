@@ -237,14 +237,30 @@ output "governance" {
     master_password_rotation            = local.create_rotation_schedule ? coalesce(var.master_password_rotation.schedule_expression, "every ${var.master_password_rotation.automatically_after_days} days") : (local.manage_password ? "rds default (every 7 days)" : "n/a")
     tls_enforced                        = local.tls_enforced ? "yes" : (var.enforce_tls ? "unknown - brought parameter group" : "no")
     iam_database_authentication_enabled = var.iam_database_authentication_enabled
-    data_api_enabled                    = var.enable_data_api
-    publicly_accessible                 = var.publicly_accessible
+    iam_database_users                  = { for u, c in var.iam_database_users : u => c.connect_via }
+
+    # Audit logging
+    audit_logging = !local.audit_enabled ? null : {
+      mechanism     = local.is_postgres ? "pgaudit" : "aurora-mysql advanced auditing"
+      classes       = local.is_postgres ? var.audit_logging.pgaudit_log : join(",", var.audit_logging.mysql_events)
+      log_parameter = local.is_postgres ? var.audit_logging.pgaudit_log_parameter : null
+      log_export    = local.is_postgres ? "postgresql" : "audit"
+      engine_steps = local.is_postgres ? [
+        "Reboot the writer so shared_preload_libraries loads pgaudit (parameters_are_applied shows pending-reboot until then).",
+        "In each database to audit: CREATE EXTENSION pgaudit;",
+        ] : [
+        "None: the parameters are dynamic. Audit files appear as audit/audit.log.* on each instance.",
+      ]
+    }
+    data_api_enabled    = var.enable_data_api
+    publicly_accessible = var.publicly_accessible
 
     # Network
     security_group_managed_by_module = var.create_security_group
     ingress_rules                    = keys(var.ingress_rules)
     ingress_outside_private_ranges   = local.non_private_ingress
     egress_rules                     = keys(var.egress_rules)
+    egress_outside_private_ranges    = local.non_private_egress
     subnet_group_managed_by_module   = var.create_db_subnet_group
 
     # Encryption
@@ -393,12 +409,33 @@ output "kms_key_policy_requirements" {
       condition = { "ArnLike kms:EncryptionContext:aws:logs:arn" = "arn:${local.partition}:logs:${local.region}:${local.account_id}:log-group:/aws/rds/cluster/${var.name}/*" }
       why       = "CloudWatch Logs encrypts the exported database logs. Without this the log group create fails."
     }]),
-    !var.activity_stream.enabled ? [] : [{
-      key       = local.activity_stream_kms_key_arn
-      principal = "the principal running terraform, and the activity stream consumer"
-      actions   = ["kms:CreateGrant", "kms:DescribeKey", "kms:Decrypt", "kms:GenerateDataKey*"]
-      condition = { "kms:ViaService" = "rds.${local.region}.amazonaws.com" }
-      why       = "Activity stream records are encrypted with this key; the consumer decrypts each record."
+    # Two statements: RDS uses the key through the service, the consumer calls
+    # KMS directly with the cluster's resource ID as encryption context, so a
+    # ViaService condition would deny it.
+    !var.activity_stream.enabled ? [] : [
+      {
+        key       = local.activity_stream_kms_key_arn
+        principal = "the principal running terraform"
+        actions   = ["kms:CreateGrant", "kms:DescribeKey", "kms:Decrypt", "kms:GenerateDataKey*"]
+        condition = { "kms:ViaService" = "rds.${local.region}.amazonaws.com" }
+        why       = "RDS starts the activity stream and encrypts its records with this key."
+      },
+      {
+        key       = local.activity_stream_kms_key_arn
+        principal = "the activity stream consumer (Lambda, Firehose or application reading the Kinesis stream)"
+        actions   = ["kms:Decrypt"]
+        condition = { "kms:EncryptionContext:aws:rds:dbc-id" = coalesce(one(aws_rds_cluster.this[*].cluster_resource_id), "<cluster resource ID>") }
+        why       = "The consumer decrypts each record with KMS directly, not through RDS; the encryption context is the cluster resource ID."
+      },
+    ],
+    # The proxy role reads its secrets through Secrets Manager. The module grants
+    # it in IAM; the key policy has to allow it too unless it delegates to IAM.
+    !local.proxy_enabled || local.proxy_secret_kms_key_arn == "" ? [] : [{
+      key       = local.proxy_secret_kms_key_arn
+      principal = local.proxy_role_arn != null ? local.proxy_role_arn : "the RDS Proxy role"
+      actions   = ["kms:Decrypt"]
+      condition = { "kms:ViaService" = "secretsmanager.${local.region}.amazonaws.com" }
+      why       = "RDS Proxy decrypts the database secrets it logs in with."
     }],
   )
 }
@@ -436,6 +473,53 @@ output "verify_commands" {
     master_secret               = local.manage_password ? "aws secretsmanager describe-secret --secret-id ${coalesce(local.managed_secret_arn, "<secret>")} --query '[RotationEnabled,RotationRules,NextRotationDate]'" : "no RDS-managed secret"
     extended_support_is_off     = "aws rds describe-db-clusters --db-cluster-identifier ${var.name} --query 'DBClusters[0].EngineLifecycleSupport'"
     alarms_have_a_target        = "aws cloudwatch describe-alarms --alarm-name-prefix ${var.name}- --query 'MetricAlarms[].[AlarmName,StateValue,length(AlarmActions)]' --output table"
+    audit_is_active             = !local.audit_enabled ? "audit logging off" : (local.is_postgres ? "psql \"host=${coalesce(one(aws_rds_cluster.this[*].endpoint), "<endpoint>")} port=${local.port} sslmode=require user=<user>\" -c 'SHOW shared_preload_libraries;' -c 'SHOW pgaudit.log;'    # pgaudit must be listed" : "aws rds describe-db-log-files --db-instance-identifier ${var.name}-${try(keys(local.instances)[0], "<key>")} --filename-contains audit    # audit/audit.log.* files must exist")
+    iam_token_connects          = length(local.iam_cluster_users) > 0 ? "TOKEN=$(aws rds generate-db-auth-token --hostname ${coalesce(one(aws_rds_cluster.this[*].endpoint), "<endpoint>")} --port ${local.port} --region ${local.region} --username ${local.iam_cluster_users[0]})    # then connect with sslmode=verify-full and the token as the password" : "no IAM database users"
     proxy_targets_are_available = local.proxy_enabled ? "aws rds describe-db-proxy-targets --db-proxy-name ${var.name}-proxy --query 'Targets[].[Endpoint,Role,TargetHealth.State,TargetHealth.Reason]' --output table" : "no proxy"
+  }
+}
+
+output "iam_database_auth" {
+  description = "IAM database authentication, per user in iam_database_users: the rds-db:connect resource ARN, a policy document to attach to the application's role, the module-created policy ARN, host, port, the token command and the SQL that creates the user in the engine. Plus a Data API policy when enable_data_api. Nothing here is secret."
+  value = !local.create ? null : {
+    cluster_iam_auth_enabled = var.iam_database_authentication_enabled
+    proxy_iam_auth           = local.proxy_enabled ? var.proxy.iam_auth : null
+    users = {
+      for u, x in local.iam_db_users : u => {
+        connect_via   = x.connect_via
+        resource_arn  = x.resource_arn
+        policy_json   = local.iam_db_policy_json[u]
+        policy_arn    = try(aws_iam_policy.iam_database_auth[u].arn, null)
+        host          = x.host
+        port          = x.port
+        token_command = "aws rds generate-db-auth-token --hostname ${coalesce(x.host, "<host>")} --port ${x.port} --region ${local.region} --username ${u}"
+        engine_sql    = x.engine_sql
+      }
+    }
+    # The five Data API actions on this cluster, and the master secret it reads.
+    data_api_policy_json = !var.enable_data_api ? null : jsonencode({
+      Version = "2012-10-17"
+      Statement = concat(
+        [{
+          Sid      = "RdsDataApi"
+          Effect   = "Allow"
+          Action   = ["rds-data:BatchExecuteStatement", "rds-data:BeginTransaction", "rds-data:CommitTransaction", "rds-data:ExecuteStatement", "rds-data:RollbackTransaction"]
+          Resource = local.cluster_arn
+        }],
+        local.manage_password ? [{
+          Sid      = "ReadDatabaseSecret"
+          Effect   = "Allow"
+          Action   = "secretsmanager:GetSecretValue"
+          Resource = local.managed_secret_arn
+        }] : [],
+      )
+    })
+    notes = [
+      "The IAM principal must be in this account; from another account, assume a role here.",
+      "Tokens are valid for 15 minutes and must be generated for the endpoint itself: a Route 53 alias or CNAME cannot be used.",
+      "aws:SourceIp, aws:SourceVpc, aws:SourceVpce and aws:VpcSourceIp are not supported in rds-db:connect policies.",
+      "The ARN contains the resource ID: a replaced or restored cluster, or a global secondary, needs new policies.",
+      "Connect with TLS. Failed token logins are logged only in the iam-db-auth-error export.",
+    ]
   }
 }

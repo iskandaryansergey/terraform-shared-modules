@@ -1,6 +1,6 @@
 # Serverless v2 for dev
 
-A disposable Aurora PostgreSQL 16 cluster on Serverless v2 that costs no compute while idle: one `db.serverless` instance scaling 0 to 4 ACU, pausing after 1800 s without connections. Deletion protection and the final snapshot are off, there is no SNS topic, and the advisory checks those corners would trip are listed in `acknowledged_checks` so each stays a recorded decision.
+A disposable Aurora PostgreSQL 17 cluster on Serverless v2 that costs no compute while idle: one `db.serverless` instance scaling 0 to 4 ACU, pausing after 1800 s without connections. Deletion protection and the final snapshot are off, there is no SNS topic, and the advisory checks those corners would trip are listed in `acknowledged_checks` so each stays a recorded decision.
 
 ## Topology
 
@@ -12,7 +12,7 @@ developers / CI (SG) --- :5432 ---> 1 x db.serverless (0-4 ACU, auto-pause 1800 
 ## Failure modes
 
 - **A paused cluster looks down.** The first connection waits about 15 seconds; set client connect timeouts to 30 s or more.
-- **Engines older than 16.3** (or the equivalent minor of 13-15) cannot pause; a major-only version avoids it.
+- **Engines older than 16.3** (or the equivalent minor of 13-15) cannot pause; pin an exact recent minor (16.3 or later, or any 17.x).
 - **Max capacity is the bill ceiling**: 4 ACU billed at full tilt, with no alarm to say so.
 - **Not a production starting point.** The AWS-managed key cannot be changed later without replacing the cluster; start from `isolated-vpc-postgresql`.
 
@@ -29,7 +29,7 @@ module "aurora" {
 
   name           = "orders-dev"
   engine         = "aurora-postgresql"
-  engine_version = "16"
+  engine_version = "17.9"
   instance_class = "db.serverless"
   instances      = { "1" = {} }
   serverlessv2_scaling_configuration = {

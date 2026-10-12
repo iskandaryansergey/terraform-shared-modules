@@ -1,6 +1,6 @@
 # Global database across two regions
 
-An Aurora PostgreSQL 16 global database: a writable primary in eu-west-2 (two `db.r7g.large`, creates the global cluster) and a read-only secondary in eu-west-1 (one instance, own CMK and network, write forwarding on). Two module calls with provider aliases; the secondary reads `module.primary.global_cluster_identifier`, which orders it after the primary cluster and its instances.
+An Aurora PostgreSQL 17 global database: a writable primary in eu-west-2 (two `db.r7g.large`, creates the global cluster) and a read-only secondary in eu-west-1 (one instance, own CMK and network, write forwarding on). Two module calls with provider aliases; the secondary reads `module.primary.global_cluster_identifier`, which orders it after the primary cluster and its instances.
 
 ## Topology
 
@@ -32,7 +32,7 @@ module "aurora" {
   providers = { aws = aws.secondary }
   name                           = "ledger"
   engine                         = "aurora-postgresql"
-  engine_version                 = "16"
+  engine_version                 = "17.9"
   instance_class                 = "db.r7g.large"
   instances                      = { a = {} }
   global_cluster_role            = "secondary"

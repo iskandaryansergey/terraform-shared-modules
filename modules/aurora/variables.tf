@@ -98,13 +98,14 @@ variable "acknowledged_checks" {
         "deleting_the_cluster_is_protected", "deleting_the_cluster_leaves_a_snapshot", "backups_cover_a_week",
         "query_level_metrics_exist", "database_logs_leave_the_instance", "log_retention_is_bounded",
         "tls_is_enforced_where_the_module_can_see", "the_module_controls_who_connects",
-        "ingress_stays_inside_private_address_space", "something_can_connect", "engine_version_is_exact",
+        "ingress_stays_inside_private_address_space", "egress_stays_inside_private_address_space", "something_can_connect", "engine_version_is_exact",
         "minor_upgrades_do_not_fight_the_pin", "extended_support_matches_the_setting",
         "extended_support_is_a_decision", "auto_pause_has_an_engine_that_supports_it", "the_proxy_has_clients", "credentials_are_not_in_state",
-        "the_proxy_can_reach_secrets_manager", "the_proxy_can_decrypt_its_secrets", "master_secret_key_is_the_one_configured",
+        "the_proxy_can_reach_secrets_manager", "the_proxy_can_decrypt_its_secrets", "the_proxy_requires_tls", "master_secret_key_is_the_one_configured",
         "performance_insights_key_is_the_one_configured", "activity_stream_key_is_the_one_configured", "database_insights_advanced_on_a_global_member",
         "major_upgrade_applies_immediately", "reader_autoscaling_has_a_reader", "mysql_log_exports_have_their_switches",
-        "parameter_group_family_matches_the_engine",
+        "parameter_group_family_matches_the_engine", "iam_auth_failures_are_logged", "iam_auth_has_memory_headroom",
+        "master_user_keeps_its_password", "audit_logs_are_retained",
       ], c)
     ])
     error_message = "acknowledged_checks names a check that does not exist. README \"Advisory checks\" lists them."
@@ -585,6 +586,51 @@ variable "allow_plaintext_credentials" {
 
 variable "iam_database_authentication_enabled" {
   description = "Allow database users to authenticate with short-lived IAM tokens instead of passwords. The database user still has to be granted rds_iam (PostgreSQL) or created with AWSAuthenticationPlugin (MySQL)."
+  type        = bool
+  default     = false
+  nullable    = false
+}
+
+variable "iam_database_users" {
+  description = <<-EOT
+    Database users that log in with IAM tokens, keyed by the user name exactly
+    as it exists in the engine (case-sensitive). For each, output
+    iam_database_auth gives the rds-db:connect resource ARN, a ready-to-attach
+    policy document, the token command and the SQL that creates the user.
+    The module does not create the database user.
+
+    connect_via:
+      cluster  the client connects to the cluster endpoints with a token. Needs
+               iam_database_authentication_enabled; the user is granted rds_iam
+               (PostgreSQL) or created WITH AWSAuthenticationPlugin (MySQL).
+      proxy    the client connects to the RDS Proxy with a token. Needs the
+               proxy with iam_auth = "REQUIRED". The proxy logs in to the
+               database with a password from proxy.secret_arns, so the user
+               must NOT be an IAM user in the engine.
+
+    The ARN contains the cluster's (or the proxy's) resource ID: a replaced
+    or restored cluster, or a global secondary, needs its own policies.
+  EOT
+  type = map(object({
+    connect_via = optional(string, "cluster")
+  }))
+  default  = {}
+  nullable = false
+
+  validation {
+    # No "*" or "/": either would widen the dbuser ARN beyond one user.
+    condition     = alltrue([for u in keys(var.iam_database_users) : can(regex("^[A-Za-z_][A-Za-z0-9_-]{0,62}$", u))])
+    error_message = "iam_database_users keys must be database user names: a letter or underscore, then up to 62 letters, digits, underscores or hyphens."
+  }
+
+  validation {
+    condition     = alltrue([for c in values(var.iam_database_users) : contains(["cluster", "proxy"], c.connect_via)])
+    error_message = "iam_database_users[*].connect_via must be cluster or proxy."
+  }
+}
+
+variable "create_iam_database_auth_policies" {
+  description = "Create one customer-managed IAM policy per iam_database_users entry (\"<name>-<region>-dbuser-<user>\"), allowing rds-db:connect as that user only. false leaves the policy documents in output.iam_database_auth for an IAM team to create."
   type        = bool
   default     = false
   nullable    = false
@@ -1080,6 +1126,64 @@ variable "recommended_parameters" {
   type        = bool
   default     = true
   nullable    = false
+}
+
+variable "audit_logging" {
+  description = <<-EOT
+    Database audit logging, written into the module-created cluster parameter
+    group. Needs the engine's log export ("postgresql" or "audit") in
+    enabled_cloudwatch_logs_exports, or the records rotate away on the
+    instance.
+
+    aurora-postgresql - pgAudit:
+      pgaudit is appended to shared_preload_libraries (your own value in
+      cluster_parameters is kept) and pgaudit.log set to pgaudit_log, all
+      pending-reboot. After the writer reboots, run CREATE EXTENSION pgaudit;
+      in each database - output.governance.audit_logging.engine_steps.
+      pgaudit_log: comma-separated classes from none, all, ddl, function,
+      misc, read, role, write; prefix with "-" to subtract (all,-misc).
+      pgaudit_log_parameter = true also logs bind values - which may hold
+      personal or card data.
+      pgaudit_role: role for object-level auditing (rds_pgaudit), or "".
+
+    aurora-mysql - Advanced Auditing:
+      server_audit_logging = 1, server_audit_events = mysql_events, and
+      server_audit_excl_users = mysql_excluded_users. Dynamic: applied
+      without a restart. mysql_events from CONNECT, QUERY, QUERY_DCL,
+      QUERY_DDL, QUERY_DML, TABLE.
+
+    Values in cluster_parameters override the ones written here.
+  EOT
+  type = object({
+    enabled               = optional(bool, false)
+    pgaudit_log           = optional(string, "ddl,role")
+    pgaudit_log_parameter = optional(bool, false)
+    pgaudit_role          = optional(string, "")
+    mysql_events          = optional(list(string), ["CONNECT", "QUERY_DCL", "QUERY_DDL"])
+    mysql_excluded_users  = optional(list(string), [])
+  })
+  default  = {}
+  nullable = false
+
+  validation {
+    condition     = alltrue([for c in split(",", var.audit_logging.pgaudit_log) : can(regex("^-?(none|all|ddl|function|misc|read|role|write)$", trimspace(c)))])
+    error_message = "audit_logging.pgaudit_log must be a comma-separated list of none, all, ddl, function, misc, read, role, write, each optionally prefixed with \"-\"."
+  }
+
+  validation {
+    condition     = length(var.audit_logging.mysql_events) > 0 && alltrue([for e in var.audit_logging.mysql_events : contains(["CONNECT", "QUERY", "QUERY_DCL", "QUERY_DDL", "QUERY_DML", "TABLE"], e)])
+    error_message = "audit_logging.mysql_events must be a non-empty list of CONNECT, QUERY, QUERY_DCL, QUERY_DDL, QUERY_DML, TABLE (upper case)."
+  }
+
+  validation {
+    condition     = alltrue([for u in var.audit_logging.mysql_excluded_users : can(regex("^[A-Za-z0-9_.@-]{1,32}$", u))]) && length(join(",", var.audit_logging.mysql_excluded_users)) <= 1024
+    error_message = "audit_logging.mysql_excluded_users must be MySQL user names (up to 32 characters, no spaces or commas), 1024 characters in total."
+  }
+
+  validation {
+    condition     = var.audit_logging.pgaudit_role == "" ? true : can(regex("^[A-Za-z_][A-Za-z0-9_]{0,62}$", var.audit_logging.pgaudit_role))
+    error_message = "audit_logging.pgaudit_role must be empty or a role name."
+  }
 }
 
 # ---------------------------------------------------------------------------

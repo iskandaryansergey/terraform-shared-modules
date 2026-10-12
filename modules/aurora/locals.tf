@@ -191,6 +191,15 @@ locals {
     [for k, r in var.proxy.ingress_rules : "proxy:${k}" if(r.cidr_ipv6 == "" ? false : !can(regex(local.unique_local_v6_pattern, lower(r.cidr_ipv6))))],
   )
 
+  # The same test for egress. A database that can reach the internet is a
+  # path for data to leave by, through postgres_fdw, dblink or an extension.
+  non_private_egress = concat(
+    [for k, r in var.egress_rules : k if(r.cidr_ipv4 == "" ? false : !can(regex(local.private_ipv4_pattern, r.cidr_ipv4)))],
+    [for k, r in var.egress_rules : k if(r.cidr_ipv6 == "" ? false : !can(regex(local.unique_local_v6_pattern, lower(r.cidr_ipv6))))],
+    [for k, r in var.proxy.egress_rules : "proxy:${k}" if(r.cidr_ipv4 == "" ? false : !can(regex(local.private_ipv4_pattern, r.cidr_ipv4)))],
+    [for k, r in var.proxy.egress_rules : "proxy:${k}" if(r.cidr_ipv6 == "" ? false : !can(regex(local.unique_local_v6_pattern, lower(r.cidr_ipv6))))],
+  )
+
   # -------------------------------------------------------------------------
   # Parameters. Lowest precedence first: recommended, caller, TLS.
   # -------------------------------------------------------------------------
@@ -226,7 +235,36 @@ locals {
   # "true" all mean on to the engine.
   tls_parameter_conflict = var.enforce_tls ? !contains(["1", "on", "true"], lower(try(var.cluster_parameters[local.tls_parameter_name].value, local.tls_parameter_value))) : false
 
-  effective_cluster_parameters = merge(local.recommended_cluster_parameters, var.cluster_parameters, local.tls_parameter)
+  # Audit logging. Lowest precedence after the recommended set: a caller's
+  # cluster_parameters still win - except shared_preload_libraries, which is
+  # composed so that the caller's libraries and pgaudit are both kept. RDS
+  # adds its own libraries (rdsutils) whatever the parameter says.
+  audit_enabled = var.audit_logging.enabled
+
+  audit_parameters = !local.audit_enabled ? tomap({}) : (
+    local.is_postgres
+    ? tomap(merge(
+      {
+        "pgaudit.log"           = { value = var.audit_logging.pgaudit_log, apply_method = "pending-reboot" }
+        "pgaudit.log_parameter" = { value = var.audit_logging.pgaudit_log_parameter ? "1" : "0", apply_method = "pending-reboot" }
+      },
+      var.audit_logging.pgaudit_role == "" ? {} : { "pgaudit.role" = { value = var.audit_logging.pgaudit_role, apply_method = "pending-reboot" } },
+    ))
+    : tomap(merge(
+      {
+        server_audit_logging = { value = "1", apply_method = "immediate" }
+        server_audit_events  = { value = join(",", var.audit_logging.mysql_events), apply_method = "immediate" }
+      },
+      length(var.audit_logging.mysql_excluded_users) == 0 ? {} : { server_audit_excl_users = { value = join(",", var.audit_logging.mysql_excluded_users), apply_method = "immediate" } },
+    ))
+  )
+
+  caller_preload_libraries = compact([for l in split(",", try(var.cluster_parameters["shared_preload_libraries"].value, "")) : trimspace(l)])
+  audit_preload_libraries = local.audit_enabled && local.is_postgres ? tomap({
+    shared_preload_libraries = { value = join(",", distinct(concat(local.caller_preload_libraries, ["pgaudit"]))), apply_method = "pending-reboot" }
+  }) : tomap({})
+
+  effective_cluster_parameters = merge(local.recommended_cluster_parameters, local.audit_parameters, var.cluster_parameters, local.audit_preload_libraries, local.tls_parameter)
 
   # TLS is enforced only when the module writes the parameter group. A brought
   # group might enforce it; the module cannot tell.
@@ -235,8 +273,8 @@ locals {
   # Aurora MySQL exports a log type whether or not the engine writes it: audit
   # and general need their switches, or the log group stays empty.
   mysql_exports_without_switch = local.is_postgres ? [] : compact([
-    contains(var.enabled_cloudwatch_logs_exports, "audit") ? (try(local.effective_cluster_parameters["server_audit_logging"].value, "0") == "1" ? "" : "audit (server_audit_logging)") : "",
-    contains(var.enabled_cloudwatch_logs_exports, "general") ? (try(local.effective_cluster_parameters["general_log"].value, "0") == "1" ? "" : "general (general_log)") : "",
+    contains(var.enabled_cloudwatch_logs_exports, "audit") ? (contains(["1", "on"], lower(try(local.effective_cluster_parameters["server_audit_logging"].value, "0"))) ? "" : "audit (server_audit_logging)") : "",
+    contains(var.enabled_cloudwatch_logs_exports, "general") ? (contains(["1", "on"], lower(try(local.effective_cluster_parameters["general_log"].value, "0"))) ? "" : "general (general_log)") : "",
   ])
 
   # -------------------------------------------------------------------------
@@ -257,6 +295,52 @@ locals {
   )
   proxy_role_arn           = var.proxy.create_role ? one(aws_iam_role.proxy[*].arn) : var.proxy.role_arn
   proxy_security_group_ids = var.proxy.create_security_group ? [for sg in aws_security_group.proxy : sg.id] : var.proxy.security_group_ids
+
+  # -------------------------------------------------------------------------
+  # IAM database authentication
+  #
+  # rds-db:connect is granted on arn:...:dbuser:<resource id>/<user>: the
+  # cluster's resource ID for a direct connection, the proxy's (prx-...) for
+  # one through RDS Proxy. aws_db_proxy exposes no resource ID attribute; it is
+  # the last segment of the proxy ARN.
+  # -------------------------------------------------------------------------
+
+  cluster_resource_id = try(coalesce(one(aws_rds_cluster.this[*].cluster_resource_id), "<cluster resource ID>"), "<cluster resource ID>")
+  proxy_resource_id   = try(element(split(":", one(aws_db_proxy.this[*].arn)), 6), "<proxy resource ID>")
+  dbuser_arn_prefix   = "arn:${local.partition}:rds-db:${local.region}:${local.account_id}:dbuser"
+
+  iam_cluster_users = [for u, c in var.iam_database_users : u if c.connect_via == "cluster"]
+  iam_proxy_users   = [for u, c in var.iam_database_users : u if c.connect_via == "proxy"]
+
+  iam_db_users = {
+    for u, c in var.iam_database_users : u => {
+      connect_via  = c.connect_via
+      resource_arn = "${local.dbuser_arn_prefix}:${c.connect_via == "proxy" ? local.proxy_resource_id : local.cluster_resource_id}/${u}"
+      host         = c.connect_via == "proxy" ? one(aws_db_proxy.this[*].endpoint) : one(aws_rds_cluster.this[*].endpoint)
+      port         = c.connect_via == "proxy" ? local.default_port : local.port
+      engine_sql = (
+        c.connect_via == "proxy"
+        ? "-- A password user: store its credentials in a secret listed in proxy.secret_arns. Do not grant rds_iam or use AWSAuthenticationPlugin - the proxy logs in with the password."
+        : local.is_postgres
+        ? "CREATE USER \"${u}\"; GRANT rds_iam TO \"${u}\";"
+        : "CREATE USER '${u}'@'%' IDENTIFIED WITH AWSAuthenticationPlugin AS 'RDS'; ALTER USER '${u}'@'%' REQUIRE SSL;"
+      )
+    }
+  }
+
+  iam_db_policy_json = {
+    for u, x in local.iam_db_users : u => jsonencode({
+      Version = "2012-10-17"
+      Statement = [{
+        Sid      = "RdsDbConnect"
+        Effect   = "Allow"
+        Action   = "rds-db:connect"
+        Resource = x.resource_arn
+      }]
+    })
+  }
+
+  create_iam_db_policies = local.create && var.create_iam_database_auth_policies
 
   # -------------------------------------------------------------------------
   # Observability

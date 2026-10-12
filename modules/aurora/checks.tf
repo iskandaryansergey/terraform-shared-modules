@@ -101,6 +101,13 @@ check "ingress_stays_inside_private_address_space" {
   }
 }
 
+check "egress_stays_inside_private_address_space" {
+  assert {
+    condition     = !local.create ? true : (contains(local.acknowledged, "egress_stays_inside_private_address_space") ? true : length(local.non_private_egress) == 0)
+    error_message = "these egress rules allow addresses outside RFC 1918, 100.64.0.0/10 and IPv6 unique-local space: ${join(", ", local.non_private_egress)}. From the database that is a path for data to leave by (postgres_fdw, dblink, extensions). Prefer a prefix list or a VPC endpoint's security group. ${local.ack_hint}"
+  }
+}
+
 # A module-created group with no ingress is a database nothing can reach.
 check "something_can_connect" {
   assert {
@@ -165,6 +172,16 @@ check "the_proxy_has_clients" {
   assert {
     condition     = !local.create_proxy_security_group ? true : (contains(local.acknowledged, "the_proxy_has_clients") ? true : length(var.proxy.ingress_rules) > 0)
     error_message = "the proxy's security group is module-created with no proxy.ingress_rules, so nothing can connect to it. ${local.ack_hint}"
+  }
+}
+
+# The proxy terminates client connections. Without require_tls, passwords -
+# and with iam_auth = REQUIRED, IAM tokens - can cross the network in clear,
+# while connection.tls_required still reports the cluster as TLS-only.
+check "the_proxy_requires_tls" {
+  assert {
+    condition     = !local.proxy_enabled ? true : (contains(local.acknowledged, "the_proxy_requires_tls") ? true : var.proxy.require_tls)
+    error_message = "proxy.require_tls is false, so clients may connect to the proxy without TLS and send passwords or IAM tokens in clear. AWS requires TLS with IAM authentication. ${local.ack_hint}"
   }
 }
 
@@ -265,5 +282,42 @@ check "parameter_group_family_matches_the_engine" {
   assert {
     condition     = !local.create ? true : (contains(local.acknowledged, "parameter_group_family_matches_the_engine") ? true : !local.family_mismatch)
     error_message = "parameter_group_family ${var.parameter_group_family} does not match engine ${var.engine} ${var.engine_version} (expected ${local.derived_family}). The module's parameter groups would be on another family than the cluster. ${local.ack_hint}"
+  }
+}
+
+# A failed token login is logged only in the iam-db-auth-error export, so
+# without it an expired token and a missing grant look the same: "access
+# denied", with nothing to read.
+check "iam_auth_failures_are_logged" {
+  assert {
+    condition     = !local.create ? true : (contains(local.acknowledged, "iam_auth_failures_are_logged") ? true : (!var.iam_database_authentication_enabled ? true : contains(var.enabled_cloudwatch_logs_exports, "iam-db-auth-error")))
+    error_message = "IAM database authentication is on and iam-db-auth-error is not in enabled_cloudwatch_logs_exports, so failed token logins leave no trace. Add it. ${local.ack_hint}"
+  }
+}
+
+# AWS documents 300-1000 MiB of extra memory per instance for IAM
+# authentication: on a burstable class that is a large share of the instance.
+check "iam_auth_has_memory_headroom" {
+  assert {
+    condition     = !local.create ? true : (contains(local.acknowledged, "iam_auth_has_memory_headroom") ? true : (!var.iam_database_authentication_enabled ? true : length(local.burstable_instances) == 0))
+    error_message = "IAM database authentication on burstable instances (${join(", ", local.burstable_instances)}): AWS documents 300-1000 MiB of extra memory for it. Use a larger class, or acknowledge. ${local.ack_hint}"
+  }
+}
+
+# On PostgreSQL, rds_iam takes precedence over the password: granting it to
+# the master user removes password login for the one account that must keep it.
+check "master_user_keeps_its_password" {
+  assert {
+    condition     = !local.create ? true : (contains(local.acknowledged, "master_user_keeps_its_password") ? true : !contains(local.iam_cluster_users, var.master_username))
+    error_message = "iam_database_users makes the master user ${var.master_username} an IAM user. Once it is granted rds_iam it can no longer log in with its password - nor can anything that uses the master secret. Use a separate user. ${local.ack_hint}"
+  }
+}
+
+# Audit records usually have to be kept for a year or more. A shorter
+# retention on the module's log groups deletes them on schedule.
+check "audit_logs_are_retained" {
+  assert {
+    condition     = !local.create_log_groups ? true : (contains(local.acknowledged, "audit_logs_are_retained") ? true : (!local.audit_enabled ? true : (var.log_retention_days == 0 ? true : var.log_retention_days >= 365)))
+    error_message = "audit_logging is on and log_retention_days is ${var.log_retention_days}: audit records are deleted after that. Most audit regimes need a year or more - set log_retention_days to 365 or longer, or ship the logs elsewhere and acknowledge. ${local.ack_hint}"
   }
 }

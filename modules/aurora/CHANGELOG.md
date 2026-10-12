@@ -35,7 +35,19 @@ blocks carry existing deployments across.
   replica lag, ACU utilisation, connections, PostgreSQL transaction ID age,
   volume size and global RPO lag; RDS event subscriptions for the cluster and
   its instances.
-- 30 advisory checks, and `acknowledged_checks` to accept one in code.
+- 36 advisory checks, and `acknowledged_checks` to accept one in code.
+- IAM database authentication contract (`iam_database_users`,
+  `create_iam_database_auth_policies`, output `iam_database_auth`): exact
+  `rds-db:connect` ARNs for cluster and proxy users, policy documents or
+  managed policies, token commands, engine SQL and a Data API policy.
+- Audit logging preset (`audit_logging`): pgAudit on aurora-postgresql,
+  Advanced Auditing on aurora-mysql, with the log export required.
+- Plan-time refusal when Performance Insights or the managed master secret is
+  turned on for an existing cluster with a customer key, which AWS would
+  otherwise encrypt with the AWS-managed key permanently.
+- Refusal of activity stream `sync` mode on aurora-mysql; checks for proxy
+  TLS and egress outside private ranges; key policy requirements for activity
+  stream consumers (encryption context) and the proxy's secret key.
 - Contract outputs: `connection`, `governance`, `network_contract`,
   `kms_key_policy_requirements`, `sns_topic_policy_requirement`,
   `verify_commands`, `effective_parameters`.

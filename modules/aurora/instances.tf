@@ -52,6 +52,26 @@ resource "aws_rds_cluster_instance" "this" {
     # AWS fixes the Performance Insights key once it is set - see the
     # performance_insights_key_is_the_one_configured check.
     ignore_changes = [performance_insights_kms_key_id]
+
+    # The cluster ignores both key arguments after creation, so its planned
+    # value is the configured key on a create and the prior state on an
+    # update. Empty on an update means the feature is being turned on for an
+    # existing cluster: the provider would send no key, and AWS would fix the
+    # AWS-managed one for good. Here, rather than on the cluster, because a
+    # precondition cannot read its own resource.
+    precondition {
+      condition = !var.performance_insights_enabled ? true : (
+        local.performance_insights_kms_key == "" ? true : try(aws_rds_cluster.this[0].performance_insights_kms_key_id, "") != ""
+      )
+      error_message = "Performance Insights is being turned on for an existing cluster, and the provider would not send performance_insights_kms_key_arn: AWS would encrypt it with aws/rds, permanently. Turn it on once with the key, then plan again: aws rds modify-db-cluster --db-cluster-identifier ${var.name} --enable-performance-insights --performance-insights-kms-key-id ${local.performance_insights_kms_key} --apply-immediately"
+    }
+
+    precondition {
+      condition = !local.manage_password ? true : (
+        local.master_secret_kms_key_arn == "" ? true : try(aws_rds_cluster.this[0].master_user_secret_kms_key_id, "") != ""
+      )
+      error_message = "The RDS-managed master secret is being turned on for an existing cluster, and the provider would not send master_user_secret_kms_key_arn: AWS would encrypt it with aws/secretsmanager, permanently. Turn it on once with the key, then plan again: aws rds modify-db-cluster --db-cluster-identifier ${var.name} --manage-master-user-password --master-user-secret-kms-key-id ${local.master_secret_kms_key_arn} --apply-immediately"
+    }
   }
 }
 

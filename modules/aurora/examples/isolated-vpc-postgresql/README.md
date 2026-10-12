@@ -1,6 +1,6 @@
 # Isolated VPC, regulated PostgreSQL
 
-A regulated Aurora PostgreSQL 16 cluster in an isolated VPC (no internet gateway, no NAT): two `db.r7g.large` instances pinned to two AZs, a customer-managed key enforced by `require_cmk`, an RDS-managed master secret rotated in a Sunday window, TLS enforced, ingress from an application security group and an on-prem CIDR, alarms and events to SNS, 90-day log exports, Performance Insights, Enhanced Monitoring, deletion protection and a final snapshot.
+A regulated Aurora PostgreSQL 17 cluster in an isolated VPC (no internet gateway, no NAT): two `db.r7g.large` instances pinned to two AZs, a customer-managed key enforced by `require_cmk`, an RDS-managed master secret rotated in a Sunday window, TLS enforced, ingress from an application security group and an on-prem CIDR, alarms and events to SNS, 90-day log exports, Performance Insights, Enhanced Monitoring, deletion protection and a final snapshot.
 
 ## Topology
 
@@ -31,7 +31,7 @@ module "aurora" {
 
   name           = "ledger"
   engine         = "aurora-postgresql"
-  engine_version = "16"
+  engine_version = "17.9"
   instance_class = "db.r7g.large"
   instances = {
     a = { availability_zone = "eu-west-2a", promotion_tier = 0 }

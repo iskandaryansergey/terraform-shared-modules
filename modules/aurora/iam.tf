@@ -118,3 +118,17 @@ resource "aws_iam_role_policy" "proxy" {
     )
   })
 }
+
+# One policy per IAM database user, scoped to that user's dbuser ARN. Keyed by
+# the caller's user names, so the set is known at plan; the documents
+# themselves are known after apply, when the resource IDs exist.
+resource "aws_iam_policy" "iam_database_auth" {
+  for_each = local.create_iam_db_policies ? var.iam_database_users : {}
+
+  name        = "${var.name}-${local.region}-dbuser-${each.key}"
+  path        = var.iam_role_path
+  description = "rds-db:connect to Aurora cluster ${var.name} as ${each.key} (${each.value.connect_via})"
+  policy      = local.iam_db_policy_json[each.key]
+
+  tags = local.common_tags
+}

@@ -313,6 +313,33 @@ resource "aws_rds_cluster" "this" {
       error_message = "cluster_parameters sets ${local.tls_parameter_name} to a value that turns TLS enforcement off, and enforce_tls owns that parameter. Remove it, or set enforce_tls = false (with allow_insecure_transport)."
     }
 
+    precondition {
+      # Without the cluster flag every token login fails, at runtime.
+      condition     = length(local.iam_cluster_users) == 0 ? true : var.iam_database_authentication_enabled
+      error_message = "iam_database_users connect to the cluster with IAM tokens (${join(", ", local.iam_cluster_users)}), but iam_database_authentication_enabled is false. Set it to true."
+    }
+
+    precondition {
+      condition     = length(local.iam_proxy_users) == 0 ? true : (var.proxy.enabled ? var.proxy.iam_auth == "REQUIRED" : false)
+      error_message = "iam_database_users connect through RDS Proxy (${join(", ", local.iam_proxy_users)}), which needs proxy.enabled = true and proxy.iam_auth = \"REQUIRED\"."
+    }
+
+    precondition {
+      condition     = local.is_postgres ? true : length([for u in keys(var.iam_database_users) : u if length(u) > 32]) == 0
+      error_message = "aurora-mysql user names are at most 32 characters: ${join(", ", [for u in keys(var.iam_database_users) : u if length(u) > 32])}."
+    }
+
+    precondition {
+      condition     = local.audit_enabled ? var.create_cluster_parameter_group : true
+      error_message = "audit_logging writes into the module-created cluster parameter group, and create_cluster_parameter_group is false. Set the audit parameters in ${var.cluster_parameter_group_name} yourself, or let the module create the group."
+    }
+
+    precondition {
+      # Audit records otherwise stay on the instance and rotate away.
+      condition     = local.audit_enabled ? contains(var.enabled_cloudwatch_logs_exports, local.is_postgres ? "postgresql" : "audit") : true
+      error_message = "audit_logging needs \"${local.is_postgres ? "postgresql" : "audit"}\" in enabled_cloudwatch_logs_exports, or the audit records stay on the instance and rotate away."
+    }
+
     # -- Encryption -------------------------------------------------------
 
     precondition {
@@ -376,6 +403,11 @@ resource "aws_rds_cluster" "this" {
     precondition {
       condition     = var.activity_stream.enabled ? length(local.serverless_instances) == 0 && length(local.burstable_instances) == 0 : true
       error_message = "activity streams are not available on db.serverless or burstable (db.t*) instances: ${join(", ", concat(local.serverless_instances, local.burstable_instances))}."
+    }
+
+    precondition {
+      condition     = var.activity_stream.enabled && !local.is_postgres ? var.activity_stream.mode == "async" : true
+      error_message = "aurora-mysql supports activity streams in async mode only; AWS refuses sync at apply. Set activity_stream.mode = \"async\"."
     }
 
     # -- Observability ----------------------------------------------------

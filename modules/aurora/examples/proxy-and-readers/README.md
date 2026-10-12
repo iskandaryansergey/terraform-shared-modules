@@ -1,6 +1,6 @@
 # RDS Proxy and a read tier
 
-Aurora MySQL 8.0 with a writer, a reader and a `reporting` reader, RDS Proxy in front with IAM auth required and a reader endpoint, reader autoscaling on CPU (1 to 4), a custom `reporting` endpoint whose only member is the reporting instance, and I/O-Optimized storage.
+Aurora MySQL 3.10 (8.0-compatible) with a writer, a reader and a `reporting` reader, RDS Proxy in front with IAM auth required and a reader endpoint, reader autoscaling on CPU (1 to 4), a custom `reporting` endpoint whose only member is the reporting instance, and I/O-Optimized storage.
 
 ## Topology
 
@@ -31,7 +31,7 @@ module "aurora" {
 
   name           = "catalogue"
   engine         = "aurora-mysql"
-  engine_version = "8.0"
+  engine_version = "8.0.mysql_aurora.3.10.4"
   instance_class = "db.r7g.large"
   instances = {
     writer    = { promotion_tier = 0 }
@@ -42,7 +42,8 @@ module "aurora" {
   proxy = {
     enabled     = true
     iam_auth    = "REQUIRED"
-    secret_arns = [var.app_secret_arn]
+    secret_arns        = [var.app_secret_arn]
+    secret_kms_key_arn = var.app_secret_kms_key_arn
     # ingress_rules and egress_rules as in main.tf
   }
   # ... reader_autoscaling, custom_endpoints, network and tags from main.tf
@@ -60,6 +61,7 @@ Needs Terraform >= 1.7.0 and the AWS provider >= 5.90.0, < 7.0.0.
 | `app_security_group_id` | App tier SG, allowed to the proxy |
 | `bi_security_group_id` | BI tools SG, direct to the database |
 | `app_secret_arn` | Secret of the app database user the proxy logs in as |
+| `app_secret_kms_key_arn` | Key the app secret is encrypted with; the proxy role gets `kms:Decrypt` on it |
 | `secretsmanager_endpoint_security_group_id` | SG of the Secrets Manager endpoint |
 | `kms_key_arn` | CMK in this region |
 | `sns_topic_arn` | SNS topic in this region |
