@@ -54,13 +54,55 @@ resource "aws_dms_replication_subnet_group" "this" {
     }
 
     precondition {
+      condition     = var.premigration_assessment.enabled ? local.provisioned : true
+      error_message = "premigration_assessment runs against a replication task, so it needs compute_mode = \"provisioned\". For serverless, use aws dms start-replication with --premigration-assessment-settings."
+    }
+
+    precondition {
+      condition     = var.require_cmk && var.premigration_assessment.enabled ? var.premigration_assessment.kms_key_arn != "" : true
+      error_message = "require_cmk = true but premigration_assessment.kms_key_arn is empty: the assessment reports, which describe the source schema and data types, would be encrypted with SSE_S3."
+    }
+
+    precondition {
+      condition     = length(var.validation_tasks) == 0 ? true : local.provisioned
+      error_message = "validation_tasks need compute_mode = \"provisioned\": a validation-only task runs on a replication instance."
+    }
+
+    precondition {
+      condition     = length(local.validation_tasks_with_bad_parent) == 0
+      error_message = "these validation tasks cannot run: ${join("; ", local.validation_tasks_with_bad_parent)}."
+    }
+
+    precondition {
+      condition     = length(local.tasks_with_full_lob_to_s3) == 0
+      error_message = "these tasks write to an S3 target in full LOB mode: ${join(", ", local.tasks_with_full_lob_to_s3)}. DMS does not support full LOB mode (lob_mode FULL or INLINE) for S3. Use lob_mode = \"LIMITED\" with lob_max_size_kb above the largest LOB in the source."
+    }
+
+    precondition {
+      # aws_dms_replication_config has no CDC start argument: the setting would
+      # be dropped without a word.
+      condition = local.serverless ? length([
+        for k, t in var.tasks : k if t.cdc_start_time != "" || t.cdc_start_position != ""
+      ]) == 0 : true
+      error_message = "cdc_start_time and cdc_start_position are not supported in serverless mode - aws_dms_replication_config has no such argument, so the start point would be ignored. Start the replication with aws dms start-replication --cdc-start-position, or use compute_mode = \"provisioned\"."
+    }
+
+    precondition {
+      # The log group is the one place require_cmk can reach task logs. Without
+      # it DMS creates dms-tasks-<id> itself, with the AWS-managed key and no
+      # expiry.
+      condition     = var.require_cmk && local.provisioned ? (var.create_log_group ? var.log_retention_days > 0 : false) : true
+      error_message = "require_cmk = true, but the module is not creating the task log group (create_log_group = false or log_retention_days = 0), so DMS would create dms-tasks-${local.instance_id} itself with the AWS-managed key. Let the module create it with a retention."
+    }
+
+    precondition {
       condition     = length(local.plaintext_endpoints) == 0 ? true : var.allow_plaintext_credentials
       error_message = "these endpoints carry a username/password pair: ${join(", ", local.plaintext_endpoints)}. Those values are written to Terraform state in plaintext and returned by the DMS API. Put the credential in Secrets Manager and set secret_arn, or set allow_plaintext_credentials = true to accept it."
     }
 
     precondition {
       condition     = length(local.insecure_endpoints) == 0 ? true : var.allow_insecure_transport
-      error_message = "these endpoints do not verify the server certificate: ${join(", ", local.insecure_endpoints)}. Use verify-full with a certificate, or set allow_insecure_transport = true."
+      error_message = "these endpoints do not verify the server certificate: ${join(", ", local.insecure_endpoints)}. Use verify-ca or verify-full (whichever DMS supports for the engine) with a certificate, or set allow_insecure_transport = true."
     }
   }
 }

@@ -34,8 +34,18 @@ output "task_arns" {
 }
 
 output "task_ids" {
-  description = "Full task identifier per task, which is what the CLI and the CloudWatch dimension use."
+  description = "Task identifier (name) per task, which the CLI filters on. Empty in serverless mode."
   value       = { for k, t in aws_dms_replication_task.this : k => t.replication_task_id }
+}
+
+output "task_resource_ids" {
+  description = "Task resource ID per task - the last segment of the task ARN. CloudWatch publishes task metrics under this, as the ReplicationTaskIdentifier dimension, not under the task name."
+  value       = local.task_resource_ids
+}
+
+output "validation_task_arns" {
+  description = "ARN per validation-only task, keyed by the name you gave it. Empty in serverless mode, where validation_tasks are refused."
+  value       = { for k, t in aws_dms_replication_task.validation : k => t.replication_task_arn }
 }
 
 output "certificate_arns" {
@@ -91,6 +101,9 @@ output "governance" {
     # so a raw_overrides that disables validation shows up as disabled.
     tasks_deleting_target_data        = local.destructive_tasks
     tasks_without_validation          = local.unvalidated_tasks
+    tasks_whose_validation_cannot_run = local.tasks_whose_validation_cannot_run
+    validation_only_tasks             = { for k, v in var.validation_tasks : k => "${v.mode} of ${v.task}" }
+    validation_alarms_enabled         = local.validation_alarms_enabled
     tasks_without_logging             = local.unlogged_tasks
     tasks_started_on_apply            = [for k, t in var.tasks : k if t.start]
     tasks_with_default_control_schema = local.tasks_with_default_control_schema
@@ -98,7 +111,12 @@ output "governance" {
     tasks_with_raw_overrides = [
       for k, t in var.tasks : k if trimspace(t.settings.raw_overrides) != "{}"
     ]
-    task_log_levels = { for k, t in var.tasks : k => t.settings.log_level }
+    # What DMS runs with, from the merged settings - raw_overrides can replace
+    # LogComponents, so the typed log_level alone would certify the wrong thing.
+    task_log_levels = local.task_log_severities
+
+    # Decisions taken in code. A reviewer reads this list, not the plan output.
+    acknowledged_checks = sort(var.acknowledged_checks)
 
     # Alerting. An unwatched CDC task is the failure mode this module is
     # shaped around.
@@ -223,7 +241,7 @@ output "migration_plan" {
           if e.role == "target" && e.postgres.after_connect_script != ""
         ]
         suggested = "SET session_replication_role = replica;"
-        why       = "runs on every connection DMS opens to the target, which is what stops triggers firing and foreign keys rejecting rows that arrive parent-last during a full load. Remember to put it back in post-data."
+        why       = "runs on every connection DMS opens to the target, which is what stops triggers firing and foreign keys rejecting rows that arrive parent-last during a full load. It applies to DMS connections only, so nothing needs restoring afterwards; the DMS database user needs the privilege to set it."
       }
     }
 
@@ -241,10 +259,10 @@ output "migration_plan" {
       what = [
         "stop writes to the source",
         "wait for CDCLatencyTarget to reach ~0",
-        "stop the forward task BEFORE the application writes anywhere",
+        "stop the forward task BEFORE the application writes anywhere, then set start = false on it (or remove it) before any later apply",
         "reset sequences - DMS migrates rows, not sequence positions, and the first application insert otherwise fails on a duplicate key",
-        "restore session_replication_role if after_connect_script changed it",
-        "capture the evidence: table statistics, validation state, governance output",
+        "nothing to restore for session_replication_role: after_connect_script applied to DMS connections only",
+        "capture the evidence: table statistics, validation state, governance output, and a full-load validation-only task run just before cutover",
         "repoint the application",
       ]
       detail = "see RUNBOOK.md section 6"
@@ -256,7 +274,7 @@ output "migration_plan" {
 }
 
 output "verify_commands" {
-  description = "Copy-paste checks for what actually goes wrong, in the order you will need them. The cutover sequence is in RUNBOOK.md."
+  description = "Copy-paste checks for what actually goes wrong, in the order you will need them. cdc_latency, validation_state, failed_tables and stop_task are maps keyed by task name, with the real task ARN or resource ID filled in. The cutover sequence is in RUNBOOK.md."
   value = !local.create ? null : {
     # Before anything: does DMS reach the databases at all. This is the check
     # that fails when the network contract was not met.
@@ -266,11 +284,15 @@ output "verify_commands" {
     task_status = local.provisioned ? "aws dms describe-replication-tasks --query 'ReplicationTasks[?starts_with(ReplicationTaskIdentifier, `${var.name}`)].[ReplicationTaskIdentifier,Status,ReplicationTaskStats.FullLoadProgressPercent,StopReason]' --output table" : "aws dms describe-replications --query 'Replications[].[ReplicationConfigIdentifier,Status,ReplicationStats]' --output table"
 
     # The number that decides whether you can cut over.
-    cdc_latency = "aws cloudwatch get-metric-statistics --namespace AWS/DMS --metric-name CDCLatencyTarget --dimensions Name=ReplicationInstanceIdentifier,Value=${local.instance_id} --start-time $(date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%SZ) --end-time $(date -u +%Y-%m-%dT%H:%M:%SZ) --period 300 --statistics Average --query 'sort_by(Datapoints,&Timestamp)[-6:].[Timestamp,Average]' --output table"
+    # Per task, with the exact dimension set the metric is published under -
+    # instance name plus task resource ID. Anything less returns no datapoints.
+    cdc_latency = {
+      for k, id in local.task_resource_ids : k => "aws cloudwatch get-metric-statistics --namespace AWS/DMS --metric-name CDCLatencyTarget --dimensions Name=ReplicationInstanceIdentifier,Value=${local.instance_id} Name=ReplicationTaskIdentifier,Value=${id} --start-time $(date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%SZ) --end-time $(date -u +%Y-%m-%dT%H:%M:%SZ) --period 300 --statistics Average --query 'sort_by(Datapoints,&Timestamp)[-6:].[Timestamp,Average]' --output table"
+    }
 
     # Validation is what turns "the task succeeded" into "the data matches".
-    validation_state = "aws dms describe-table-statistics --replication-task-arn <task-arn> --query 'TableStatistics[?ValidationState!=`Validated`].[SchemaName,TableName,ValidationState,ValidationFailedRecords]' --output table"
-    failed_tables    = "aws dms describe-table-statistics --replication-task-arn <task-arn> --query 'TableStatistics[?TableState!=`Table completed`].[SchemaName,TableName,TableState,Inserts,Updates,Deletes]' --output table"
+    validation_state = { for k, t in merge(aws_dms_replication_task.this, aws_dms_replication_task.validation) : k => "aws dms describe-table-statistics --replication-task-arn ${t.replication_task_arn} --query 'TableStatistics[?ValidationState!=`Validated`].[SchemaName,TableName,ValidationState,ValidationFailedRecords]' --output table" }
+    failed_tables    = { for k, t in aws_dms_replication_task.this : k => "aws dms describe-table-statistics --replication-task-arn ${t.replication_task_arn} --query 'TableStatistics[?TableState!=`Table completed`].[SchemaName,TableName,TableState,Inserts,Updates,Deletes]' --output table" }
 
     task_logs = local.provisioned ? "aws logs tail ${local.log_group_name} --since 1h --follow" : "aws logs describe-log-groups --log-group-name-prefix dms-serverless"
 
@@ -280,7 +302,79 @@ output "verify_commands" {
     verify_endpoint_coverage = "aws cloudwatch list-metrics --namespace AWS/DMS --query 'Metrics[?MetricName==`CDCLatencyTarget`].Dimensions' --output json"
 
     # The one that stops the bill after cutover.
-    stop_task             = local.provisioned ? "aws dms stop-replication-task --replication-task-arn <task-arn>" : "aws dms stop-replication --replication-config-arn <config-arn>"
+    stop_task             = local.provisioned ? { for k, t in aws_dms_replication_task.this : k => "aws dms stop-replication-task --replication-task-arn ${t.replication_task_arn}" } : { for k, c in aws_dms_replication_config.this : k => "aws dms stop-replication --replication-config-arn ${c.arn}" }
     what_is_still_billing = "aws dms describe-replication-instances --query 'ReplicationInstances[].[ReplicationInstanceIdentifier,ReplicationInstanceClass,MultiAZ,ReplicationInstanceStatus]' --output table"
   }
+}
+
+output "premigration_assessment" {
+  description = "Premigration assessment per task: the command that starts one, the one that reports its status, where the report lands, and what the operator running them needs. null unless premigration_assessment.enabled. Run it before starting a task; attach the report to the change record."
+  value = !local.assessment_enabled ? null : {
+    role_arn   = local.assessment_role_arn
+    bucket     = var.premigration_assessment.bucket_name
+    folder     = var.premigration_assessment.bucket_folder
+    encryption = local.assessment_encryption
+
+    operator_permissions = [
+      "dms:StartReplicationTaskAssessmentRun, dms:DescribeReplicationTaskAssessmentRuns, dms:DescribeReplicationTaskIndividualAssessments on the tasks",
+      "iam:PassRole on ${local.assessment_role_arn}",
+      "s3:GetObject on the folder, to read the report",
+    ]
+
+    commands = {
+      for k, t in aws_dms_replication_task.this : k => {
+        start  = "aws dms start-replication-task-assessment-run --replication-task-arn ${t.replication_task_arn} --service-access-role-arn ${local.assessment_role_arn} --result-location-bucket ${var.premigration_assessment.bucket_name} --result-location-folder ${var.premigration_assessment.bucket_folder}/${var.name}/${k} --result-encryption-mode ${local.assessment_encryption}${var.premigration_assessment.kms_key_arn != "" ? " --result-kms-key-arn ${var.premigration_assessment.kms_key_arn}" : ""} --assessment-run-name ${var.name}-${k}-$(date -u +%Y%m%d%H%M%S)"
+        status = "aws dms describe-replication-task-assessment-runs --filters Name=replication-task-arn,Values=${t.replication_task_arn} --query 'ReplicationTaskAssessmentRuns[].[AssessmentRunName,Status,ResultStatistic]' --output table"
+        report = "s3://${var.premigration_assessment.bucket_name}/${var.premigration_assessment.bucket_folder}/${var.name}/${k}/"
+      }
+    }
+  }
+}
+
+output "kms_key_policy_requirements" {
+  description = "What each customer-managed key's policy has to allow for this migration to work. The module uses the keys but cannot write their policies - hand this to the key owner before the first apply. A missing CloudWatch Logs grant fails the log group create part way through the apply."
+  value = !local.create ? null : concat(
+    var.kms_key_arn == "" ? [] : [{
+      key       = var.kms_key_arn
+      principal = "the principal running terraform"
+      actions   = ["kms:CreateGrant", "kms:DescribeKey", "kms:Encrypt", "kms:Decrypt", "kms:ReEncrypt*", "kms:GenerateDataKey*"]
+      condition = { "kms:ViaService" = "dms.${local.region}.amazonaws.com" }
+      why       = "DMS encrypts replication storage (cached changes, in-flight LOBs) and endpoint connection details with grants created on the caller's behalf."
+    }],
+    [for key in distinct([for k, e in var.endpoints : e.kms_key_arn if e.kms_key_arn != "" && e.kms_key_arn != var.kms_key_arn]) : {
+      key       = key
+      principal = "the principal running terraform"
+      actions   = ["kms:CreateGrant", "kms:DescribeKey", "kms:Encrypt", "kms:Decrypt"]
+      condition = { "kms:ViaService" = "dms.${local.region}.amazonaws.com" }
+      why       = "DMS encrypts the endpoint's connection details with this key."
+    }],
+    !(local.provisioned && var.create_log_group && var.log_retention_days > 0 && var.kms_key_arn != "") ? [] : [{
+      key       = var.kms_key_arn
+      principal = "Service: logs.${local.region}.amazonaws.com"
+      actions   = ["kms:Encrypt*", "kms:Decrypt*", "kms:ReEncrypt*", "kms:GenerateDataKey*", "kms:Describe*"]
+      condition = { "ArnEquals kms:EncryptionContext:aws:logs:arn" = "arn:${local.partition}:logs:${local.region}:${local.account_id}:log-group:${local.log_group_name}" }
+      why       = "CloudWatch Logs encrypts the task log group with this key. Without the grant the log group create fails."
+    }],
+    [for key in distinct([for k, e in var.endpoints : e.secret_kms_key_arn if e.secret_kms_key_arn != ""]) : {
+      key       = key
+      principal = join(", ", [for k, e in var.endpoints : local.endpoint_secret_role_arns[k] if e.secret_kms_key_arn == key])
+      actions   = ["kms:Decrypt"]
+      condition = { "kms:ViaService" = "secretsmanager.${local.region}.amazonaws.com" }
+      why       = "DMS reads the endpoint secret through these roles. Needed in the key policy unless it delegates to IAM."
+    }],
+    [for key in distinct([for k, s in var.s3_targets : s.kms_key_arn if s.encryption_mode == "SSE_KMS" && s.kms_key_arn != ""]) : {
+      key       = key
+      principal = join(", ", [for k, s in var.s3_targets : local.s3_target_role_arns[k] if s.kms_key_arn == key])
+      actions   = ["kms:GenerateDataKey", "kms:Encrypt", "kms:Decrypt", "kms:DescribeKey"]
+      condition = { "kms:ViaService" = "s3.${local.region}.amazonaws.com" }
+      why       = "DMS writes SSE-KMS objects to the target bucket through these roles."
+    }],
+    !local.assessment_enabled || var.premigration_assessment.kms_key_arn == "" ? [] : [{
+      key       = var.premigration_assessment.kms_key_arn
+      principal = local.assessment_role_arn
+      actions   = ["kms:GenerateDataKey", "kms:Decrypt"]
+      condition = { "kms:ViaService" = "s3.${local.region}.amazonaws.com" }
+      why       = "DMS writes the premigration assessment reports encrypted with this key."
+    }],
+  )
 }

@@ -21,11 +21,15 @@ resource "aws_iam_role" "endpoint_secret" {
       Effect    = "Allow"
       Action    = "sts:AssumeRole"
       Principal = { Service = "dms.${local.region}.amazonaws.com" }
-      # Confused deputy: without these, DMS in any account could assume it.
+      # Confused deputy: without these, DMS acting for another account could
+      # assume it. The SourceArn is any DMS resource in this account and region,
+      # as AWS documents it: DMS presents the endpoint, task or replication
+      # config ARN depending on the operation, so narrowing it to endpoint:*
+      # risks a denied AssumeRole at run time.
       Condition = {
         StringEquals = { "aws:SourceAccount" = local.account_id }
         ArnLike = {
-          "aws:SourceArn" = "arn:${local.partition}:dms:${local.region}:${local.account_id}:endpoint:*"
+          "aws:SourceArn" = "arn:${local.partition}:dms:${local.region}:${local.account_id}:*"
         }
       }
     }]
@@ -87,13 +91,13 @@ resource "aws_iam_role" "s3_target" {
       # Both principals: S3 target roles are documented with the global one and
       # the regional one appears in newer engine versions.
       Principal = { Service = ["dms.amazonaws.com", "dms.${local.region}.amazonaws.com"] }
-      # SourceAccount alone lets ANY DMS endpoint in this account assume the
-      # role - including one created by another team with dms:CreateEndpoint,
-      # which is a far more common grant than iam:PassRole on this role.
+      # Confused deputy, as AWS documents it. Within the account, what stops
+      # another team's endpoint using this role is iam:PassRole on it - grant
+      # that narrowly.
       Condition = {
         StringEquals = { "aws:SourceAccount" = local.account_id }
         ArnLike = {
-          "aws:SourceArn" = "arn:${local.partition}:dms:${local.region}:${local.account_id}:endpoint:*"
+          "aws:SourceArn" = "arn:${local.partition}:dms:${local.region}:${local.account_id}:*"
         }
       }
     }]
@@ -210,4 +214,71 @@ resource "aws_iam_role_policy_attachment" "dms_cloudwatch_logs" {
 
   role       = aws_iam_role.dms_cloudwatch_logs[0].name
   policy_arn = "arn:${local.partition}:iam::aws:policy/service-role/AmazonDMSCloudWatchLogsRole"
+}
+
+# ---------------------------------------------------------------------------
+# Premigration assessment
+#
+# The role DMS writes assessment reports with, scoped to one bucket prefix.
+# Trust as AWS documents it, plus the account condition. No SourceArn: what DMS
+# presents for an assessment run is not documented closely enough to pin, and
+# a wrong condition fails the run with AccessDenied.
+# ---------------------------------------------------------------------------
+
+resource "aws_iam_role" "assessment" {
+  count = local.create_assessment_role ? 1 : 0
+
+  name        = "${var.name}-assessment"
+  description = "DMS writes premigration assessment reports for the ${var.name} migration"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Action    = "sts:AssumeRole"
+      Principal = { Service = "dms.amazonaws.com" }
+      Condition = {
+        StringEquals = { "aws:SourceAccount" = local.account_id }
+      }
+    }]
+  })
+
+  permissions_boundary = var.permissions_boundary_arn != "" ? var.permissions_boundary_arn : null
+  tags                 = local.common_tags
+}
+
+resource "aws_iam_role_policy" "assessment" {
+  count = local.create_assessment_role ? 1 : 0
+
+  name = "write-assessment-reports"
+  role = aws_iam_role.assessment[0].id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = concat(
+      [
+        {
+          Sid      = "WriteAssessmentReports"
+          Effect   = "Allow"
+          Action   = ["s3:PutObject", "s3:DeleteObject", "s3:GetObject", "s3:PutObjectTagging"]
+          Resource = ["arn:${local.partition}:s3:::${var.premigration_assessment.bucket_name}/${var.premigration_assessment.bucket_folder}/*"]
+        },
+        {
+          Sid      = "LocateAssessmentBucket"
+          Effect   = "Allow"
+          Action   = ["s3:ListBucket", "s3:GetBucketLocation"]
+          Resource = ["arn:${local.partition}:s3:::${var.premigration_assessment.bucket_name}"]
+        },
+      ],
+      var.premigration_assessment.kms_key_arn == "" ? [] : [{
+        Sid      = "EncryptAssessmentReports"
+        Effect   = "Allow"
+        Action   = ["kms:GenerateDataKey", "kms:Decrypt"]
+        Resource = [var.premigration_assessment.kms_key_arn]
+        Condition = {
+          StringEquals = { "kms:ViaService" = "s3.${local.region}.amazonaws.com" }
+        }
+      }],
+    )
+  })
 }

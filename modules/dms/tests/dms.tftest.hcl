@@ -298,7 +298,7 @@ run "a_credential_hidden_in_extra_connection_attributes_is_rejected" {
         role                        = "source"
         engine                      = "oracle"
         secret_arn                  = "arn:aws:secretsmanager:eu-west-1:111122223333:secret:src-AbCdEf"
-        ssl_mode                    = "require"
+        ssl_mode                    = "none"
         extra_connection_attributes = "addSupplementalLogging=Y;password=hunter2"
       }
     }
@@ -829,16 +829,23 @@ run "oracle_source_prerequisites_name_supplemental_logging" {
   command = plan
 
   variables {
+    # Oracle verifies TLS with verify-ca against an Oracle wallet; DMS does not
+    # support verify-full for Oracle.
+    certificates = {
+      rds-ca        = { pem = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----" }
+      oracle-wallet = { wallet = "b3JhY2xlLXdhbGxldA==" }
+    }
     endpoints = {
       source-db = {
         role               = "source"
         engine             = "oracle"
         server_name        = "src.example.com"
         port               = 1521
+        database_name      = "ORCLPDB1"
         secret_arn         = "arn:aws:secretsmanager:eu-west-1:111122223333:secret:src-AbCdEf"
         secret_kms_key_arn = "arn:aws:kms:eu-west-1:111122223333:key/11111111-2222-3333-4444-555555555555"
-        ssl_mode           = "verify-full"
-        certificate_key    = "rds-ca"
+        ssl_mode           = "verify-ca"
+        certificate_key    = "oracle-wallet"
       }
       target-db = {
         role               = "target"

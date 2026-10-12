@@ -12,13 +12,15 @@ resource "aws_dms_endpoint" "this" {
   endpoint_type = each.value.role
   engine_name   = each.value.engine
 
-  # With a secret, DMS takes the host, port, database and credential FROM the
-  # secret, and the provider rejects these fields as conflicting. They stay in
-  # the variable because output.network_contract still has to tell the network
-  # team which host and port to open - they just do not reach the API.
+  # With a secret, DMS takes the host, port and credential FROM the secret, and
+  # the provider rejects those fields as conflicting. They stay in the variable
+  # because output.network_contract still has to tell the network team which
+  # host and port to open. The database name is NOT in the secret DMS reads
+  # (host, port, username, password): the provider sends database_name inside
+  # the engine settings on the secret path too, so it is always passed.
   server_name   = each.value.secret_arn == "" && each.value.server_name != "" ? each.value.server_name : null
   port          = each.value.secret_arn == "" && each.value.port != 0 ? each.value.port : null
-  database_name = each.value.secret_arn == "" && each.value.database_name != "" ? each.value.database_name : null
+  database_name = each.value.database_name != "" ? each.value.database_name : null
 
   secrets_manager_arn             = each.value.secret_arn != "" ? each.value.secret_arn : null
   secrets_manager_access_role_arn = each.value.secret_arn != "" ? local.endpoint_secret_role_arns[each.key] : null

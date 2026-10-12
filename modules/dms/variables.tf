@@ -49,6 +49,39 @@ variable "tags" {
 # Compute
 # ---------------------------------------------------------------------------
 
+variable "acknowledged_checks" {
+  description = "Advisory checks this caller has decided to live with, by name - for example \"replication_survives_an_az\" on a single-AZ dev migration. An acknowledged check stops warning in plans and HCP Terraform health assessments, and is listed in output.governance so a reviewer still sees the decision."
+  type        = list(string)
+  default     = []
+  nullable    = false
+
+  validation {
+    condition = alltrue([
+      for c in var.acknowledged_checks : contains([
+        "somebody_hears_a_failed_task",
+        "serverless_replication_is_not_watched_by_this_module",
+        "control_tables_have_their_own_schema",
+        "debug_logging_is_temporary",
+        "the_target_schema_comes_from_somewhere",
+        "the_full_load_is_not_fighting_the_targets_constraints",
+        "the_storage_alarm_leaves_room_to_react",
+        "cdc_tasks_are_validated",
+        "tasks_write_logs",
+        "log_retention_is_bounded",
+        "replication_survives_an_az",
+        "full_load_does_not_leave_the_meter_running",
+        "engine_version_is_pinned",
+        "credentials_are_not_in_state",
+        "transport_is_verified",
+        "minor_upgrades_do_not_fight_the_pin",
+        "oracle_ssl_uses_a_wallet",
+        "validation_is_claimed_where_it_cannot_run",
+      ], c)
+    ])
+    error_message = "acknowledged_checks names a check that does not exist. The check names are the check blocks in observability.tf, listed in the README."
+  }
+}
+
 variable "compute_mode" {
   description = <<-EOT
     Where the replication runs.
@@ -122,9 +155,9 @@ variable "availability_zone" {
 }
 
 variable "auto_minor_version_upgrade" {
-  description = "Let AWS apply minor engine upgrades in the maintenance window. Leave true: DMS minor versions carry replication correctness fixes."
+  description = "Let AWS apply minor engine upgrades in the maintenance window. Off by default because engine_version is pinned: with both, AWS moves the instance to a newer minor and every later plan tries to set the pinned one back, which DMS refuses. DMS minor versions do carry replication fixes - take them by raising engine_version, as a reviewed change outside a cutover window."
   type        = bool
-  default     = true
+  default     = false
   nullable    = false
 }
 
@@ -296,17 +329,29 @@ variable "endpoints" {
       username / password                          plaintext in state. Refused
                    unless allow_plaintext_credentials = true.
 
-    ssl_mode defaults to verify-full. Anything below that on a database carrying
-    production data is a decision, not a default - see allow_insecure_transport.
+    ssl_mode defaults to verify-full, which DMS does not support on every
+    engine: Oracle, Db2 and Db2 z/OS take none or verify-ca (Oracle with an
+    Oracle wallet in certificates[*].wallet), SQL Server none, require or
+    verify-full, SAP ASE none or verify-full, Redshift none. Set ssl_mode
+    explicitly for those; an unsupported value is refused at plan. Anything
+    below verify on a database carrying production data is a decision, not a
+    default - see allow_insecure_transport.
+
+    With secret_arn, the secret DMS reads holds host, port, username and
+    password - give DMS its own database user and its own secret. The
+    RDS/Aurora-managed master secret is not usable here. database_name is not
+    in that secret and is always sent from this variable.
 
     S3 targets are a different resource with a different shape; use s3_targets.
   EOT
   type = map(object({
     role   = string
     engine = string
-    # With secret_arn set, these do NOT reach DMS - the secret carries the host,
-    # port and database. They are still worth filling in: output.network_contract
-    # is built from them, and that is what the firewall request is made of.
+    # With secret_arn set, server_name and port do NOT reach DMS - the secret
+    # carries host and port. They are still worth filling in:
+    # output.network_contract is built from them, and that is what the firewall
+    # request is made of. database_name always reaches DMS: the secret does not
+    # carry it, and Oracle needs it (SID or service name) on either path.
     server_name   = optional(string, "")
     port          = optional(number, 0)
     database_name = optional(string, "")
@@ -335,7 +380,11 @@ variable "endpoints" {
     # migrating into. The module only sends them when role = "source".
     #
     # after_connect_script and execute_timeout apply to either end, and the
-    # target is where after_connect_script earns its keep: see sql_scripts.
+    # target is where after_connect_script earns its keep: it runs on every
+    # connection DMS opens, so "SET session_replication_role = replica;"
+    # affects DMS's sessions only and nothing needs restoring afterwards. The
+    # DMS database user needs the privilege to set it (superuser, or on RDS and
+    # Aurora membership of rds_superuser).
     postgres = optional(object({
       heartbeat_enable             = optional(bool, true)
       heartbeat_frequency          = optional(number, 5)
@@ -417,6 +466,27 @@ variable "endpoints" {
       contains(["none", "require", "verify-ca", "verify-full"], e.ssl_mode)
     ])
     error_message = "endpoints[*].ssl_mode must be none, require, verify-ca, or verify-full."
+  }
+
+  validation {
+    # AWS DMS supports a different set of SSL modes per engine (the "Using SSL"
+    # table in the DMS user guide). An unsupported mode fails at endpoint
+    # create or connection test - on Oracle, verify-full is refused outright,
+    # and the only escape left would be ssl_mode = "none".
+    condition = alltrue([
+      for k, e in var.endpoints : contains(lookup({
+        aurora    = ["none", "verify-ca", "verify-full"]
+        mariadb   = ["none", "verify-ca", "verify-full"]
+        mysql     = ["none", "verify-ca", "verify-full"]
+        sqlserver = ["none", "require", "verify-full"]
+        oracle    = ["none", "verify-ca"]
+        db2       = ["none", "verify-ca"]
+        db2-zos   = ["none", "verify-ca"]
+        sybase    = ["none", "verify-full"]
+        redshift  = ["none"]
+      }, e.engine, ["none", "require", "verify-ca", "verify-full"]), e.ssl_mode)
+    ])
+    error_message = "endpoints[*].ssl_mode is not supported by DMS for that engine. Oracle, db2 and db2-zos: none or verify-ca (Oracle with a wallet - certificates[*].wallet). MySQL, MariaDB and Aurora MySQL: none, verify-ca or verify-full. SQL Server: none, require or verify-full. SAP ASE (sybase): none or verify-full. Redshift: none (DMS reaches it through S3, already encrypted). PostgreSQL: any."
   }
 
   validation {
@@ -589,7 +659,7 @@ variable "s3_targets" {
 }
 
 variable "certificates" {
-  description = "CA certificates DMS uses to verify a server, keyed by name. Required for ssl_mode verify-ca and verify-full. For RDS this is the regional or global RDS CA bundle; for an on-prem source it is whatever signed the database's certificate."
+  description = "CA certificates DMS uses to verify a server, keyed by name. Required for ssl_mode verify-ca and verify-full. Set exactly one of pem (PEM text) or wallet (base64 of an Oracle wallet, e.g. filebase64 of cwallet.sso). For RDS, pem is the regional or global RDS CA bundle; for an on-prem source it is whatever signed the database's certificate; an Oracle endpoint verifies against a wallet, not a PEM."
   type = map(object({
     pem    = optional(string, "")
     wallet = optional(string, "")
@@ -626,10 +696,21 @@ variable "certificates" {
 
 variable "tasks" {
   description = <<-EOT
-    Replication tasks, keyed by name. Provisioned mode only - serverless has one
-    replication per config, configured through the serverless variable.
+    Replication tasks, keyed by name. In provisioned mode each becomes an
+    aws_dms_replication_task on the replication instance; in serverless mode
+    each becomes its own aws_dms_replication_config, sized by the serverless
+    variable. Alarms, event subscriptions, the log group, validation_tasks and
+    premigration_assessment are provisioned only.
 
     source_endpoint and target_endpoint are keys from endpoints or s3_targets.
+
+    start = false (the default) creates the task stopped. start = true starts
+    it on apply, and the provider then RESUMES a stopped task after any later
+    modification of it - set it back to false (or remove the task) once the
+    task is stopped on purpose, for example after cutover.
+
+    cdc_start_time and cdc_start_position are refused in serverless mode: the
+    replication config has no such argument.
 
     table_mappings is JSON. It must contain at least one selection rule: a
     mapping with only transformation rules matches no tables, and the task then
@@ -677,8 +758,8 @@ variable "tasks" {
       # Named by default. DMS writes awsdms_apply_exceptions here - failing rows
       # with their data and SQL - and in the target's default schema that is
       # production data in an unscoped table. The schema must exist on the
-      # target, or the migrating user must be able to create it; it is listed in
-      # output.target_prerequisites.
+      # target, or the migrating user must be able to create it - create it in a
+      # sql_scripts.pre_data script (see output.migration_plan, phase 1).
       control_schema      = optional(string, "dms_control")
       task_recovery_table = optional(bool, false)
       apply_error_max     = optional(number, 0)
@@ -863,6 +944,128 @@ variable "tasks" {
   }
 }
 
+variable "validation_tasks" {
+  description = <<-EOT
+    Validation-only tasks, keyed by name: each compares the source and target
+    of an existing entry in tasks without migrating anything, and is the
+    reconciliation evidence for a change record - run a full-load one just
+    before cutover to see how many rows differ at that moment.
+
+    task     the key in tasks it validates. Endpoints and table_mappings are
+             taken from it: AWS requires the same direction as the migration.
+    mode     full-load (one pass, reports and stops) or cdc (validates the
+             existing rows, then keeps re-validating changes). cdc needs the
+             parent task to read changes.
+    start    false leaves it created and stopped; start it when you need the
+             answer.
+
+    The task always renders TargetTablePrepMode = DO_NOTHING and
+    ValidationOnly = true. ValidationOnly cannot change after a task is
+    created, which is why this is its own map rather than a flag on tasks.
+    Provisioned mode only.
+  EOT
+  type = map(object({
+    task              = string
+    mode              = optional(string, "full-load")
+    start             = optional(bool, false)
+    threads           = optional(number, 5)
+    failure_max       = optional(number, 10000)
+    table_failure_max = optional(number, 1000)
+  }))
+  default  = {}
+  nullable = false
+
+  validation {
+    condition     = alltrue([for k, v in var.validation_tasks : can(regex("^[a-z][a-z0-9-]{1,50}$", k))])
+    error_message = "validation_tasks keys must be 2-51 chars, lowercase alphanumeric or hyphen, starting with a letter; they become task ids."
+  }
+
+  validation {
+    condition     = alltrue([for k, v in var.validation_tasks : contains(["full-load", "cdc"], v.mode)])
+    error_message = "validation_tasks[*].mode must be full-load or cdc."
+  }
+
+  validation {
+    condition     = alltrue([for k, v in var.validation_tasks : contains(keys(var.tasks), v.task)])
+    error_message = "validation_tasks[*].task must be a key of tasks: a validation-only task reuses that task's endpoints and table mappings."
+  }
+
+  validation {
+    condition = alltrue([
+      for k, v in var.validation_tasks :
+      v.threads >= 1 && v.threads <= 64 && v.failure_max >= 1 && v.table_failure_max >= 1
+    ])
+    error_message = "validation_tasks[*]: threads must be 1-64, failure_max and table_failure_max at least 1."
+  }
+}
+
+variable "create_validation_alarms" {
+  description = "Alarm on failed and suspended validation records for every task that validates, including validation_tasks. Needs sns_topic_arn and create_alarms."
+  type        = bool
+  default     = true
+  nullable    = false
+}
+
+variable "alarm_validation_failed_records" {
+  description = "Alarm when a task reports more failed validation records than this. 0 alarms on the first mismatch."
+  type        = number
+  default     = 0
+  nullable    = false
+
+  validation {
+    condition     = var.alarm_validation_failed_records >= 0
+    error_message = "alarm_validation_failed_records must be 0 or more."
+  }
+}
+
+variable "premigration_assessment" {
+  description = <<-EOT
+    Premigration assessments: DMS checks a task against its source and target
+    (unsupported types, LOBs without primary keys, missing privileges,
+    supplemental logging...) and writes a report to S3, before any data moves.
+    The report is change-record evidence.
+
+    The provider has no resource for an assessment run, so the module creates
+    the role DMS writes the report with and emits the exact command per task
+    in output.premigration_assessment - your pipeline runs it as a gated step
+    before a task is started. Results are always encrypted: SSE_KMS with
+    kms_key_arn, else SSE_S3. Provisioned mode only.
+
+    create_role = false uses role_arn (it must trust dms.amazonaws.com and be
+    able to write the bucket and folder).
+  EOT
+  type = object({
+    enabled       = optional(bool, false)
+    bucket_name   = optional(string, "")
+    bucket_folder = optional(string, "dms-assessments")
+    kms_key_arn   = optional(string, "")
+    create_role   = optional(bool, true)
+    role_arn      = optional(string, "")
+  })
+  default  = {}
+  nullable = false
+
+  validation {
+    condition     = var.premigration_assessment.enabled ? can(regex("^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$", var.premigration_assessment.bucket_name)) : true
+    error_message = "premigration_assessment.bucket_name must be an S3 bucket name when enabled."
+  }
+
+  validation {
+    condition     = can(regex("^[A-Za-z0-9!_.'()-]+(/[A-Za-z0-9!_.'()-]+)*$", var.premigration_assessment.bucket_folder))
+    error_message = "premigration_assessment.bucket_folder must be an S3 prefix with no leading or trailing slash and no wildcard - the role is scoped to it."
+  }
+
+  validation {
+    condition     = var.premigration_assessment.kms_key_arn == "" ? true : can(regex("^arn:aws[a-z-]*:kms:[a-z0-9-]+:[0-9]{12}:key/", var.premigration_assessment.kms_key_arn))
+    error_message = "premigration_assessment.kms_key_arn must be empty or a KMS key ARN."
+  }
+
+  validation {
+    condition     = var.premigration_assessment.create_role ? var.premigration_assessment.role_arn == "" : can(regex("^arn:aws[a-z-]*:iam::[0-9]{12}:role/", var.premigration_assessment.role_arn))
+    error_message = "premigration_assessment: create_role = false needs role_arn (an IAM role ARN); create_role = true takes none."
+  }
+}
+
 variable "sql_scripts" {
   description = <<-EOT
     The SQL that runs either side of the data, as a MANIFEST. The module does
@@ -1042,14 +1245,14 @@ variable "alarm_cdc_latency_seconds" {
 }
 
 variable "alarm_free_storage_bytes" {
-  description = "Alarm when the replication instance's free storage drops below this. A full disk stops every task on the instance."
+  description = "Alarm when the replication instance's free storage drops below this. A full disk stops every task on the instance. 0 (the default) means 15% of allocated_storage_gb, so the threshold follows the volume."
   type        = number
-  default     = 5368709120
+  default     = 0
   nullable    = false
 
   validation {
-    condition     = var.alarm_free_storage_bytes >= 1073741824
-    error_message = "alarm_free_storage_bytes must be at least 1 GiB."
+    condition     = var.alarm_free_storage_bytes == 0 ? true : var.alarm_free_storage_bytes >= 1073741824
+    error_message = "alarm_free_storage_bytes must be 0 (15% of the volume) or at least 1 GiB."
   }
 }
 
@@ -1079,6 +1282,13 @@ variable "alarm_freeable_memory_bytes" {
 
 variable "create_log_group" {
   description = "Create the dms-tasks-<name> log group so retention applies before DMS writes to it. Set false when the group already exists - DMS creates it on first task start with no expiry, and Terraform then fails with ResourceAlreadyExistsException."
+  type        = bool
+  default     = true
+  nullable    = false
+}
+
+variable "log_group_skip_destroy" {
+  description = "Keep the task log group, and the logs in it, when Terraform destroys the module - the teardown after cutover would otherwise delete the evidence the retention was set to keep. The group still expires its logs after log_retention_days."
   type        = bool
   default     = true
   nullable    = false

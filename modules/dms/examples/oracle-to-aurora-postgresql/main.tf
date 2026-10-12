@@ -40,7 +40,7 @@ variable "security_group_id" {
 }
 
 variable "source_secret_arn" {
-  description = "Secrets Manager secret holding the Oracle credential, in the shape DMS expects: username, password, port, host, dbname."
+  description = "Secrets Manager secret holding the Oracle credential, in the shape DMS expects: username, password, host and port. It is a database user of its own for DMS, not the RDS-managed master secret, which DMS cannot read. The database name comes from the endpoint, not the secret."
   type        = string
 }
 
@@ -69,8 +69,8 @@ variable "rds_ca_bundle_pem" {
   type        = string
 }
 
-variable "oracle_ca_pem" {
-  description = "PEM of whatever signed the Oracle source's certificate."
+variable "oracle_wallet_base64" {
+  description = "Base64 of the Oracle wallet (cwallet.sso) holding the CA that signed the Oracle source's certificate: base64 -w0 cwallet.sso. DMS verifies Oracle against a wallet, not a PEM."
   type        = string
 }
 
@@ -93,12 +93,14 @@ module "migration" {
   kms_key_arn = var.kms_key_arn
   require_cmk = true
 
-  # verify-full on both sides needs a CA to verify against. Uploaded here and
+  # Verifying a server needs a CA to verify against. Uploaded here and
   # referenced by certificate_key below - referencing the module's own output
-  # from its own input would be a dependency cycle.
+  # from its own input would be a dependency cycle. Oracle takes a wallet, and
+  # DMS supports only none or verify-ca on Oracle; the Aurora side verifies
+  # against the RDS CA bundle with verify-full.
   certificates = {
-    oracle-ca = { pem = var.oracle_ca_pem }
-    rds-ca    = { pem = var.rds_ca_bundle_pem }
+    oracle-wallet = { wallet = var.oracle_wallet_base64 }
+    rds-ca        = { pem = var.rds_ca_bundle_pem }
   }
 
   endpoints = {
@@ -112,8 +114,8 @@ module "migration" {
       secret_arn         = var.source_secret_arn
       secret_kms_key_arn = var.secret_kms_key_arn
 
-      ssl_mode        = "verify-full"
-      certificate_key = "oracle-ca"
+      ssl_mode        = "verify-ca"
+      certificate_key = "oracle-wallet"
     }
 
     aurora-target = {

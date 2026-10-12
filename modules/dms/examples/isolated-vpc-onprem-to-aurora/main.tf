@@ -65,8 +65,13 @@ variable "replication_kms_key_arn" {
   type        = string
 }
 
-variable "onprem_ca_pem" {
-  description = "PEM of the internal CA that signed the on-prem database's certificate. Without it verify-full has nothing to verify against."
+variable "onprem_wallet_base64" {
+  description = "Base64 of the Oracle wallet (cwallet.sso) holding the CA that signed the on-prem database's certificate: base64 -w0 cwallet.sso. DMS verifies an Oracle source against a wallet, not a PEM, and supports only none or verify-ca on Oracle - so verify-full is not available here."
+  type        = string
+}
+
+variable "assessment_bucket_name" {
+  description = "Existing S3 bucket for premigration assessment reports, in this region. The module creates the role DMS writes them with, scoped to a folder."
   type        = string
 }
 
@@ -111,17 +116,22 @@ module "migration" {
   require_cmk = true
 
   certificates = {
-    onprem-ca = { pem = var.onprem_ca_pem }
-    rds-ca    = { pem = var.rds_ca_bundle_pem }
+    # An Oracle endpoint verifies against a wallet; the module refuses a PEM
+    # here (check oracle_ssl_uses_a_wallet) and refuses verify-full on Oracle.
+    onprem-wallet = { wallet = var.onprem_wallet_base64 }
+    rds-ca        = { pem = var.rds_ca_bundle_pem }
   }
 
   endpoints = {
     core-onprem = {
       role   = "source"
       engine = "oracle"
-      # With secret_arn set these do not reach DMS - the secret carries them.
-      # They are here because network_contract is built from them, and that is
-      # the firewall request.
+      # With secret_arn set, server_name and port do not reach DMS - the secret
+      # carries host and port (and its user is the DMS user's own, not a shared
+      # admin credential). They are here because network_contract is built from
+      # them, and that is the firewall request. database_name always reaches
+      # DMS: the secret does not hold it, and Oracle needs it (SID or service
+      # name).
       server_name   = var.onprem_hostname
       port          = 1521
       database_name = "CORE"
@@ -130,9 +140,10 @@ module "migration" {
       secret_kms_key_arn = var.secret_kms_key_arn
 
       # Over a WAN link crossing a bank's own estate, unverified TLS is not a
-      # defensible position in an audit.
-      ssl_mode        = "verify-full"
-      certificate_key = "onprem-ca"
+      # defensible position in an audit. verify-ca is the strongest mode DMS
+      # supports on Oracle, and it needs the wallet above.
+      ssl_mode        = "verify-ca"
+      certificate_key = "onprem-wallet"
     }
 
     aurora-core = {
@@ -152,8 +163,9 @@ module "migration" {
         # The only pre-data hook DMS has. It runs on every connection DMS opens
         # to the target, so for the duration of the load the target's triggers
         # do not fire and its foreign keys do not reject rows that arrive
-        # parent-last. 03-post-data-sequences.sql checks it is back to default
-        # for everyone else.
+        # parent-last. It affects DMS's own sessions only, so nothing needs
+        # restoring afterwards. The DMS database user needs the privilege to
+        # set it.
         after_connect_script = "SET session_replication_role = replica;"
       }
     }
@@ -190,6 +202,17 @@ module "migration" {
     ]
   }
 
+  # Premigration assessment: DMS checks the task against the source and target
+  # and writes a report to S3 before any data moves. The module creates the
+  # role; the command is in output.premigration_assessment, run as a gated step
+  # before the task is started.
+  premigration_assessment = {
+    enabled       = true
+    bucket_name   = var.assessment_bucket_name
+    bucket_folder = "dms-assessments"
+    kms_key_arn   = var.replication_kms_key_arn
+  }
+
   tasks = {
     core = {
       source_endpoint = "core-onprem"
@@ -210,7 +233,7 @@ module "migration" {
         validation_enabled = true
         validation_threads = 8
 
-        # FULL LOB mode: a truncated LOB in a banking record is a data defect
+        # FULL LOB mode (the target is Aurora, not S3): a truncated LOB in a banking record is a data defect
         # that surfaces in a regulatory report, not in an error log. It costs
         # throughput, which over a WAN link is the scarce resource - measure it
         # before deciding it is too slow.
@@ -220,6 +243,18 @@ module "migration" {
         # reviewer and easy to exclude from the target's backups.
         control_schema = "dms_control"
       }
+    }
+  }
+
+  # Reconciliation evidence for the change record: a validation-only task over
+  # the same endpoints and mappings. Start it just before cutover (RUNBOOK) and
+  # attach its describe-table-statistics output. It never prepares the target.
+  validation_tasks = {
+    pre-cutover = {
+      task    = "core"
+      mode    = "full-load"
+      threads = 8
+      start   = false
     }
   }
 
@@ -272,6 +307,16 @@ output "governance" {
 output "migration_plan" {
   description = "The whole migration in order: pre-data DDL, DMS load and CDC, post-data DDL, cutover. Hand to whoever runs the pipeline - the module executes none of the SQL."
   value       = module.migration.migration_plan
+}
+
+output "premigration_assessment" {
+  description = "Start, status and report commands per task. Run the assessment before starting the task and attach the report to the change record."
+  value       = module.migration.premigration_assessment
+}
+
+output "kms_key_policy_requirements" {
+  description = "Hand to the owner of each CMK before the first apply: what its key policy has to allow."
+  value       = module.migration.kms_key_policy_requirements
 }
 
 output "verify_commands" {

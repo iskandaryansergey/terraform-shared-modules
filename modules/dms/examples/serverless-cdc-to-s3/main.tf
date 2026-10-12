@@ -159,11 +159,19 @@ module "cdc_to_lake" {
 
       settings = {
         target_table_prep_mode = "DO_NOTHING"
-        validation_enabled     = true
+        # Validation compares a PostgreSQL source with an S3 target only because
+        # the target is parquet, with a timestamp column and a day-level date
+        # partition - the module reports validation as unable to run otherwise.
+        # Serverless has no validation alarms or validation_tasks.
+        validation_enabled = true
 
-        # FULL rather than LIMITED: a truncated LOB in a lake is a silent data
-        # defect that surfaces months later in a report.
-        lob_mode = "FULL"
+        # LIMITED with a generous ceiling (16384 KB): DMS does not support full
+        # LOB mode for an S3 target, and the module refuses lob_mode FULL or
+        # INLINE into one. Size lob_max_size_kb above the largest LOB in the
+        # source (check with a MAX(length()) query) - past it, values are
+        # truncated without an error, which in a lake surfaces months later.
+        lob_mode        = "LIMITED"
+        lob_max_size_kb = 16384
       }
     }
   }

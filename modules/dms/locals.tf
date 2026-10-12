@@ -12,6 +12,8 @@ locals {
   region     = coalesce(one(data.aws_region.current[*].name), "us-east-1")
   account_id = coalesce(one(data.aws_caller_identity.current[*].account_id), "000000000000")
 
+  acknowledged = toset(var.acknowledged_checks)
+
   provisioned = var.compute_mode == "provisioned"
   serverless  = var.compute_mode == "serverless"
 
@@ -85,6 +87,12 @@ locals {
     for k, e in var.endpoints : k if contains(["none", "require"], e.ssl_mode)
   ]
 
+  # Oracle verifies against a wallet; a PEM-only certificate is the usual slip.
+  oracle_endpoints_with_pem = [
+    for k, e in var.endpoints : k
+    if e.engine == "oracle" && e.ssl_mode == "verify-ca" && e.certificate_key != "" && try(var.certificates[e.certificate_key].wallet, "") == ""
+  ]
+
   cleartext_endpoints = [
     for k, e in var.endpoints : k if e.ssl_mode == "none"
   ]
@@ -116,6 +124,25 @@ locals {
     if !try(local.task_settings_merged[k].ValidationSettings.EnableValidation, true)
   ]
 
+  # Severity per task, from the MERGED settings: raw_overrides replaces
+  # LogComponents wholesale, so the typed log_level is not what DMS runs with.
+  task_log_severities = {
+    for k, t in var.tasks : k => distinct([
+      for c in try(local.task_settings_merged[k].Logging.LogComponents, []) : try(c.Severity, "LOGGER_SEVERITY_DEFAULT")
+    ])
+  }
+
+  debug_logging_tasks = [
+    for k, sev in local.task_log_severities : k
+    if length(setintersection(toset(sev), toset(["LOGGER_SEVERITY_DEBUG", "LOGGER_SEVERITY_DETAILED_DEBUG"]))) > 0
+  ]
+
+  # Task IDs DMS uses in CloudWatch: the resource ID at the end of the task
+  # ARN, not the task name.
+  task_resource_ids = {
+    for k, t in aws_dms_replication_task.this : k => element(split(":", t.replication_task_arn), 6)
+  }
+
   unlogged_tasks = [
     for k, t in var.tasks : k
     if !try(local.task_settings_merged[k].Logging.EnableLogging, true)
@@ -134,6 +161,73 @@ locals {
     for k, t in var.tasks : k
     if try(local.task_settings_merged[k].TargetMetadata.LimitedSizeLobMode, false)
   ]
+
+  # DMS does not support full LOB mode for an S3 target (INLINE is full LOB
+  # mode with a threshold). Read from the merged settings.
+  tasks_with_full_lob_to_s3 = [
+    for k, t in var.tasks : k
+    if contains(keys(var.s3_targets), t.target_endpoint) && try(local.task_settings_merged[k].TargetMetadata.FullLobMode, false)
+  ]
+
+  # -------------------------------------------------------------------------
+  # Data validation
+  #
+  # DMS validates only these engines (DMS user guide, "AWS DMS data
+  # validation"); anywhere else EnableValidation = true is accepted and does
+  # nothing, so a governance field that trusted the flag would certify a
+  # reconciliation that never happens.
+  # -------------------------------------------------------------------------
+
+  validation_source_engines = ["oracle", "postgres", "aurora-postgresql", "mysql", "mariadb", "aurora", "sqlserver", "db2"]
+  validation_target_engines = concat(local.validation_source_engines, ["redshift"])
+
+  # An S3 target validates only from parquet, with a timestamp column and a
+  # date partition that has a day component.
+  s3_targets_validatable = {
+    for k, s in var.s3_targets : k => (
+      s.data_format == "parquet" && s.timestamp_column_name != "" && s.date_partition_enabled && strcontains(s.date_partition_sequence, "DD")
+    )
+  }
+
+  task_validation_feasible = {
+    for k, t in var.tasks : k => (
+      contains(local.validation_source_engines, try(var.endpoints[t.source_endpoint].engine, "")) && (
+        contains(keys(var.s3_targets), t.target_endpoint)
+        ? try(local.s3_targets_validatable[t.target_endpoint], false)
+        : contains(local.validation_target_engines, try(var.endpoints[t.target_endpoint].engine, ""))
+      )
+    )
+  }
+
+  tasks_whose_validation_cannot_run = [
+    for k, t in var.tasks : k
+    # A task naming a missing endpoint, or one in the wrong direction, is
+    # refused on its own; it is not also reported here.
+    if contains(concat(local.tasks_with_unknown_endpoints, local.tasks_with_wrong_direction), k) ? false : (try(local.task_settings_merged[k].ValidationSettings.EnableValidation, false) ? !local.task_validation_feasible[k] : false)
+  ]
+
+  validation_tasks_with_bad_parent = concat(
+    [for k, v in var.validation_tasks : "${k} (cdc mode needs a parent that reads changes)" if v.mode == "cdc" && !contains(["cdc", "full-load-and-cdc"], try(var.tasks[v.task].migration_type, ""))],
+    [for k, v in var.validation_tasks : "${k} (DMS cannot validate ${v.task}'s source or target)" if !try(local.task_validation_feasible[v.task], false)],
+    [for k, v in var.validation_tasks : "${k} (same key as a task)" if contains(keys(var.tasks), k)],
+  )
+
+  # The parent's merged settings, made safe and turned into a validator: it
+  # never prepares the target, whatever the parent does to it.
+  validation_task_settings_json = {
+    for k, v in var.validation_tasks : k => jsonencode(merge(try(local.task_settings_merged[v.task], {}), {
+      FullLoadSettings = merge(try(local.task_settings_merged[v.task].FullLoadSettings, {}), {
+        TargetTablePrepMode = "DO_NOTHING"
+      })
+      ValidationSettings = merge(try(local.task_settings_merged[v.task].ValidationSettings, {}), {
+        EnableValidation     = true
+        ValidationOnly       = true
+        ThreadCount          = v.threads
+        FailureMaxCount      = v.failure_max
+        TableFailureMaxCount = v.table_failure_max
+      })
+    }))
+  }
 
   # A task referring to an endpoint key that does not exist. Terraform would
   # otherwise report this as a confusing map lookup failure.
@@ -290,6 +384,15 @@ locals {
   }
 
   # -------------------------------------------------------------------------
+  # Premigration assessment
+  # -------------------------------------------------------------------------
+
+  assessment_enabled     = local.create && local.provisioned && var.premigration_assessment.enabled
+  create_assessment_role = local.assessment_enabled && var.premigration_assessment.create_role
+  assessment_role_arn    = var.premigration_assessment.create_role ? try(aws_iam_role.assessment[0].arn, "") : var.premigration_assessment.role_arn
+  assessment_encryption  = var.premigration_assessment.kms_key_arn != "" ? "SSE_KMS" : "SSE_S3"
+
+  # -------------------------------------------------------------------------
   # Naming
   # -------------------------------------------------------------------------
 
@@ -427,8 +530,6 @@ locals {
       description = s.description
     }
   ]
-
-  has_sql_scripts = length(local.pre_data_scripts) + length(local.post_data_scripts) > 0
 
   # DO_NOTHING means DMS creates nothing on the target. With no pre-data script
   # declared either, the tables have to already exist - and if they do not, the
