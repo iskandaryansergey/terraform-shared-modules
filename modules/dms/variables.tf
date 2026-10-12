@@ -76,6 +76,7 @@ variable "acknowledged_checks" {
         "minor_upgrades_do_not_fight_the_pin",
         "oracle_ssl_uses_a_wallet",
         "validation_is_claimed_where_it_cannot_run",
+        "account_service_roles_exist",
       ], c)
     ])
     error_message = "acknowledged_checks names a check that does not exist. The check names are the check blocks in observability.tf, listed in the README."
@@ -340,7 +341,10 @@ variable "endpoints" {
     With secret_arn, the secret DMS reads holds host, port, username and
     password - give DMS its own database user and its own secret. The
     RDS/Aurora-managed master secret is not usable here. database_name is not
-    in that secret and is always sent from this variable.
+    in that secret and is sent from this variable - except for aurora, mysql
+    and mariadb on the secret path, where the provider does not send it. For
+    the MySQL family leave database_name empty: when DMS does receive it, it
+    replicates every table into that one database.
 
     S3 targets are a different resource with a different shape; use s3_targets.
   EOT
@@ -350,8 +354,9 @@ variable "endpoints" {
     # With secret_arn set, server_name and port do NOT reach DMS - the secret
     # carries host and port. They are still worth filling in:
     # output.network_contract is built from them, and that is what the firewall
-    # request is made of. database_name always reaches DMS: the secret does not
-    # carry it, and Oracle needs it (SID or service name) on either path.
+    # request is made of. database_name reaches DMS on both paths except for
+    # the MySQL family on the secret path (see the description). Oracle needs
+    # it (SID or service name) on either path.
     server_name   = optional(string, "")
     port          = optional(number, 0)
     database_name = optional(string, "")
@@ -394,7 +399,9 @@ variable "endpoints" {
       map_boolean_as_boolean       = optional(bool, true)
       fail_tasks_on_lob_truncation = optional(bool, true)
       after_connect_script         = optional(string, "")
-      execute_timeout              = optional(number, 0)
+      # Seconds. Sent as given: the provider sends 0 for an unset value rather
+      # than leaving DMS's default (60), so the default is spelled out here.
+      execute_timeout = optional(number, 60)
     }), {})
   }))
   default  = {}
@@ -418,10 +425,10 @@ variable "endpoints" {
     condition = alltrue([
       for k, e in var.endpoints : contains([
         "aurora", "aurora-postgresql", "mariadb", "mysql", "oracle", "postgres",
-        "sqlserver", "db2", "db2-zos", "sybase", "redshift", "docdb", "neptune",
+        "sqlserver", "db2", "db2-zos", "sybase", "redshift",
       ], e.engine)
     ])
-    error_message = "endpoints[*].engine must be a relational engine DMS supports: aurora, aurora-postgresql, mariadb, mysql, oracle, postgres, sqlserver, db2, db2-zos, sybase, redshift, docdb, neptune. S3 targets go in s3_targets."
+    error_message = "endpoints[*].engine must be a relational engine DMS supports: aurora, aurora-postgresql, mariadb, mysql, oracle, postgres, sqlserver, db2, db2-zos, sybase, redshift. S3 targets go in s3_targets. docdb and neptune are not supported: the provider drops the Secrets Manager fields for them, so the endpoint would reach DMS with no credentials."
   }
 
   validation {
@@ -588,7 +595,11 @@ variable "s3_targets" {
 
     date_partition_enabled  = optional(bool, true)
     date_partition_sequence = optional(string, "YYYYMMDD")
-    cdc_path                = optional(string, "cdc")
+    # Empty: CDC files land beside the full load under the date partitions.
+    # DMS refuses CdcPath together with date partitioning or Glue catalog
+    # generation; it belongs with PreserveTransactions, which the module does
+    # not expose.
+    cdc_path = optional(string, "")
 
     include_op_for_full_load = optional(bool, true)
     timestamp_column_name    = optional(string, "dms_ingest_ts")
@@ -637,6 +648,13 @@ variable "s3_targets" {
       for k, s in var.s3_targets : contains(["parquet-1-0", "parquet-2-0"], s.parquet_version)
     ])
     error_message = "s3_targets[*].parquet_version must be parquet-1-0 or parquet-2-0."
+  }
+
+  validation {
+    condition = alltrue([
+      for k, s in var.s3_targets : s.cdc_path == "" || !(s.date_partition_enabled || s.glue_catalog_generation)
+    ])
+    error_message = "s3_targets[*].cdc_path cannot be combined with date_partition_enabled or glue_catalog_generation - DMS does not support either combination. Leave cdc_path empty."
   }
 
   validation {
@@ -709,12 +727,22 @@ variable "tasks" {
     modification of it - set it back to false (or remove the task) once the
     task is stopped on purpose, for example after cutover.
 
+    Applying ANY change to a running task (table_mappings, settings,
+    migration_type, the CDC start point) stops it first - the API cannot
+    modify a running task. With start = false it is then left stopped and the
+    apply reports success. Do not apply while a task you started from the
+    console or CLI is running; if you must, resume it afterwards
+    (start-replication-task --start-replication-task-type resume-processing).
+
     cdc_start_time and cdc_start_position are refused in serverless mode: the
     replication config has no such argument.
 
     table_mappings is JSON. It must contain at least one selection rule: a
     mapping with only transformation rules matches no tables, and the task then
-    completes successfully having moved nothing.
+    completes successfully having moved nothing. In table and schema names "%"
+    matches any run of characters and "_" matches ANY single character, so an
+    exclude on STG_% also drops STGX...; escape a literal underscore (on
+    Oracle, with the selection rule's escape character).
   EOT
   type = map(object({
     source_endpoint = string
@@ -745,8 +773,18 @@ variable "tasks" {
 
       target_table_prep_mode = optional(string, "DO_NOTHING")
       stop_after_full_load   = optional(bool, false)
-      max_full_load_subtasks = optional(number, 8)
-      commit_rate            = optional(number, 10000)
+      # Pauses a full-load-and-cdc task after the load and BEFORE the changes
+      # cached during it are applied: the window to build the indexes CDC
+      # needs (see output.migration_plan). Resume the task to continue.
+      stop_before_cached_changes = optional(bool, false)
+      # Oracle source with CDC: a transaction still open
+      # transaction_consistency_timeout seconds after the task starts is
+      # skipped by DMS, and its changes never reach the target. true fails the
+      # task instead, so the start is retried rather than silently lossy.
+      fail_on_open_transaction        = optional(bool, true)
+      transaction_consistency_timeout = optional(number, 600)
+      max_full_load_subtasks          = optional(number, 8)
+      commit_rate                     = optional(number, 10000)
 
       lob_mode          = optional(string, "LIMITED")
       lob_max_size_kb   = optional(number, 32)
@@ -838,6 +876,13 @@ variable "tasks" {
       contains(["LIMITED", "FULL", "INLINE", "NONE"], t.settings.lob_mode)
     ])
     error_message = "tasks[*].settings.lob_mode must be LIMITED, FULL, INLINE, or NONE."
+  }
+
+  validation {
+    condition = alltrue([
+      for k, t in var.tasks : !(t.settings.batch_apply_enabled && contains(["FULL", "INLINE"], t.settings.lob_mode))
+    ])
+    error_message = "tasks[*].settings.batch_apply_enabled requires lob_mode LIMITED or NONE - DMS supports batch apply with LOB columns only in limited LOB mode."
   }
 
   validation {
@@ -941,6 +986,20 @@ variable "tasks" {
       t.settings.max_full_load_subtasks >= 1 && t.settings.max_full_load_subtasks <= 49
     ])
     error_message = "tasks[*].settings.max_full_load_subtasks must be between 1 and 49."
+  }
+
+  validation {
+    condition = alltrue([
+      for k, t in var.tasks : !(t.settings.stop_after_full_load && t.settings.stop_before_cached_changes)
+    ])
+    error_message = "tasks[*].settings: set at most one of stop_after_full_load and stop_before_cached_changes - they stop the task at two different points after the full load."
+  }
+
+  validation {
+    condition = alltrue([
+      for k, t in var.tasks : t.settings.transaction_consistency_timeout >= 0
+    ])
+    error_message = "tasks[*].settings.transaction_consistency_timeout must be 0 or more seconds."
   }
 }
 
@@ -1188,6 +1247,18 @@ variable "sns_topic_arn" {
   }
 }
 
+variable "sns_topic_kms_key_arn" {
+  description = "The customer-managed key the SNS topic is encrypted with, if any. The module does not use it; it lists what the key policy must allow in output.kms_key_policy_requirements, because a topic whose key DMS, CloudWatch and EventBridge cannot use drops every notification without an error anywhere."
+  type        = string
+  default     = ""
+  nullable    = false
+
+  validation {
+    condition     = var.sns_topic_kms_key_arn == "" ? true : can(regex("^arn:aws[a-z-]*:kms:[a-z0-9-]+:[0-9]{12}:(key|alias)/", var.sns_topic_kms_key_arn))
+    error_message = "sns_topic_kms_key_arn must be a KMS key or alias ARN."
+  }
+}
+
 variable "create_event_subscriptions" {
   description = "Subscribe to DMS instance and task events. No-op without sns_topic_arn."
   type        = bool
@@ -1198,8 +1269,10 @@ variable "create_event_subscriptions" {
 variable "instance_event_categories" {
   description = "Replication instance event categories to notify on."
   type        = list(string)
-  default     = ["failure", "low storage", "maintenance", "configuration change"]
-  nullable    = false
+  # failover: multi_az defaults to true, and a failover mid-load is worth
+  # knowing about.
+  default  = ["failure", "low storage", "maintenance", "configuration change", "failover"]
+  nullable = false
 
   validation {
     condition = alltrue([
@@ -1327,7 +1400,7 @@ variable "create_account_service_roles" {
 }
 
 variable "permissions_boundary_arn" {
-  description = "Permissions boundary for every role this module creates."
+  description = "Permissions boundary for every role this module creates, except the account-wide dms-vpc-role and dms-cloudwatch-logs-role: those carry AWS-managed policies DMS needs in full."
   type        = string
   default     = ""
   nullable    = false

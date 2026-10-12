@@ -172,7 +172,13 @@ output "network_contract" {
     ]
 
     required_egress = concat(
-      [for k, e in var.endpoints : "${e.role}: ${e.server_name != "" ? e.server_name : "<server_name unset>"}:${e.port != 0 ? e.port : 0} from the replication instance"],
+      # server_name and port are optional on the secret path; without them the
+      # firewall request names the endpoint and says what is missing.
+      [for k, e in var.endpoints : (
+        e.server_name != "" && e.port != 0
+        ? "${e.role}: ${e.server_name}:${e.port} from the replication instance"
+        : "${e.role} ${k}: host and port are in its secret - set server_name and port on the endpoint so this request can name them"
+      )],
       ["443 -> the interface endpoints above"],
     )
 
@@ -183,6 +189,8 @@ output "network_contract" {
 
     notes = [
       "Interface endpoints need private DNS enabled, or DMS resolves the public name and the task hangs instead of erroring.",
+      "The interface endpoints' subnets must be the replication subnet group's subnets (AWS DMS VPC endpoint documentation).",
+      "Secrets Manager from a private subnet: if the secretsmanager endpoint's private DNS does not resolve from this VPC (a centralised endpoint in a hub VPC, or custom dns_name_servers), add the extra connection attribute secretsManagerEndpointOverride=<endpoint DNS name> to every endpoint with a secret - AWS's documented procedure. Otherwise the connection test times out and reads like a database problem.",
       "The interface endpoints' own security groups must allow 443 INBOUND from the replication instance's security group. \"No ingress\" above refers to the replication instance, and is routinely misread as \"no ingress rules anywhere\".",
       "The replication instance needs a route to BOTH databases. A source in another VPC or on-premises means VPC peering, Transit Gateway, Cloud WAN or VPN - DMS has no other path.",
       "DNS: an on-premises source hostname must RESOLVE from inside the VPC. That means Route 53 Resolver outbound endpoints with forwarding rules to the on-prem resolvers, or a private hosted zone. A name that only resolves on-premises fails as a connection timeout that reads like a firewall problem.",
@@ -195,7 +203,7 @@ output "network_contract" {
 
 output "account_prerequisites" {
   description = "Account-wide IAM roles DMS requires, which this module does not create by default. Fixed names, one set per account - create them once in the landing zone."
-  value = !local.create ? null : [
+  value = !local.create ? null : concat([
     {
       role    = "dms-vpc-role"
       policy  = "arn:${local.partition}:iam::aws:policy/service-role/AmazonDMSVPCManagementRole"
@@ -208,7 +216,17 @@ output "account_prerequisites" {
       created = var.create_account_service_roles
       why     = "Task logging needs it. Missing: tasks run, logging silently does nothing, and a failure has no detail behind it."
     },
-  ]
+    ], local.has_redshift_target ? [{
+      role    = "dms-access-for-endpoint"
+      policy  = "arn:${local.partition}:iam::aws:policy/service-role/AmazonDMSRedshiftS3Role"
+      created = var.create_account_service_roles
+      why     = "A Redshift target stages its load in S3 through this role. The console creates it; the API does not. Missing: the endpoint applies and the load fails."
+      }] : [], local.serverless || var.premigration_assessment.enabled ? [{
+      role    = "AWSServiceRoleForDMSServerless"
+      policy  = "service-linked (AWS managed)"
+      created = false
+      why     = "DMS creates this service-linked role the first time a serverless replication or a premigration assessment starts - if the principal starting it may call iam:CreateServiceLinkedRole. Under an SCP that denies it, create it once in advance: aws iam create-service-linked-role --aws-service-name dms.amazonaws.com"
+  }] : [])
 }
 
 # ---------------------------------------------------------------------------
@@ -223,7 +241,7 @@ output "migration_plan" {
     phase_1_pre_data = {
       when    = "before the task is started, once"
       run_by  = "your pipeline - the module does not execute SQL"
-      what    = "schemas, tables, types, sequences. The default target_table_prep_mode is DO_NOTHING, so DMS creates none of it."
+      what    = "schemas, tables with their primary keys, types, sequences. The default target_table_prep_mode is DO_NOTHING, so DMS creates none of it. Primary keys belong here: CDC applies changes as soon as each table finishes loading, and on a table without a key every UPDATE and DELETE is a full scan."
       scripts = local.pre_data_scripts
       example = length(local.pre_data_scripts) > 0 ? "psql -h <target-host> -d <db> -v ON_ERROR_STOP=1 -f ${local.pre_data_scripts[0].path}" : "no pre_data scripts declared - see sql_scripts"
     }
@@ -248,7 +266,7 @@ output "migration_plan" {
     phase_3_post_data = {
       when    = "after the full load completes and before cutover"
       run_by  = "your pipeline"
-      what    = "indexes, foreign keys, constraints, triggers, grants - built after the data so the load is not paying for index maintenance, and so constraints are not rejecting rows that arrive out of order"
+      what    = "secondary indexes, foreign keys, triggers, grants - built after the data so the load is not paying for index maintenance, and so foreign keys are not rejecting rows that arrive out of order. To build them before cached changes are applied, set settings.stop_before_cached_changes, run this, then resume the task."
       scripts = local.post_data_scripts
       example = length(local.post_data_scripts) > 0 ? "psql -h <target-host> -d <db> -v ON_ERROR_STOP=1 -f ${local.post_data_scripts[0].path}" : "no post_data scripts declared - see sql_scripts"
     }
@@ -301,6 +319,15 @@ output "verify_commands" {
     # on, and whether metrics reach CloudWatch at all from an isolated VPC.
     verify_endpoint_coverage = "aws cloudwatch list-metrics --namespace AWS/DMS --query 'Metrics[?MetricName==`CDCLatencyTarget`].Dimensions' --output json"
 
+    # Run when you start a task. A CDC alarm on a task that has never run is
+    # already in ALARM (no data is breaching), and an alarm only notifies on a
+    # state change - so a task that stalls before its first datapoint would
+    # say nothing. Setting OK here re-arms it: no data within 15 minutes turns
+    # it back to ALARM, and that change notifies.
+    arm_alarms = {
+      for k, t in local.cdc_tasks : k => "aws cloudwatch set-alarm-state --alarm-name ${var.name}-${k}-cdc-latency-target --state-value OK --state-reason 'task started' && aws cloudwatch set-alarm-state --alarm-name ${var.name}-${k}-cdc-latency-source --state-value OK --state-reason 'task started'"
+    }
+
     # The one that stops the bill after cutover.
     stop_task             = local.provisioned ? { for k, t in aws_dms_replication_task.this : k => "aws dms stop-replication-task --replication-task-arn ${t.replication_task_arn}" } : { for k, c in aws_dms_replication_config.this : k => "aws dms stop-replication --replication-config-arn ${c.arn}" }
     what_is_still_billing = "aws dms describe-replication-instances --query 'ReplicationInstances[].[ReplicationInstanceIdentifier,ReplicationInstanceClass,MultiAZ,ReplicationInstanceStatus]' --output table"
@@ -319,6 +346,7 @@ output "premigration_assessment" {
       "dms:StartReplicationTaskAssessmentRun, dms:DescribeReplicationTaskAssessmentRuns, dms:DescribeReplicationTaskIndividualAssessments on the tasks",
       "iam:PassRole on ${local.assessment_role_arn}",
       "s3:GetObject on the folder, to read the report",
+      "iam:CreateServiceLinkedRole for dms.amazonaws.com, once per account, unless AWSServiceRoleForDMSServerless already exists",
     ]
 
     commands = {
@@ -331,9 +359,75 @@ output "premigration_assessment" {
   }
 }
 
+output "deployer_requirements" {
+  description = "Permissions the principal running Terraform (the one that creates the tasks) needs beyond managing these resources. Null when there are none."
+  value = !local.create || length(local.tasks_validating_s3) == 0 ? null : {
+    s3_target_validation = {
+      tasks = local.tasks_validating_s3
+      why   = "S3 target validation runs Athena CTAS queries over the written parquet, once a day at 00:00 UTC, as the principal that created the task (DMS S3 validation documentation). Without these the validation state errors and the evidence it was meant to produce does not exist."
+      policy = jsonencode({
+        Version = "2012-10-17"
+        Statement = [
+          { Effect = "Allow", Action = ["athena:StartQueryExecution", "athena:GetQueryExecution", "athena:CreateWorkGroup"], Resource = "*" },
+          { Effect = "Allow", Action = ["glue:CreateDatabase", "glue:DeleteDatabase", "glue:GetDatabase", "glue:GetTables", "glue:CreateTable", "glue:DeleteTable", "glue:GetTable"], Resource = "*" },
+          { Effect = "Allow", Action = ["s3:GetBucketLocation", "s3:GetObject", "s3:ListBucketMultipartUploads", "s3:AbortMultipartUpload", "s3:ListMultipartUploadParts"], Resource = "*" },
+        ]
+      })
+    }
+  }
+}
+
+output "notification_requirements" {
+  description = "What sns_topic_arn's access policy must allow, as policy statements. The module subscribes DMS events, CloudWatch alarms and (serverless) an EventBridge rule to the topic but does not own it. A topic that denies them drops every notification while the subscriptions show active."
+  value = !local.create || var.sns_topic_arn == "" ? null : {
+    topic = var.sns_topic_arn
+    topic_policy_statements = concat(
+      length(aws_dms_event_subscription.instance) + length(aws_dms_event_subscription.task) == 0 ? [] : [{
+        Sid       = "DmsEventSubscriptions"
+        Effect    = "Allow"
+        Principal = { Service = "dms.amazonaws.com" }
+        Action    = "sns:Publish"
+        Resource  = var.sns_topic_arn
+        Condition = { ArnLike = { "aws:SourceArn" = "arn:${local.partition}:dms:${local.region}:${local.account_id}:es:*" } }
+      }],
+      local.alarms_enabled ? [{
+        Sid       = "CloudWatchAlarms"
+        Effect    = "Allow"
+        Principal = { Service = "cloudwatch.amazonaws.com" }
+        Action    = "sns:Publish"
+        Resource  = var.sns_topic_arn
+        Condition = { ArnLike = { "aws:SourceArn" = "arn:${local.partition}:cloudwatch:${local.region}:${local.account_id}:alarm:${var.name}-*" } }
+      }] : [],
+      length(aws_cloudwatch_event_rule.serverless_failures) == 0 ? [] : [{
+        Sid       = "EventBridgeServerlessFailures"
+        Effect    = "Allow"
+        Principal = { Service = "events.amazonaws.com" }
+        Action    = "sns:Publish"
+        Resource  = var.sns_topic_arn
+        Condition = { ArnEquals = { "aws:SourceArn" = aws_cloudwatch_event_rule.serverless_failures[0].arn } }
+      }],
+    )
+    encrypted_topic = var.sns_topic_kms_key_arn == "" ? "if the topic uses SSE-KMS with a customer key, set sns_topic_kms_key_arn: kms_key_policy_requirements then lists what the key must allow" : "see output.kms_key_policy_requirements for ${var.sns_topic_kms_key_arn}"
+    test            = "aws sns publish --topic-arn ${var.sns_topic_arn} --subject 'dms ${var.name}: test' --message 'notification path test' - proves the subscription end, not the publishers above"
+  }
+}
+
 output "kms_key_policy_requirements" {
   description = "What each customer-managed key's policy has to allow for this migration to work. The module uses the keys but cannot write their policies - hand this to the key owner before the first apply. A missing CloudWatch Logs grant fails the log group create part way through the apply."
   value = !local.create ? null : concat(
+    # The services that publish to an SSE-KMS topic need the topic's key.
+    # Without it SNS rejects the publish and nobody is told.
+    var.sns_topic_kms_key_arn == "" ? [] : [{
+      key = var.sns_topic_kms_key_arn
+      principal = join(", ", concat(
+        length(aws_dms_event_subscription.instance) + length(aws_dms_event_subscription.task) > 0 ? ["Service: dms.amazonaws.com"] : [],
+        local.alarms_enabled ? ["Service: cloudwatch.amazonaws.com"] : [],
+        length(aws_cloudwatch_event_rule.serverless_failures) > 0 ? ["Service: events.amazonaws.com"] : [],
+      ))
+      actions   = ["kms:GenerateDataKey*", "kms:Decrypt"]
+      condition = {}
+      why       = "the SNS topic is encrypted with this key; each service that publishes to it needs the key, or the notification is dropped."
+    }],
     var.kms_key_arn == "" ? [] : [{
       key       = var.kms_key_arn
       principal = "the principal running terraform"

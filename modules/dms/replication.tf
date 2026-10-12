@@ -18,9 +18,8 @@ resource "aws_dms_replication_subnet_group" "this" {
     }
 
     precondition {
-      # Every account needs dms-vpc-role before a subnet group can be created,
-      # and the error AWS returns for its absence names neither the role nor the
-      # fix.
+      # dms-vpc-role, which the subnet group also needs, is looked up by the
+      # account_service_roles_exist check in observability.tf.
       condition     = length(var.subnet_ids) >= 2
       error_message = "DMS needs at least two subnets in different availability zones, even for a single-AZ replication instance."
     }
@@ -71,6 +70,11 @@ resource "aws_dms_replication_subnet_group" "this" {
     precondition {
       condition     = length(local.validation_tasks_with_bad_parent) == 0
       error_message = "these validation tasks cannot run: ${join("; ", local.validation_tasks_with_bad_parent)}."
+    }
+
+    precondition {
+      condition     = length(local.tasks_with_batch_apply_to_s3) == 0
+      error_message = "these tasks enable batch apply into an S3 target: ${join(", ", local.tasks_with_batch_apply_to_s3)}. DMS does not support BatchApplyEnabled for S3 and documents that it can lose data. Set batch_apply_enabled = false for them."
     }
 
     precondition {

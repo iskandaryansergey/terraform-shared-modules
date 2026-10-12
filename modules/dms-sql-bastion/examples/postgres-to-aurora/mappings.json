@@ -1,0 +1,11 @@
+{
+  "rules": [
+    {
+      "rule-type": "selection",
+      "rule-id": "1",
+      "rule-name": "app",
+      "object-locator": { "schema-name": "app", "table-name": "%" },
+      "rule-action": "include"
+    }
+  ]
+}

@@ -1,0 +1,50 @@
+#!/bin/bash
+# dms-sql-bastion launcher. Rendered by Terraform, run by SSM Run Command as
+# root. It writes the runner and its configuration to a private directory and
+# hands the document parameters over as DMS_* environment variables; the
+# runner (scripts/runner.py) does the rest.
+#
+# The parameters are substituted by SSM as text before this runs. Each one is
+# constrained by allowedValues or allowedPattern in the document, so none of
+# them can contain a quote. Never write a double brace anywhere else in this
+# file or in the runner, comments included: SSM substitutes those too and
+# rejects the document for an undeclared parameter.
+set -euo pipefail
+umask 077
+
+command -v python3 >/dev/null 2>&1 || {
+  echo "FAILED: python3 is not installed on this AMI"
+  exit 4
+}
+
+export AWS_DEFAULT_REGION='${region}'
+export AWS_REGION='${region}'
+
+WORK=$(mktemp -d /tmp/dms-sql-launch.XXXXXX)
+trap 'rm -rf "$WORK"' EXIT
+
+cat >"$WORK/runner.py" <<'DMS_SQL_BASTION_RUNNER_PY'
+${runner_py}
+DMS_SQL_BASTION_RUNNER_PY
+
+cat >"$WORK/config.json" <<'DMS_SQL_BASTION_CONFIG_JSON'
+${config_json}
+DMS_SQL_BASTION_CONFIG_JSON
+
+export DMS_CONFIG="$WORK/config.json"
+export DMS_MODE='{{ Mode }}'
+export DMS_TARGET='{{ Target }}'
+export DMS_SCRIPT_KEY='{{ ScriptKey }}'
+export DMS_EXPECTED_SHA256='{{ ExpectedSha256 }}'
+export DMS_TRANSACTION='{{ Transaction }}'
+export DMS_VARIABLES='{{ Variables }}'
+export DMS_RUNBOOK='{{ Runbook }}'
+export DMS_MANIFEST_KEY='{{ ManifestKey }}'
+export DMS_START_AT='{{ StartAt }}'
+export DMS_DRY_RUN='{{ DryRun }}'
+export DMS_TIMEOUT_SECONDS='{{ StepTimeoutSeconds }}'
+
+set +e
+python3 "$WORK/runner.py"
+rc=$?
+exit "$rc"

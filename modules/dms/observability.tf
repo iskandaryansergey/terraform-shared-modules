@@ -278,17 +278,17 @@ check "somebody_hears_a_failed_task" {
   }
 }
 
-# Serverless gets no alarms, no event subscriptions and no log group from this
-# module - DMS event subscriptions only carry source types for replication
-# instances and tasks, and neither exists in that mode. Supplying an SNS topic
-# does not change it, so the check above would otherwise pass while nothing at
-# all is watching.
+# Serverless gets no latency alarms and no log group from this module. DMS
+# event subscriptions only carry source types for replication instances and
+# tasks; a serverless replication's failure is an EventBridge event instead,
+# which the rule below forwards. That covers a replication that FAILS, not one
+# that runs and falls behind, so the check still warns.
 check "serverless_replication_is_not_watched_by_this_module" {
   assert {
     condition = contains(local.acknowledged, "serverless_replication_is_not_watched_by_this_module") ? true : (
       !local.create ? true : local.provisioned
     )
-    error_message = "compute_mode is \"serverless\", and this module creates no alarms, no event subscriptions and no log group for it - every observability resource here is instance-scoped. A serverless replication that stops is invisible. Build monitoring on the AWS/DMS ReplicationConfigIdentifier dimension yourself, or use compute_mode = \"provisioned\" where the module can watch it."
+    error_message = "compute_mode is \"serverless\": the module forwards replication failures from EventBridge to sns_topic_arn (when set), but creates no latency alarms and no log group. A serverless replication that runs and falls behind is not alarmed. Build latency alarms on the AWS/DMS ReplicationConfigIdentifier dimension yourself, or use compute_mode = \"provisioned\"."
   }
 }
 
@@ -459,4 +459,51 @@ check "validation_is_claimed_where_it_cannot_run" {
     )
     error_message = "these tasks have validation on, but DMS cannot validate them: ${join(", ", local.tasks_whose_validation_cannot_run)}. DMS validates Oracle, PostgreSQL, MySQL/MariaDB/Aurora MySQL, SQL Server and Db2 LUW sources, the same targets plus Redshift, and S3 targets only as parquet with a timestamp column and a date partition by day. Reconcile another way, and turn validation off so governance does not report it."
   }
+}
+
+# DMS needs both roles by these exact names, and neither failure says so: a
+# missing dms-vpc-role fails the subnet group with an error naming neither the
+# role nor the fix, and a missing dms-cloudwatch-logs-role leaves the task log
+# group empty while the task runs - a task that moves nothing and logs nothing.
+# Looked up rather than assumed. The plan principal needs iam:GetRole; a
+# lookup that fails is reported as a warning, never an error.
+check "account_service_roles_exist" {
+  data "aws_iam_roles" "dms_service" {
+    name_regex = "^dms-(vpc|cloudwatch-logs)-role$|^dms-access-for-endpoint$"
+  }
+
+  assert {
+    # Nothing to look for when this module creates them.
+    condition = contains(local.acknowledged, "account_service_roles_exist") || !local.create || var.create_account_service_roles ? true : (
+      length(setsubtract(local.required_account_roles, data.aws_iam_roles.dms_service.names)) == 0
+    )
+    error_message = "missing from this account: ${join(", ", setsubtract(local.required_account_roles, data.aws_iam_roles.dms_service.names))}. Without dms-vpc-role the subnet group cannot be created; without dms-cloudwatch-logs-role tasks run with no logs at all; without dms-access-for-endpoint a Redshift target cannot stage its load. Create them once in the landing zone (see output.account_prerequisites), or set create_account_service_roles = true in exactly one module."
+  }
+}
+
+# A serverless replication that fails publishes an EventBridge event (source
+# aws.dms, category Failure) - the only failure signal that mode has. Matched
+# on this migration's replication config ARNs. The topic policy must let
+# events.amazonaws.com publish: see output.notification_requirements.
+resource "aws_cloudwatch_event_rule" "serverless_failures" {
+  count = local.create && local.serverless && var.sns_topic_arn != "" && var.create_event_subscriptions && length(var.tasks) > 0 ? 1 : 0
+
+  name        = "${var.name}-dms-replication-failures"
+  description = "DMS Serverless replication failures for the ${var.name} migration"
+
+  event_pattern = jsonencode({
+    source    = ["aws.dms"]
+    resources = [for k, c in aws_dms_replication_config.this : c.arn]
+    detail    = { category = ["Failure"] }
+  })
+
+  tags = local.common_tags
+}
+
+resource "aws_cloudwatch_event_target" "serverless_failures" {
+  count = length(aws_cloudwatch_event_rule.serverless_failures)
+
+  rule      = aws_cloudwatch_event_rule.serverless_failures[0].name
+  target_id = "sns"
+  arn       = var.sns_topic_arn
 }

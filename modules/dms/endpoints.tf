@@ -16,8 +16,9 @@ resource "aws_dms_endpoint" "this" {
   # the provider rejects those fields as conflicting. They stay in the variable
   # because output.network_contract still has to tell the network team which
   # host and port to open. The database name is NOT in the secret DMS reads
-  # (host, port, username, password): the provider sends database_name inside
-  # the engine settings on the secret path too, so it is always passed.
+  # (host, port, username, password). The provider sends database_name on the
+  # secret path for every engine EXCEPT the MySQL family (aurora, mysql,
+  # mariadb), whose secret branch carries only the secret fields.
   server_name   = each.value.secret_arn == "" && each.value.server_name != "" ? each.value.server_name : null
   port          = each.value.secret_arn == "" && each.value.port != 0 ? each.value.port : null
   database_name = each.value.database_name != "" ? each.value.database_name : null
@@ -52,7 +53,7 @@ resource "aws_dms_endpoint" "this" {
       map_boolean_as_boolean       = each.value.postgres.map_boolean_as_boolean
       fail_tasks_on_lob_truncation = each.value.postgres.fail_tasks_on_lob_truncation
       after_connect_script         = each.value.postgres.after_connect_script != "" ? each.value.postgres.after_connect_script : null
-      execute_timeout              = each.value.postgres.execute_timeout != 0 ? each.value.postgres.execute_timeout : null
+      execute_timeout              = each.value.postgres.execute_timeout
     }
   }
 
@@ -69,13 +70,26 @@ resource "aws_dms_endpoint" "this" {
       map_boolean_as_boolean       = each.value.postgres.map_boolean_as_boolean
       fail_tasks_on_lob_truncation = each.value.postgres.fail_tasks_on_lob_truncation
       after_connect_script         = each.value.postgres.after_connect_script != "" ? each.value.postgres.after_connect_script : null
-      execute_timeout              = each.value.postgres.execute_timeout != 0 ? each.value.postgres.execute_timeout : null
+      execute_timeout              = each.value.postgres.execute_timeout
     }
   }
 
   tags = merge(local.common_tags, { "EndpointRole" = each.value.role })
 
+  # The role's ARN alone does not order the endpoint after the role's policy;
+  # a task started on the first apply could reach for the secret before it is
+  # readable.
+  depends_on = [aws_iam_role_policy.endpoint_secret]
+
   lifecycle {
+    # The provider (5.x) sends postgres_settings on create only - its update
+    # path never reads them. Without this an edit to after_connect_script or
+    # the heartbeat applies "successfully", changes nothing in DMS, and plans
+    # the same diff forever. Replacing the endpoint is the only way the change
+    # lands; the plan then also shows every task on it being replaced, which
+    # is the true cost.
+    replace_triggered_by = [terraform_data.postgres_settings[each.key]]
+
     # The credential and transport gates are module-wide and live on the subnet
     # group, which exists in every compute mode - a precondition here would not
     # run for an S3-only migration.
@@ -84,6 +98,26 @@ resource "aws_dms_endpoint" "this" {
       error_message = "require_cmk = true but these endpoints resolve to the AWS-managed DMS key: ${join(", ", local.endpoints_without_cmk)}. Set kms_key_arn on the module or on the endpoint."
     }
   }
+}
+
+# The PostgreSQL settings each endpoint was created with, so a change to them
+# replaces the endpoint (see the lifecycle above). Empty for other engines, so
+# they never churn.
+resource "terraform_data" "postgres_settings" {
+  for_each = local.create ? var.endpoints : {}
+
+  # Only the fields the matching dynamic block sends, so editing a source-only
+  # knob on a target endpoint does not replace it.
+  # Each branch is encoded on its own: a conditional over two object shapes
+  # would convert both to a common type first.
+  input = !contains(["postgres", "aurora-postgresql"], each.value.engine) ? "" : sha256(
+    each.value.role == "source" ? jsonencode(each.value.postgres) : jsonencode({
+      map_boolean_as_boolean       = each.value.postgres.map_boolean_as_boolean
+      fail_tasks_on_lob_truncation = each.value.postgres.fail_tasks_on_lob_truncation
+      after_connect_script         = each.value.postgres.after_connect_script
+      execute_timeout              = each.value.postgres.execute_timeout
+    })
+  )
 }
 
 # ---------------------------------------------------------------------------
@@ -125,6 +159,9 @@ resource "aws_dms_s3_endpoint" "this" {
   glue_catalog_generation = each.value.glue_catalog_generation
 
   tags = merge(local.common_tags, { "EndpointRole" = "target" })
+
+  # Ordered after the policy, not just the role: the first write must not race it.
+  depends_on = [aws_iam_role_policy.s3_target]
 
   lifecycle {
     precondition {

@@ -130,6 +130,16 @@ module "migration" {
 
       ssl_mode        = "verify-full"
       certificate_key = "rds-ca"
+
+      # The target already has its foreign keys and triggers, and the full
+      # load runs tables in parallel in no set order: child rows arrive before
+      # their parents. This runs on every DMS connection and switches both off
+      # for DMS's sessions only. Set it before the first apply - changing it
+      # later replaces the endpoint and the task. The DMS user needs
+      # rds_superuser (or, on PostgreSQL 15+, SET on session_replication_role).
+      postgres = {
+        after_connect_script = "SET session_replication_role = replica;"
+      }
     }
   }
 
@@ -150,7 +160,8 @@ module "migration" {
 
       settings = {
         # The target is pre-created by the schema conversion step, with its own
-        # indexes and constraints. DO_NOTHING keeps them.
+        # indexes and constraints. DO_NOTHING keeps them; after_connect_script
+        # on the target endpoint stops the foreign keys rejecting the load.
         target_table_prep_mode = "DO_NOTHING"
 
         # Oracle LOBs: LIMITED is fast and truncates past the cap, FULL is
@@ -170,7 +181,10 @@ module "migration" {
         # batch_apply_enabled is the lever that actually moves CDC apply
         # throughput on a relational target. It batches changes instead of
         # applying them one transaction at a time, at the cost of applying them
-        # out of transactional order within a batch.
+        # out of transactional order within a batch. With it on, the module
+        # renders SUSPEND_TABLE for data and apply errors, so one bad row
+        # suspends its table instead of silently dropping the whole task to
+        # one-by-one apply.
         batch_apply_enabled = true
       }
     }

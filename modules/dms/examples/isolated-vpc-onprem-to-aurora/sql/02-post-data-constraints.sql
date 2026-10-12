@@ -1,7 +1,5 @@
--- post-data: applied after the full load, before cutover.
-
-ALTER TABLE core.customer ADD CONSTRAINT customer_pk PRIMARY KEY (customer_id);
-ALTER TABLE core.account  ADD CONSTRAINT account_pk  PRIMARY KEY (account_id);
+-- post-data: applied after the full load, before cutover. Primary keys are
+-- already in pre-data, so CDC has them from the first change.
 
 CREATE INDEX account_customer_ix ON core.account (customer_id);
 CREATE INDEX account_status_ix   ON core.account (status) WHERE status <> 'CLOSED';

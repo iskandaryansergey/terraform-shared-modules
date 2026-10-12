@@ -14,6 +14,15 @@ locals {
 
   acknowledged = toset(var.acknowledged_checks)
 
+  # A Redshift target stages through S3 with the fixed-name account role
+  # dms-access-for-endpoint, which the API path never creates for you.
+  has_redshift_target = anytrue([for k, e in var.endpoints : e.engine == "redshift" && e.role == "target"])
+
+  required_account_roles = concat(
+    ["dms-vpc-role", "dms-cloudwatch-logs-role"],
+    local.has_redshift_target ? ["dms-access-for-endpoint"] : [],
+  )
+
   provisioned = var.compute_mode == "provisioned"
   serverless  = var.compute_mode == "serverless"
 
@@ -88,7 +97,10 @@ locals {
   ]
 
   # Oracle verifies against a wallet; a PEM-only certificate is the usual slip.
-  oracle_endpoints_with_pem = [
+  # Endpoint keys only, but computed from certificates, which a caller often
+  # passes as sensitive: unwrapped so the check can name them.
+  oracle_endpoints_with_pem = try(nonsensitive(local.oracle_endpoints_with_pem_raw), local.oracle_endpoints_with_pem_raw)
+  oracle_endpoints_with_pem_raw = [
     for k, e in var.endpoints : k
     if e.engine == "oracle" && e.ssl_mode == "verify-ca" && e.certificate_key != "" && try(var.certificates[e.certificate_key].wallet, "") == ""
   ]
@@ -164,6 +176,20 @@ locals {
 
   # DMS does not support full LOB mode for an S3 target (INLINE is full LOB
   # mode with a threshold). Read from the merged settings.
+  # "BatchApply is not supported for an S3 endpoint ... might result in loss of
+  # data" (DMS S3 target documentation).
+  tasks_with_batch_apply_to_s3 = [
+    for k, t in var.tasks : k
+    if contains(keys(var.s3_targets), t.target_endpoint) && try(local.task_settings_merged[k].TargetMetadata.BatchApplyEnabled, false)
+  ]
+
+  # S3 target validation runs Athena queries as the principal that created the
+  # task - the Terraform role here, not the endpoint's role.
+  tasks_validating_s3 = [
+    for k, t in var.tasks : k
+    if contains(keys(var.s3_targets), t.target_endpoint) && try(local.task_settings_merged[k].ValidationSettings.EnableValidation, false)
+  ]
+
   tasks_with_full_lob_to_s3 = [
     for k, t in var.tasks : k
     if contains(keys(var.s3_targets), t.target_endpoint) && try(local.task_settings_merged[k].TargetMetadata.FullLobMode, false)
@@ -256,7 +282,12 @@ locals {
 
   # The components worth having in the log. Everything else is noise until you
   # are debugging, and DEBUG on all of them fills a log group fast.
-  log_components = ["SOURCE_UNLOAD", "SOURCE_CAPTURE", "TARGET_LOAD", "TARGET_APPLY", "TASK_MANAGER", "VALIDATOR"]
+  #
+  # VALIDATOR_EXT, not VALIDATOR: it is the id DMS stores and returns (AWS
+  # "Saving task settings" example; the provider's acceptance-test settings
+  # round-trip it). A component DMS drops would show as a diff on every plan,
+  # and every applied diff stops a running task.
+  log_components = ["SOURCE_UNLOAD", "SOURCE_CAPTURE", "TARGET_LOAD", "TARGET_APPLY", "TASK_MANAGER", "VALIDATOR_EXT"]
 
   task_settings_base = {
     for k, t in var.tasks : k => {
@@ -282,9 +313,9 @@ locals {
         TargetTablePrepMode             = t.settings.target_table_prep_mode
         CreatePkAfterFullLoad           = false
         StopTaskCachedChangesApplied    = t.settings.stop_after_full_load
-        StopTaskCachedChangesNotApplied = false
+        StopTaskCachedChangesNotApplied = t.settings.stop_before_cached_changes
         MaxFullLoadSubTasks             = t.settings.max_full_load_subtasks
-        TransactionConsistencyTimeout   = 600
+        TransactionConsistencyTimeout   = t.settings.transaction_consistency_timeout
         CommitRate                      = t.settings.commit_rate
       }
 
@@ -327,8 +358,12 @@ locals {
         t.settings.validation_mode != "" ? { ValidationMode = t.settings.validation_mode } : {},
       )
 
+      # With batch apply on, a data or apply error under LOG_ERROR switches the
+      # task to one-by-one apply for the rest of its life - CDC latency climbs
+      # and nothing fails. SUSPEND_TABLE confines the damage to the one table,
+      # as the DMS TargetMetadata documentation recommends.
       ErrorBehavior = {
-        DataErrorPolicy               = "LOG_ERROR"
+        DataErrorPolicy               = t.settings.batch_apply_enabled ? "SUSPEND_TABLE" : "LOG_ERROR"
         DataTruncationErrorPolicy     = "LOG_ERROR"
         DataErrorEscalationPolicy     = "SUSPEND_TABLE"
         DataErrorEscalationCount      = 0
@@ -339,16 +374,18 @@ locals {
         RecoverableErrorInterval      = 5
         RecoverableErrorThrottling    = true
         RecoverableErrorThrottlingMax = 1800
-        ApplyErrorDeletePolicy        = "IGNORE_RECORD"
-        ApplyErrorInsertPolicy        = "LOG_ERROR"
-        ApplyErrorUpdatePolicy        = "LOG_ERROR"
-        ApplyErrorEscalationPolicy    = "LOG_ERROR"
-        ApplyErrorEscalationCount     = t.settings.apply_error_max
-        FullLoadIgnoreConflicts       = true
+        ApplyErrorDeletePolicy        = t.settings.batch_apply_enabled ? "SUSPEND_TABLE" : "IGNORE_RECORD"
+        ApplyErrorInsertPolicy        = t.settings.batch_apply_enabled ? "SUSPEND_TABLE" : "LOG_ERROR"
+        ApplyErrorUpdatePolicy        = t.settings.batch_apply_enabled ? "SUSPEND_TABLE" : "LOG_ERROR"
+        # apply_error_max only means something with a policy that acts on it:
+        # under LOG_ERROR reaching the count changes nothing.
+        ApplyErrorEscalationPolicy = t.settings.apply_error_max > 0 ? "STOP_TASK" : "LOG_ERROR"
+        ApplyErrorEscalationCount  = t.settings.apply_error_max
+        FullLoadIgnoreConflicts    = true
         # The runtime half of the "selection rule matched nothing" trap: without
         # this the task starts, captures no tables, and reports success.
         FailOnNoTablesCaptured               = true
-        FailOnTransactionConsistencyBreached = false
+        FailOnTransactionConsistencyBreached = t.settings.fail_on_open_transaction
       }
 
       ChangeProcessingDdlHandlingPolicy = {
@@ -421,14 +458,24 @@ locals {
         why  = "CDC reads redo. Once an archived log is gone the task cannot resume and the full load starts again."
       },
       {
-        what = "Database-level minimal supplemental logging, plus PRIMARY KEY logging on every migrated table"
-        how  = "ALTER DATABASE ADD SUPPLEMENTAL LOG DATA; ALTER TABLE <t> ADD SUPPLEMENTAL LOG DATA (PRIMARY KEY) COLUMNS;"
+        what = "Database-level minimal supplemental logging, plus PRIMARY KEY logging on every migrated table - ALL COLUMNS logging on a table with neither a primary key nor a unique index"
+        how  = "ALTER DATABASE ADD SUPPLEMENTAL LOG DATA; ALTER TABLE <t> ADD SUPPLEMENTAL LOG DATA (PRIMARY KEY) COLUMNS; for a keyless table: ALTER TABLE <t> ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS;"
         why  = "Without it an UPDATE arrives with no way to identify the row, and DMS applies it to the wrong one or drops it."
       },
       {
-        what = "Grants for the DMS user: SELECT ANY TRANSACTION, SELECT on V_$ views, and EXECUTE on DBMS_LOGMNR"
-        how  = "see the DMS Oracle source documentation for the exact grant list"
+        what = "Read access for the DMS user: CREATE SESSION, and SELECT on every migrated table (or SELECT ANY TABLE)"
+        how  = "GRANT CREATE SESSION TO <dms_user>; GRANT SELECT ON <schema>.<table> TO <dms_user>; -- per table, or GRANT SELECT ANY TABLE TO <dms_user>;"
+        why  = "The connection test does not read your tables. Without SELECT the task starts and the tables sit at 0 rows or go to error."
+      },
+      {
+        what = "LogMiner grants for CDC: SELECT ANY TRANSACTION, SELECT on the V_$ views DMS reads, EXECUTE on DBMS_LOGMNR, and LOGMINING on 12c and later"
+        how  = "GRANT SELECT ANY TRANSACTION TO <dms_user>; GRANT EXECUTE ON DBMS_LOGMNR TO <dms_user>; GRANT LOGMINING TO <dms_user>; plus the V_$ view grants listed in the DMS Oracle source documentation"
         why  = "LogMiner cannot start without them, and the task fails at first CDC read rather than at connection test."
+      },
+      {
+        what = "EXECUTE on SYS.DBMS_CRYPTO, when validation is enabled"
+        how  = "GRANT EXECUTE ON SYS.DBMS_CRYPTO TO <dms_user>;"
+        why  = "DMS validates Oracle rows with DBMS_CRYPTO. Without it validation errors and the evidence it was meant to produce does not exist."
       },
     ]
     postgres = [
@@ -438,9 +485,19 @@ locals {
         why  = "Without logical WAL there is no change stream at all; the task connects, then fails at CDC start."
       },
       {
-        what = "A role with rds_replication (RDS) or REPLICATION (self-managed)"
-        how  = "GRANT rds_replication TO <dms_user>;"
-        why  = "Creating the replication slot is a privileged operation."
+        what = "A role with rds_superuser and rds_replication (RDS/Aurora) or REPLICATION (self-managed)"
+        how  = "GRANT rds_superuser, rds_replication TO <dms_user>;"
+        why  = "Creating the replication slot is a privileged operation, and DMS documents both roles for an RDS or Aurora source."
+      },
+      {
+        what = "A primary key on every table captured by CDC"
+        how  = "SELECT n.nspname, c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relkind = 'r' AND n.nspname = '<schema>' AND NOT EXISTS (SELECT 1 FROM pg_constraint p WHERE p.conrelid = c.oid AND p.contype = 'p');"
+        why  = "DMS ignores UPDATE and DELETE on a table without a primary key - silently. The full load is complete and the target diverges from the first change."
+      },
+      {
+        what = "The heartbeat schema (postgres.heartbeat_schema, default awsdms), existing and writable by the DMS user"
+        how  = "CREATE SCHEMA IF NOT EXISTS awsdms; GRANT USAGE, CREATE ON SCHEMA awsdms TO <dms_user>;"
+        why  = "The heartbeat is what keeps the slot advancing on a quiet source. If DMS cannot create its table there, the heartbeat silently does not run and WAL accumulates."
       },
       {
         what = "A plan for the replication slot when the task stops"
@@ -484,8 +541,6 @@ locals {
     db2-zos           = []
     sybase            = []
     redshift          = []
-    docdb             = []
-    neptune           = []
   }
 
   # mariadb and aurora flavours share their upstream engine's requirements.

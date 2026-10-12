@@ -65,7 +65,7 @@
         "Severity": "LOGGER_SEVERITY_DEFAULT"
       },
       {
-        "Id": "VALIDATOR",
+        "Id": "VALIDATOR_EXT",
         "Severity": "LOGGER_SEVERITY_DEFAULT"
       }
     ]

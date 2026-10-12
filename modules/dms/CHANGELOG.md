@@ -42,7 +42,7 @@ Capabilities:
   `task_settings_json`, `governance`.
 - Account-wide service roles (`dms-vpc-role`, `dms-cloudwatch-logs-role`),
   off by default (`create_account_service_roles`).
-- Advisory checks, 18 in all, accepted individually with `acknowledged_checks`
+- Advisory checks, 19 in all, accepted individually with `acknowledged_checks`
   and listed in `output.governance.acknowledged_checks`.
 
 Validation-only tasks and validation posture:
@@ -79,6 +79,49 @@ Premigration assessment and key policies:
   assessment key).
 - `log_group_skip_destroy` (default `true`): teardown keeps the task log group.
 - Output `task_resource_ids`.
+
+Runtime safety (from a review of what plans cleanly and then fails in DMS):
+
+- `settings.stop_before_cached_changes` (`StopTaskCachedChangesNotApplied`):
+  pause a full-load-and-cdc task after the load, before cached changes apply,
+  to build the indexes CDC needs.
+- `settings.fail_on_open_transaction` (default `true`) and
+  `settings.transaction_consistency_timeout` (default 600): an Oracle
+  transaction still open at CDC start fails the task instead of being skipped.
+- Check `account_service_roles_exist`: looks up `dms-vpc-role` and
+  `dms-cloudwatch-logs-role` and warns when either is missing. Without the
+  logs role a task runs with an empty log group. Needs `iam:ListRoles` on the
+  plan principal. With a Redshift target it also requires
+  `dms-access-for-endpoint`.
+
+Notifications and account prerequisites:
+
+- `notification_requirements`: the SNS topic-policy statements DMS
+  (`dms.amazonaws.com`), CloudWatch alarms (`cloudwatch.amazonaws.com`) and,
+  in serverless mode, EventBridge (`events.amazonaws.com`) need, each scoped by
+  `aws:SourceArn`. Also a test command.
+- `sns_topic_kms_key_arn`: an SSE-KMS topic's key. `kms_key_policy_requirements`
+  then lists the publishers that need `kms:GenerateDataKey*` and `kms:Decrypt`
+  on it.
+- Serverless mode: an EventBridge rule (source `aws.dms`, category `Failure`,
+  this migration's replication config ARNs) forwards replication failures to
+  `sns_topic_arn`. The serverless check now says what is still missing:
+  latency alarms and a log group.
+- `verify_commands.arm_alarms`: resets each CDC alarm to OK when a task
+  starts. A CDC alarm on a task that has never run is already in ALARM, and an
+  alarm only notifies on a change of state. The RUNBOOK names it as a step.
+- `account_prerequisites`: `dms-access-for-endpoint` with a Redshift target
+  (created by `create_account_service_roles`, with `AmazonDMSRedshiftS3Role`),
+  and `AWSServiceRoleForDMSServerless` in serverless mode or with
+  premigration assessments. The assessment operator permissions add
+  `iam:CreateServiceLinkedRole`.
+- `deployer_requirements`: the Athena, Glue and S3 permissions S3 target
+  validation needs on the principal that creates the task.
+
+S3 targets:
+
+- `glue_catalog_generation = true` adds the Glue, Athena and S3 read
+  permissions the DMS documentation lists to the target's role.
 
 ### Fixed
 
@@ -128,6 +171,53 @@ Premigration assessment and key policies:
   `create = false` or a destroy run in the same workspace; `COSTS.md`
   arithmetic is corrected and its prices carry their pull date.
 
+- PostgreSQL endpoints are replaced when their `postgres` block changes.
+  Provider 5.x sends `postgres_settings` on create only, so an edit to
+  `after_connect_script` or the heartbeat applied cleanly, changed nothing in
+  DMS, and planned the same diff forever. The replacement also replaces every
+  task on the endpoint; set the block before the first apply.
+- With `batch_apply_enabled`, data and apply errors render `SUSPEND_TABLE`. Under
+  `LOG_ERROR` one bad row switched the task to one-by-one apply for good.
+  `batch_apply_enabled` with `lob_mode` `FULL` or `INLINE` is refused.
+- `source_prerequisites`: Oracle now lists `CREATE SESSION`, `SELECT` on the
+  migrated tables, `LOGMINING`, `DBMS_CRYPTO` for validation and ALL COLUMNS
+  supplemental logging for keyless tables; PostgreSQL lists `rds_superuser` and
+  a primary key on every captured table (DMS ignores UPDATE and DELETE without
+  one).
+- The isolated example creates primary keys in pre-data, not post-data: CDC
+  starts applying as each table finishes loading, and without a key every
+  UPDATE and DELETE is a full scan. Oracle `DATE` columns are `timestamp(0)`.
+- The Oracle example sets `after_connect_script` on the target, whose foreign
+  keys otherwise reject the parallel full load. The serverless example no
+  longer sets `slot_name`, which needs a pre-created slot and a CDC start
+  position serverless cannot take.
+- RUNBOOK: reloading a table under `DO_NOTHING` truncates it first and needs a
+  running task; `RecoverableErrorCount = -1` is described as the DMS default
+  (bounded retries for most errors), not retry forever; the privilege for
+  `session_replication_role` is named.
+- Comments and documentation no longer claim `database_name` reaches DMS on the
+  secret path for the MySQL family: the provider does not send it there.
+- Validator logging uses `VALIDATOR_EXT`, the component id DMS stores and
+  returns. A component DMS drops would show as a diff on every plan, and every
+  applied diff stops a running task.
+- `apply_error_max` now acts: above 0 it sets `ApplyErrorEscalationPolicy` to
+  `STOP_TASK`. Under the previous `LOG_ERROR`, reaching the count changed
+  nothing.
+- Endpoints are ordered after their roles' inline policies, not only the
+  roles. A task started on the first apply could otherwise race the secret
+  policy.
+- `network_contract.required_egress` names the endpoint and what to fill in
+  when `server_name` or `port` is unset, instead of printing `:0`. Its notes
+  add the Secrets Manager endpoint override for private subnets and the rule
+  that VPC endpoint subnets match the replication subnet group.
+- The `oracle_ssl_uses_a_wallet` check no longer warns about sensitive values
+  when `certificates` is passed as sensitive.
+- `source_prerequisites` (PostgreSQL) lists the heartbeat schema. The
+  `table_mappings` description warns that `_` is a single-character wildcard.
+- RUNBOOK: re-arm the alarms and check the notification path at the first
+  start; adopt a kept `dms-tasks-<name>` log group with an `import` block
+  before re-applying under the same name.
+
 ### Changed
 
 - **BREAKING (default):** `auto_minor_version_upgrade` defaults to `false`. A
@@ -153,3 +243,20 @@ Premigration assessment and key policies:
   task name to the task resource ID, so existing alarms are updated in place.
 - The role trust `aws:SourceArn` on the endpoint-secret and S3-target roles
   changes to the `dms:<region>:<account>:*` form, updated in place.
+- **BREAKING (default):** `s3_targets[*].cdc_path` defaults to `""` instead of
+  `"cdc"`. DMS does not support CdcPath with date partitioning (the default) or
+  Glue catalog generation; that combination is now refused at plan.
+- **BREAKING (default):** `FailOnTransactionConsistencyBreached` is `true`
+  (was `false`). See `settings.fail_on_open_transaction`.
+- **BREAKING (validation):** `docdb` and `neptune` endpoints are refused.
+  Provider 5.x drops the Secrets Manager fields for them, so they reached DMS
+  without credentials.
+- **BREAKING (default):** `endpoints[*].postgres.execute_timeout` defaults to
+  60 (the DMS default) instead of 0. The provider sent 0 for the old unset
+  value.
+- **BREAKING (default):** `instance_event_categories` adds `failover`.
+- **BREAKING (validation):** `batch_apply_enabled` into an S3 target is
+  refused. DMS does not support it there and documents possible data loss.
+- `permissions_boundary_arn` no longer applies to `dms-vpc-role` and
+  `dms-cloudwatch-logs-role`, whose AWS-managed policies a landing-zone
+  boundary could cap silently.

@@ -94,7 +94,7 @@ to whoever owns IAM, `kms_key_policy_requirements` to the key owners, and
 |---|---|---|
 | Terraform | `>= 1.9.0` | Set the workspace's Terraform version to 1.9 or later. Conditions use ternaries because 1.9 evaluates both sides of `\|\|` and `&&` |
 | `hashicorp/aws` | `>= 5.70.0, < 6.0.0` | Commit the `.terraform.lock.hcl` for a 5.x provider; the module is validated on 5.100.0. A 6.x provider is not supported |
-| Account | `dms-vpc-role` and `dms-cloudwatch-logs-role` | Fixed names, one set per account. Create them once in the landing zone, or set `create_account_service_roles = true` in exactly one module. `output.account_prerequisites` says which are missing |
+| Account | `dms-vpc-role` and `dms-cloudwatch-logs-role` | Fixed names, one set per account. Create them once in the landing zone, or set `create_account_service_roles = true` in exactly one module. The check `account_service_roles_exist` warns at plan when either is missing (the plan principal needs `iam:ListRoles`) |
 | Network | VPC endpoints for `secretsmanager`, `kms`, `logs`, `sns` as used; an `s3` gateway endpoint for an S3 target | The module creates no network resources. `output.network_contract` lists what the configuration needs |
 
 ## What the module refuses
@@ -134,14 +134,14 @@ plan rather than at endpoint create or connection test.
 | `sqlserver` | `none`, `require`, `verify-full` |
 | `sybase` | `none`, `verify-full` |
 | `redshift` | `none` (DMS reaches it through S3) |
-| `postgres`, `aurora-postgresql`, `docdb`, `neptune` | any |
+| `postgres`, `aurora-postgresql` | any |
 
 The default is `verify-full`, so an Oracle, Db2, Db2 z/OS, SAP ASE or Redshift
 endpoint must set `ssl_mode` explicitly.
 
 ### Advisory checks
 
-Eighteen `check` blocks warn without refusing. Each is silenced by naming it in
+Nineteen `check` blocks warn without refusing. Each is silenced by naming it in
 `acknowledged_checks`, and the decision is then listed in `output.governance`
 for a reviewer. All are silent when `create = false`.
 
@@ -165,6 +165,7 @@ for a reviewer. All are silent when `create = false`.
 | `minor_upgrades_do_not_fight_the_pin` | `engine_version` is pinned and `auto_minor_version_upgrade` is on |
 | `oracle_ssl_uses_a_wallet` | an Oracle endpoint verifies with a PEM instead of a wallet |
 | `validation_is_claimed_where_it_cannot_run` | validation is on for a task DMS cannot validate (below) |
+| `account_service_roles_exist` | `dms-vpc-role` or `dms-cloudwatch-logs-role` is missing from the account |
 
 ## The migration is three phases; DMS owns one
 
@@ -329,6 +330,7 @@ written to be read there.
 | `kms_key_arn`, `require_cmk` | `""`, `false` | Storage, endpoints, logs |
 | `multi_az`, `engine_version` | `true`, `""` | Pin the version; minor upgrades are off by default |
 | `sns_topic_arn` | `""` | Without it nothing is watching |
+| `sns_topic_kms_key_arn` | `""` | The topic's customer key, so `kms_key_policy_requirements` can say what it must allow |
 | `acknowledged_checks` | `[]` | Advisory checks you have decided to live with |
 | `allow_plaintext_credentials`, `allow_insecure_transport`, `allow_destructive_target_prep` | `false` | Each acknowledges one refusal |
 
@@ -339,10 +341,12 @@ written to be read there.
 | `migration_plan` | The ordered phases with script checksums; hand to the pipeline |
 | `source_prerequisites` | Per source engine, what the DBA team must change before CDC works |
 | `network_contract` | Subnets, endpoints, egress, DNS and return-path notes; hand to the network team |
-| `account_prerequisites` | The two fixed-name IAM roles DMS needs |
-| `kms_key_policy_requirements` | What each customer key's policy must allow; hand to the key owners before the first apply |
+| `account_prerequisites` | The fixed-name IAM roles DMS needs (`dms-access-for-endpoint` too with a Redshift target), and the DMS Serverless service-linked role when serverless or assessment is used |
+| `notification_requirements` | The topic-policy statements DMS, CloudWatch and EventBridge need to publish to `sns_topic_arn` |
+| `deployer_requirements` | Extra permissions for the principal running Terraform (S3 target validation); `null` when none |
+| `kms_key_policy_requirements` | What each customer key's policy must allow, including the SNS topic's key (`sns_topic_kms_key_arn`); hand to the key owners before the first apply |
 | `governance` | The effective posture from the merged settings, including `acknowledged_checks` |
-| `verify_commands` | Connection test, task status, and per-task CDC latency, validation state, failed tables and stop commands |
+| `verify_commands` | Connection test, task status, and per-task CDC latency, validation state, failed tables, alarm re-arming (`arm_alarms`) and stop commands |
 | `premigration_assessment` | Per-task start, status and report commands; `null` unless enabled |
 | `task_settings_json` | The rendered settings per task, for a change review |
 | `replication_instance_arn`, `replication_instance_id` | The instance; `null` in serverless mode |
@@ -371,15 +375,17 @@ written to be read there.
   requirements have not been run.** The assessment role carries only
   `aws:SourceAccount`, because what DMS presents for an assessment run is not
   documented closely enough to pin.
-- **Serverless has no observability here**: no alarms, no event subscriptions,
-  no log group, no validation-only tasks and no assessment.
+- **Serverless observability is failures only**: an EventBridge rule forwards
+  replication failures to `sns_topic_arn`. There are no latency alarms, no log
+  group, no validation-only tasks and no assessment. The rule matches the
+  replication config ARNs in the event's `resources`, as documented. Confirm on
+  the first rehearsal that a failed replication actually notifies.
 - **Scope.** Relational engines (`aurora`, `aurora-postgresql`, `mariadb`,
   `mysql`, `oracle`, `postgres`, `sqlserver`, `db2`, `db2-zos`, `sybase`,
   `redshift`) and S3 targets are typed and tested. `docdb` and `neptune` are
-  accepted as endpoint engines with no engine-specific handling: no
-  `source_prerequisites`, validation cannot run, and only
-  `extra_connection_attributes` reaches DMS for their settings. Kafka, Kinesis,
-  MongoDB, OpenSearch, DynamoDB and Redis endpoints are not supported.
+  refused: provider 5.x drops the Secrets Manager fields for them, so the
+  endpoint would reach DMS without credentials. Kafka, Kinesis, MongoDB,
+  OpenSearch, DynamoDB and Redis endpoints are not supported.
 - **The module runs no SQL.** `sql_scripts` is a manifest.
 - **Account-wide roles are not created by default.**
 - **Schema conversion is out of scope.** DMS moves data; the target schema is

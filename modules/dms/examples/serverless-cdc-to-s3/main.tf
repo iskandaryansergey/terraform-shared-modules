@@ -118,7 +118,9 @@ module "cdc_to_lake" {
         heartbeat_frequency = 5
         heartbeat_schema    = "awsdms"
 
-        slot_name = "dms_sales_lake"
+        # No slot_name: DMS then creates and manages the slot itself. A named
+        # slot must already exist and needs a CDC start position, which
+        # serverless mode cannot take - the replication would fail to start.
       }
     }
   }

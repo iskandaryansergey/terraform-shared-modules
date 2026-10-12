@@ -14,6 +14,11 @@ mock_provider "aws" {
   mock_data "aws_caller_identity" {
     defaults = { account_id = "111122223333" }
   }
+  # The account-wide service roles exist; tests that need them missing
+  # override this.
+  mock_data "aws_iam_roles" {
+    defaults = { names = ["dms-vpc-role", "dms-cloudwatch-logs-role"] }
+  }
   mock_resource "aws_dms_replication_instance" {
     defaults = {
       replication_instance_arn = "arn:aws:dms:eu-west-1:111122223333:rep:MOCKINSTANCE"

@@ -43,9 +43,17 @@ which is why that flag exists and defaults to false.
 **DMS's database users.** DMS needs its own database user on each side, in its
 own secret holding `host`, `port`, `username` and `password`. The RDS/Aurora
 master secret cannot be used by DMS. The database name is not read from the
-secret: it comes from `database_name` on the endpoint. On a PostgreSQL target
-that uses `after_connect_script = "SET session_replication_role = replica;"`, the
-DMS user needs the privilege to set that parameter.
+secret: it comes from `database_name` on the endpoint (for the MySQL family,
+leave it empty). On a PostgreSQL target that uses `after_connect_script = "SET
+session_replication_role = replica;"`, the DMS user needs the privilege to set
+that parameter: `rds_superuser` on RDS and Aurora, or on PostgreSQL 15 and later
+`GRANT SET ON PARAMETER session_replication_role TO <dms_user>;`. Check it before
+the first start by running the statement as the DMS user.
+
+**Set the `postgres` block before the first apply.** The provider never sends a
+change to `postgres_settings` on an existing endpoint, so the module replaces
+the endpoint when that block changes, and every task on it with it. Mid-migration
+that is a new task starting from zero.
 
 ---
 
@@ -151,6 +159,18 @@ aws dms start-replication-task --replication-task-arn <task-arn> \
   --start-replication-task-type start-replication
 ```
 
+Then re-arm the CDC alarms (`verify_commands.arm_alarms.<task>`). A CDC alarm
+on a task that has never run is already in ALARM, because no data counts as
+breaching, and an alarm only notifies on a change of state. Setting it to OK
+at start means a task that stalls before publishing a datapoint flips it back
+to ALARM within 15 minutes, and that flip notifies. A task paused by
+`stop_before_cached_changes` alarms the same way; that one is expected.
+
+Before the first start, check the notification path: `notification_requirements`
+lists the statements the topic policy needs, and `kms_key_policy_requirements`
+what an encrypted topic's key needs. A topic that refuses DMS or CloudWatch
+drops every notification while the subscriptions show as active.
+
 Watch it **per table**. A task at 99% with one table erroring looks healthy in
 the console:
 
@@ -163,7 +183,8 @@ watch -n 60 "aws dms describe-table-statistics --replication-task-arn <task-arn>
 | What you see | What it means |
 |---|---|
 | `Table error` | The task continues; that table does not |
-| Tables stuck at 0 rows | Usually a source permission gap, or a selection rule matching a schema name with different casing |
+| Tables stuck at 0 rows | Usually a source permission gap (the DMS user lacks `SELECT` on the tables; the connection test does not read them), or a selection rule matching a schema name with different casing |
+| Running, and the task log group is empty | `dms-cloudwatch-logs-role` is missing or cannot write (check `account_service_roles_exist`). Fix that first: nothing else here is diagnosable without the log |
 | `FreeStorageSpace` falling | Cached changes accumulating. A full disk stops **every** task on the instance |
 
 The target's triggers and foreign keys are inert for this phase because of
@@ -176,9 +197,17 @@ connect, check that the DMS user may set that parameter.
 
 ## 4. Post-data, then the CDC soak
 
-Run phase 3 of `migration_plan` once the full load completes: indexes, foreign
-keys, constraints, grants. Built now rather than during the load, because index
-maintenance slows the load and foreign keys reject rows that arrive parent-last.
+Run phase 3 of `migration_plan` once the full load completes: secondary
+indexes, foreign keys, triggers, grants. Built now rather than during the load,
+because index maintenance slows the load and foreign keys reject rows that
+arrive parent-last. Primary keys are not in this list: they belong in pre-data,
+because CDC applies changes from the moment each table finishes loading and
+every UPDATE or DELETE on a table without a key is a full scan.
+
+To build the secondary indexes CDC needs before any cached change is applied,
+set `settings.stop_before_cached_changes = true`: the task stops after the full
+load, you run post-data, then resume it (`--start-replication-task-type
+resume-processing`).
 
 Then watch the number the cutover window is made of. CloudWatch publishes task
 metrics under the task **resource ID** (the last segment of the task ARN), not
@@ -414,6 +443,17 @@ aws dms describe-replication-instances \
    the module; they still expire after `log_retention_days`. If your retention
    rule is longer than that, export them (for example
    `aws logs create-export-task`) or raise the retention first.
+
+   The kept group also blocks the next apply under the same `name` (a
+   rehearsal, then the real run): the create fails with
+   ResourceAlreadyExistsException. Adopt it instead of deleting the logs:
+
+   ```hcl
+   import {
+     to = module.dms.aws_cloudwatch_log_group.tasks[0]
+     id = "dms-tasks-<name>"
+   }
+   ```
 3. Drop the `dms_control` schema from the target **after** step 1:
    `awsdms_apply_exceptions` holds failed rows and their SQL.
 
@@ -477,9 +517,9 @@ What the failure usually is, read from `LastFailureMessage` and the log:
 
 | Cause | What to do |
 |---|---|
-| Table error escalation | One table exceeded `table_error_max` (default 50) and the task stopped by policy. Fix the cause, then reload that table (below) and resume |
+| Table error escalation | One table exceeded `table_error_max` (default 50) and the task stopped by policy. Fix the cause, resume the task, then reload that table (below) |
 | Source log unavailable | The source purged logs DMS needed: binlog or archive retention. The task cannot resume; the load starts again |
-| A task that is *running* but not progressing | The module renders `RecoverableErrorCount = -1`, which is retry forever: DMS never gives up on a recoverable error, so a failing connection shows as growing CDC latency, not a stopped task. Read the log and the `cdc-latency` alarms |
+| A task that is *running* but not progressing | The module renders `RecoverableErrorCount = -1`, the DMS default: DMS restarts the task itself after a recoverable error (nine times while running, six while starting, indefinitely for some error classes). Between restarts a failing connection shows as growing CDC latency, not a stopped task. Read the log and the `cdc-latency` alarms |
 | Nothing obvious, right after an HCP Terraform run | **Check section 6a.** An apply touched the task |
 
 **Resume, do not restart**, unless you mean to reload:
@@ -489,13 +529,20 @@ What the failure usually is, read from `LastFailureMessage` and the log:
 aws dms start-replication-task --replication-task-arn <arn> \
   --start-replication-task-type resume-processing
 
-# Reloads ONE table (or a few) without restarting the task.
+# Reloads ONE table (or a few) without restarting the task. The task must be
+# RUNNING - resume it first. Under DO_NOTHING (the module default) DMS does not
+# empty the table before reloading it: TRUNCATE it on the target first, or
+# every row is loaded a second time. Test on the first rehearsal whether
+# SchemaName/TableName take the source names (CORE/ACCOUNT on Oracle) or the
+# transformed target names.
+psql -h <target-host> -d <db> -c 'TRUNCATE core.account;'
 aws dms reload-tables --replication-task-arn <arn> \
   --tables-to-reload SchemaName=core,TableName=account \
   --reload-option data-reload
 
 # Starts the whole task's full load again from zero. Rarely what you want, and
-# over a WAN link it is the expensive kind of retry.
+# over a WAN link it is the expensive kind of retry. Under DO_NOTHING TRUNCATE
+# every in-scope target table first, for the same reason as above.
 aws dms start-replication-task --replication-task-arn <arn> \
   --start-replication-task-type reload-target
 ```

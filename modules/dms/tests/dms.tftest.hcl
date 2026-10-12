@@ -20,6 +20,11 @@ mock_provider "aws" {
   mock_data "aws_caller_identity" {
     defaults = { account_id = "111122223333" }
   }
+  # The account-wide service roles exist; tests that need them missing
+  # override this.
+  mock_data "aws_iam_roles" {
+    defaults = { names = ["dms-vpc-role", "dms-cloudwatch-logs-role"] }
+  }
   mock_resource "aws_dms_replication_instance" {
     defaults = {
       replication_instance_arn = "arn:aws:dms:eu-west-1:111122223333:rep:MOCKINSTANCE"
@@ -452,7 +457,7 @@ run "task_settings_are_rendered_with_safe_defaults" {
   assert {
     condition = length([
       for c in jsondecode(output.task_settings_json["app"]).Logging.LogComponents :
-      c if c.Id == "VALIDATOR"
+      c if c.Id == "VALIDATOR_EXT"
     ]) == 1
     error_message = "the validator's own log component must be enabled, or a validation failure has no detail behind it."
   }

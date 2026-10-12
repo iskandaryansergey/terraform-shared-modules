@@ -141,6 +141,39 @@ resource "aws_iam_role_policy" "s3_target" {
           Resource = ["arn:${local.partition}:s3:::${each.value.bucket_name}"]
         },
       ],
+      # GlueCatalogGeneration: the endpoint role creates the Glue tables and
+      # runs Athena, as the DMS S3 target documentation lists. Without these
+      # the load succeeds and the catalog never appears.
+      each.value.glue_catalog_generation ? [
+        {
+          Sid    = "ReadForGlueCatalog"
+          Effect = "Allow"
+          Action = ["s3:GetObject", "s3:ListBucketMultipartUploads", "s3:ListMultipartUploadParts", "s3:AbortMultipartUpload"]
+          Resource = [
+            "arn:${local.partition}:s3:::${each.value.bucket_name}",
+            "arn:${local.partition}:s3:::${each.value.bucket_name}/*",
+          ]
+        },
+        {
+          Sid    = "GenerateGlueCatalog"
+          Effect = "Allow"
+          Action = [
+            "glue:CreateDatabase", "glue:GetDatabase", "glue:CreateTable", "glue:DeleteTable", "glue:UpdateTable", "glue:GetTable",
+            "glue:BatchCreatePartition", "glue:CreatePartition", "glue:UpdatePartition", "glue:GetPartition", "glue:GetPartitions", "glue:BatchGetPartition",
+          ]
+          Resource = [
+            "arn:${local.partition}:glue:${local.region}:${local.account_id}:catalog",
+            "arn:${local.partition}:glue:${local.region}:${local.account_id}:database/*",
+            "arn:${local.partition}:glue:${local.region}:${local.account_id}:table/*",
+          ]
+        },
+        {
+          Sid      = "QueryForGlueCatalog"
+          Effect   = "Allow"
+          Action   = ["athena:StartQueryExecution", "athena:GetQueryExecution", "athena:CreateWorkGroup"]
+          Resource = ["arn:${local.partition}:athena:${local.region}:${local.account_id}:workgroup/glue_catalog_generation_for_task_*"]
+        },
+      ] : [],
       each.value.encryption_mode == "SSE_KMS" && each.value.kms_key_arn != "" ? [
         {
           # SSE-KMS writes need GenerateDataKey on the bucket's key, not just
@@ -179,8 +212,10 @@ resource "aws_iam_role" "dms_vpc" {
     }]
   })
 
-  permissions_boundary = var.permissions_boundary_arn != "" ? var.permissions_boundary_arn : null
-  tags                 = local.common_tags
+  # No permissions_boundary: this role carries an AWS-managed policy DMS needs
+  # in full, and a landing-zone boundary that does not grant the EC2 network
+  # interface calls would cap it silently.
+  tags = local.common_tags
 }
 
 resource "aws_iam_role_policy_attachment" "dms_vpc" {
@@ -205,8 +240,10 @@ resource "aws_iam_role" "dms_cloudwatch_logs" {
     }]
   })
 
-  permissions_boundary = var.permissions_boundary_arn != "" ? var.permissions_boundary_arn : null
-  tags                 = local.common_tags
+  # No permissions_boundary, for the same reason as dms-vpc-role: a boundary
+  # without logs:PutLogEvents on dms-tasks-* leaves the role in place and the
+  # task logs empty.
+  tags = local.common_tags
 }
 
 resource "aws_iam_role_policy_attachment" "dms_cloudwatch_logs" {
@@ -281,4 +318,32 @@ resource "aws_iam_role_policy" "assessment" {
       }],
     )
   })
+}
+
+# Redshift targets stage the load through S3 with this fixed-name role. The
+# console creates it; the API, and so Terraform, does not.
+resource "aws_iam_role" "dms_access_for_endpoint" {
+  count = local.create && var.create_account_service_roles && local.has_redshift_target ? 1 : 0
+
+  name        = "dms-access-for-endpoint"
+  description = "Account-wide role DMS uses to stage Redshift loads through S3"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Action    = "sts:AssumeRole"
+      Principal = { Service = ["dms.amazonaws.com", "redshift-serverless.amazonaws.com"] }
+    }]
+  })
+
+  # No permissions_boundary, as for the other account-wide roles.
+  tags = local.common_tags
+}
+
+resource "aws_iam_role_policy_attachment" "dms_access_for_endpoint" {
+  count = length(aws_iam_role.dms_access_for_endpoint)
+
+  role       = aws_iam_role.dms_access_for_endpoint[0].name
+  policy_arn = "arn:${local.partition}:iam::aws:policy/service-role/AmazonDMSRedshiftS3Role"
 }
