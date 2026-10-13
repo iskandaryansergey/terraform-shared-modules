@@ -207,7 +207,7 @@ output "proxy_security_group_id" {
 # ---------------------------------------------------------------------------
 
 output "connection" {
-  description = "Everything a client needs to connect, with no secret in it. Hand this to the application or the DMS module."
+  description = "Everything a client needs to connect, with no secret in it. Hand this to the application. For DMS, give it its own database user in its own secret: the RDS-managed master secret holds no host or port, and DMS cannot use it."
   value = !local.create ? null : {
     host              = one(aws_rds_cluster.this[*].endpoint)
     reader_host       = one(aws_rds_cluster.this[*].reader_endpoint)
@@ -379,7 +379,7 @@ output "network_contract" {
 }
 
 output "kms_key_policy_requirements" {
-  description = "What each customer-managed key's policy has to allow. The module uses the keys but cannot write their policies. Read it in the plan, before the first apply."
+  description = "What each customer-managed key's policy has to allow. The module uses the keys but cannot write their policies. Read it in the plan, before the first apply. Each entry also carries the machine-readable fields of contract version 2, which modules/kms compiles into key policy statements: sid (unique in this module), principals = { services, arns, roles } (roles are symbolic: deployer is the principal running terraform), actions, conditions = [{ test, variable, values }] and purpose."
   value = !local.create ? null : concat(
     local.storage_kms_key_arn == "" ? [] : [{
       key       = local.storage_kms_key_arn
@@ -387,13 +387,37 @@ output "kms_key_policy_requirements" {
       actions   = ["kms:CreateGrant", "kms:DescribeKey", "kms:Encrypt", "kms:Decrypt", "kms:ReEncrypt*", "kms:GenerateDataKey*"]
       condition = { "kms:ViaService" = "rds.${local.region}.amazonaws.com" }
       why       = "RDS encrypts the cluster volume, backups and snapshots through grants created on the caller's behalf."
+
+      sid        = "ClusterStorage"
+      principals = { services = [], arns = [], roles = ["deployer", "snapshot_restorers"] }
+      conditions = [{ test = "StringEquals", variable = "kms:ViaService", values = ["rds.${local.region}.amazonaws.com"] }]
+      purpose    = "RDS encrypts the cluster volume, backups and snapshots through grants made for these principals."
     }],
     !local.manage_password ? [] : (local.master_secret_kms_key_arn == "" ? [] : [{
       key       = local.master_secret_kms_key_arn
-      principal = "the principal running terraform, RDS, and every reader of the secret (applications, the proxy role, DMS)"
+      principal = "the principal running terraform, RDS, and every reader of the secret (applications, the proxy role)"
       actions   = ["kms:Decrypt", "kms:GenerateDataKey*", "kms:DescribeKey", "kms:CreateGrant"]
       condition = { "kms:ViaService" = "secretsmanager.${local.region}.amazonaws.com" }
       why       = "RDS writes and rotates the master secret; readers decrypt it through Secrets Manager."
+
+      sid        = "MasterSecret"
+      principals = { services = [], arns = [], roles = ["deployer"] }
+      conditions = [{ test = "StringEquals", variable = "kms:ViaService", values = ["secretsmanager.${local.region}.amazonaws.com"] }]
+      purpose    = "RDS writes and rotates the master secret through the deployer's grant."
+      },
+      # Readers only decrypt. Kept apart from the deployer's entry so a
+      # compiled key policy does not hand them CreateGrant and GenerateDataKey.
+      {
+        key       = local.master_secret_kms_key_arn
+        principal = "every reader of the secret (applications)"
+        actions   = ["kms:Decrypt"]
+        condition = { "kms:ViaService" = "secretsmanager.${local.region}.amazonaws.com" }
+        why       = "Readers decrypt the master secret through Secrets Manager."
+
+        sid        = "MasterSecretReaders"
+        principals = { services = [], arns = [], roles = ["secret_readers"] }
+        conditions = [{ test = "StringEquals", variable = "kms:ViaService", values = ["secretsmanager.${local.region}.amazonaws.com"] }]
+        purpose    = "Readers decrypt the master secret through Secrets Manager."
     }]),
     !var.performance_insights_enabled ? [] : (local.performance_insights_kms_key == "" ? [] : [{
       key       = local.performance_insights_kms_key
@@ -401,6 +425,25 @@ output "kms_key_policy_requirements" {
       actions   = ["kms:CreateGrant", "kms:DescribeKey", "kms:Decrypt", "kms:GenerateDataKey*"]
       condition = { "kms:ViaService" = "rds.${local.region}.amazonaws.com" }
       why       = "Performance Insights data includes SQL text and is encrypted with this key."
+
+      sid        = "PerformanceInsights"
+      principals = { services = [], arns = [], roles = ["deployer"] }
+      conditions = [{ test = "StringEquals", variable = "kms:ViaService", values = ["rds.${local.region}.amazonaws.com"] }]
+      purpose    = "Performance Insights data includes SQL text and is encrypted with this key."
+      },
+      # Readers need Decrypt and GenerateDataKey through RDS (AWS PI key policy
+      # documentation), not CreateGrant.
+      {
+        key       = local.performance_insights_kms_key
+        principal = "anyone using Performance Insights or Database Insights"
+        actions   = ["kms:Decrypt", "kms:GenerateDataKey"]
+        condition = { "kms:ViaService" = "rds.${local.region}.amazonaws.com" }
+        why       = "Reading Performance Insights decrypts its data through RDS."
+
+        sid        = "PerformanceInsightsReaders"
+        principals = { services = [], arns = [], roles = ["performance_insights_readers"] }
+        conditions = [{ test = "StringEquals", variable = "kms:ViaService", values = ["rds.${local.region}.amazonaws.com"] }]
+        purpose    = "Reading Performance Insights decrypts its data through RDS."
     }]),
     !local.create_log_groups || length(var.enabled_cloudwatch_logs_exports) == 0 ? [] : (local.logs_kms_key_arn == "" ? [] : [{
       key       = local.logs_kms_key_arn
@@ -408,6 +451,11 @@ output "kms_key_policy_requirements" {
       actions   = ["kms:Encrypt*", "kms:Decrypt*", "kms:ReEncrypt*", "kms:GenerateDataKey*", "kms:Describe*"]
       condition = { "ArnLike kms:EncryptionContext:aws:logs:arn" = "arn:${local.partition}:logs:${local.region}:${local.account_id}:log-group:/aws/rds/cluster/${var.name}/*" }
       why       = "CloudWatch Logs encrypts the exported database logs. Without this the log group create fails."
+
+      sid        = "LogGroups"
+      principals = { services = ["logs.${local.region}.amazonaws.com"], arns = [], roles = [] }
+      conditions = [{ test = "ArnLike", variable = "kms:EncryptionContext:aws:logs:arn", values = ["arn:${local.partition}:logs:${local.region}:${local.account_id}:log-group:/aws/rds/cluster/${var.name}/*"] }]
+      purpose    = "CloudWatch Logs encrypts the exported database logs; without it the log group create fails."
     }]),
     # Two statements: RDS uses the key through the service, the consumer calls
     # KMS directly with the cluster's resource ID as encryption context, so a
@@ -419,6 +467,11 @@ output "kms_key_policy_requirements" {
         actions   = ["kms:CreateGrant", "kms:DescribeKey", "kms:Decrypt", "kms:GenerateDataKey*"]
         condition = { "kms:ViaService" = "rds.${local.region}.amazonaws.com" }
         why       = "RDS starts the activity stream and encrypts its records with this key."
+
+        sid        = "ActivityStream"
+        principals = { services = [], arns = [], roles = ["deployer"] }
+        conditions = [{ test = "StringEquals", variable = "kms:ViaService", values = ["rds.${local.region}.amazonaws.com"] }]
+        purpose    = "RDS starts the activity stream and encrypts its records with this key."
       },
       {
         key       = local.activity_stream_kms_key_arn
@@ -426,6 +479,11 @@ output "kms_key_policy_requirements" {
         actions   = ["kms:Decrypt"]
         condition = { "kms:EncryptionContext:aws:rds:dbc-id" = coalesce(one(aws_rds_cluster.this[*].cluster_resource_id), "<cluster resource ID>") }
         why       = "The consumer decrypts each record with KMS directly, not through RDS; the encryption context is the cluster resource ID."
+
+        sid        = "ActivityStreamConsumer"
+        principals = { services = [], arns = [], roles = ["activity_stream_consumers"] }
+        conditions = [{ test = "StringEquals", variable = "kms:EncryptionContext:aws:rds:dbc-id", values = [coalesce(one(aws_rds_cluster.this[*].cluster_resource_id), "<cluster resource ID>")] }]
+        purpose    = "The consumer decrypts each record with KMS directly, with the cluster resource ID as encryption context."
       },
     ],
     # The proxy role reads its secrets through Secrets Manager. The module grants
@@ -436,6 +494,15 @@ output "kms_key_policy_requirements" {
       actions   = ["kms:Decrypt"]
       condition = { "kms:ViaService" = "secretsmanager.${local.region}.amazonaws.com" }
       why       = "RDS Proxy decrypts the database secrets it logs in with."
+
+      sid = "ProxySecrets"
+      principals = {
+        services = []
+        arns     = var.proxy.create_role ? [local.proxy_role_arn] : (var.proxy.role_arn != "" ? [var.proxy.role_arn] : [])
+        roles    = var.proxy.create_role || var.proxy.role_arn != "" ? [] : ["proxy"]
+      }
+      conditions = [{ test = "StringEquals", variable = "kms:ViaService", values = ["secretsmanager.${local.region}.amazonaws.com"] }]
+      purpose    = "RDS Proxy decrypts the database secrets it logs in with."
     }],
   )
 }

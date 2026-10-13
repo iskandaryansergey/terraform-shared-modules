@@ -10,10 +10,9 @@ risky-but-valid postures are reported by `check` blocks, and the integration
 points the module cannot own (KMS key policies, SNS topic policies, VPC
 endpoints) are emitted as structured outputs for their owners.
 
-[Costs](https://github.com/ivasik-k7/terraform-shared-modules/blob/aurora-v2.0.0/modules/aurora/COSTS.md) ·
-[Changelog](https://github.com/ivasik-k7/terraform-shared-modules/blob/aurora-v2.0.0/modules/aurora/CHANGELOG.md) ·
-[Examples](#examples) ·
-[Issues](https://github.com/ivasik-k7/terraform-shared-modules/issues)
+[Costs](COSTS.md) ·
+[Changelog](CHANGELOG.md) ·
+[Examples](#examples)
 
 ## Contents
 
@@ -141,7 +140,7 @@ needs one `terraform init -upgrade`.
 | `instances.tf` | Instances, custom endpoints, reader autoscaling target and policy |
 | `network.tf` | Subnet group, database and proxy security groups and every rule |
 | `parameter-groups.tf` | Cluster and instance parameter groups |
-| `credentials.tf` | Rotation schedule of the RDS-managed master secret |
+| `password-rotation.tf` | Rotation schedule of the RDS-managed master secret |
 | `iam.tf` | Enhanced Monitoring and RDS Proxy roles with inline policies; IAM database auth policies |
 | `proxy.tf` | RDS Proxy, default target group, target, read-only endpoint |
 | `integrations.tf` | IAM role associations (PostgreSQL) and Database Activity Streams |
@@ -305,6 +304,14 @@ key, the principal, actions and condition its policy must allow: a
 `kms:ViaService` condition for the Terraform principal, RDS, Secrets Manager and
 the proxy role, and a `kms:EncryptionContext:aws:rds:dbc-id` condition for the
 activity stream consumer, which decrypts records with KMS directly.
+
+Each entry also carries contract version 2 fields for `modules/kms`: a `sid`
+unique in this module, `principals` split into service principals, concrete
+IAM ARNs and symbolic `roles`, `conditions` as `{ test, variable, values }`,
+and a one-line `purpose`. The roles are principals the module cannot know:
+`deployer` (the principal running terraform), `snapshot_restorers`,
+`secret_readers`, `performance_insights_readers`, `activity_stream_consumers`
+and `proxy` (a proxy role it was not given). The key owner maps each to ARNs.
 
 ### Parameter groups and TLS
 
@@ -726,10 +733,10 @@ application's role, and give the DBA `…users["orders_rw"].engine_sql`.
 
 | Example | Shows |
 |---|---|
-| [isolated-vpc-postgresql](https://github.com/ivasik-k7/terraform-shared-modules/tree/aurora-v2.0.0/modules/aurora/examples/isolated-vpc-postgresql) | Two AZs, one CMK with `require_cmk`, IAM authentication, alarms, contract outputs |
-| [proxy-and-readers](https://github.com/ivasik-k7/terraform-shared-modules/tree/aurora-v2.0.0/modules/aurora/examples/proxy-and-readers) | Aurora MySQL, a reporting reader behind a custom endpoint, reader autoscaling, RDS Proxy |
-| [global-database](https://github.com/ivasik-k7/terraform-shared-modules/tree/aurora-v2.0.0/modules/aurora/examples/global-database) | A primary in eu-west-2 and a secondary in eu-west-1 with its own key |
-| [serverless-v2-dev](https://github.com/ivasik-k7/terraform-shared-modules/tree/aurora-v2.0.0/modules/aurora/examples/serverless-v2-dev) | One pausing `db.serverless` instance with its checks acknowledged |
+| [isolated-vpc-postgresql](examples/isolated-vpc-postgresql) | Two AZs, one CMK with `require_cmk`, IAM authentication, alarms, contract outputs |
+| [proxy-and-readers](examples/proxy-and-readers) | Aurora MySQL, a reporting reader behind a custom endpoint, reader autoscaling, RDS Proxy |
+| [global-database](examples/global-database) | A primary in eu-west-2 and a secondary in eu-west-1 with its own key |
+| [serverless-v2-dev](examples/serverless-v2-dev) | One pausing `db.serverless` instance with its checks acknowledged |
 
 ---
 
@@ -1058,7 +1065,7 @@ Structured, non-sensitive outputs for other teams. Each is null when
 |---|---|
 | `connection` | `{ host, reader_host, proxy_host, proxy_reader_host, port, proxy_port, engine, database, username, secret_arn, secret_kms_key_arn, ca_cert_identifiers, tls_required, iam_auth, security_group_id }` |
 | `network_contract` | `{ subnet_group, subnet_ids, security_group_ids, database_port, proxy_port, rules_you_must_add[], vpc_endpoints[], notes[] }` |
-| `kms_key_policy_requirements` | `[{ key, principal, actions[], condition, why }]`, one entry per customer-managed key in use |
+| `kms_key_policy_requirements` | `[{ key, principal, actions[], condition, why, sid, principals = { services[], arns[], roles[] }, conditions[{ test, variable, values[] }], purpose }]`, one entry per customer-managed key and principal group in use. The second half is contract version 2, which `modules/kms` compiles into key policy statements |
 | `sns_topic_policy_requirement` | `{ topic, statements[{ principal, action, condition, why }] }` for `events.rds.amazonaws.com` and `cloudwatch.amazonaws.com` |
 | `iam_database_auth` | `{ cluster_iam_auth_enabled, proxy_iam_auth, users = { <user> = { connect_via, resource_arn, policy_json, policy_arn, host, port, token_command, engine_sql } }, data_api_policy_json, notes[] }` |
 | `governance` | Credentials and transport (including `iam_database_users`), network (including `egress_outside_private_ranges`), encryption (`keys`, `purposes_without_cmk`), resilience, versions (the actual `engine_lifecycle_support`), observability, `audit_logging`, `acknowledged_checks`, data egress paths, `cost_drivers` |
@@ -1163,7 +1170,7 @@ versions can be skipped.
 
 | Layer | Coverage |
 |---|---|
-| `tests/aurora.tftest.hcl` | 20 runs: default resource set and posture, naming and tags, both engines, Serverless v2, autoscaling, bring-your-own, proxy, global primary and secondary, `create = false`, contract outputs, refusals and checks |
+| `tests/aurora.tftest.hcl` | 21 runs: default resource set and posture, naming and tags, both engines, Serverless v2, autoscaling, bring-your-own, proxy, global primary and secondary, `create = false`, contract outputs, the machine-readable key policy contract, refusals and checks |
 | `tests/hardening.tftest.hcl` | 14 runs: keys on features turned on later (with an applied existing cluster), activity stream mode on MySQL, key policy requirements for stream consumers and the proxy, proxy TLS, egress ranges |
 | `tests/iam_auth.tftest.hcl` | 15 runs: exact `dbuser` ARNs for cluster and proxy users, policy documents and managed policies, engine SQL per engine, Data API policy, refusals and checks |
 | `tests/audit_logging.tftest.hcl` | 13 runs: pgAudit and Advanced Auditing parameters, `shared_preload_libraries` composition, caller precedence, refusals, retention check |
@@ -1179,8 +1186,7 @@ python3 tests/check_consistency.py
 terraform show -json plan.tfplan > plan.json && python3 tests/check_plan.py plan.json --require-cmk
 ```
 
-**Support.** Open an issue on
-[ivasik-k7/terraform-shared-modules](https://github.com/ivasik-k7/terraform-shared-modules/issues)
-titled `aurora: …`, with the plan output for a bug.
+**Support.** Open an issue in this repository titled `aurora: …`, with the
+plan output for a bug.
 
-**License.** MIT; see [LICENSE](https://github.com/ivasik-k7/terraform-shared-modules/blob/main/LICENSE).
+**License.** MIT; see [LICENSE](../../LICENSE).

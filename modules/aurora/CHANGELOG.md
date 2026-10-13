@@ -51,6 +51,14 @@ blocks carry existing deployments across.
 - Contract outputs: `connection`, `governance`, `network_contract`,
   `kms_key_policy_requirements`, `sns_topic_policy_requirement`,
   `verify_commands`, `effective_parameters`.
+- `kms_key_policy_requirements` entries carry contract version 2 fields for
+  `modules/kms` to compile: `sid`, `principals` (`services`, `arns`, symbolic
+  `roles` such as `deployer`), `conditions` (`test`, `variable`, `values`) and
+  `purpose`. Additive, not breaking: `key`, `principal`, `actions`,
+  `condition` and `why` are unchanged. Secret readers and Performance
+  Insights readers are separate entries (`MasterSecretReaders`,
+  `PerformanceInsightsReaders`) with only the actions they need, so a compiled
+  key policy does not give them the deployer's `CreateGrant`.
 - `egress_rules`, prefix-list and cross-account security group sources, and a
   separate proxy security group with its own rules.
 - Module-created log groups with retention, key, class and `skip_destroy`.

@@ -127,8 +127,9 @@ run "the_default_cluster_has_the_expected_resources" {
       length(aws_rds_cluster_activity_stream.this) == 0,
       length(aws_appautoscaling_target.readers) == 0,
       length(aws_rds_cluster_endpoint.this) == 0,
+      length(aws_secretsmanager_secret_rotation.master) == 0,
     ])
-    error_message = "proxy, activity stream, reader autoscaling and custom endpoints are opt-in."
+    error_message = "proxy, activity stream, reader autoscaling, custom endpoints and a rotation schedule are opt-in."
   }
 
   assert {
@@ -458,8 +459,35 @@ run "the_contract_outputs_describe_the_cluster" {
       output.governance.deletion_protection,
       length(output.governance.purposes_without_cmk) == 0,
       output.governance.instance_count == 2,
+      output.governance.master_password_rotation == "rds default (every 7 days)",
     ])
     error_message = "governance reports the managed secret, TLS, deletion protection, every purpose on the CMK and the instance count."
+  }
+}
+
+run "a_rotation_schedule_replaces_the_rds_default" {
+  command = plan
+
+  variables {
+    master_password_rotation = {
+      automatically_after_days = 90
+      duration                 = "3h"
+    }
+  }
+
+  assert {
+    condition = alltrue([
+      length(aws_secretsmanager_secret_rotation.master) == 1,
+      aws_secretsmanager_secret_rotation.master[0].rotation_rules[0].automatically_after_days == 90,
+      aws_secretsmanager_secret_rotation.master[0].rotation_rules[0].duration == "3h",
+      !aws_secretsmanager_secret_rotation.master[0].rotate_immediately,
+    ])
+    error_message = "the schedule is set on the RDS-managed secret, and applying it does not rotate the password."
+  }
+
+  assert {
+    condition     = output.governance.master_password_rotation == "every 90 days"
+    error_message = "governance reports the schedule that is applied."
   }
 }
 
@@ -557,5 +585,70 @@ run "an_acknowledged_check_is_silent" {
   assert {
     condition     = contains(output.governance.acknowledged_checks, "cluster_survives_an_az")
     error_message = "the acknowledgement is recorded in governance for the reviewer."
+  }
+}
+
+# ---------------------------------------------------------------------------
+# Key policy contract, version 2
+# ---------------------------------------------------------------------------
+
+# Apply, not plan: the proxy role ARN and the cluster resource ID in the
+# contract are unknown until the mock creates them. Last in the file, so no
+# plan run inherits this state.
+run "every_key_policy_requirement_is_machine_readable" {
+  command = apply
+
+  variables {
+    acknowledged_checks = var.every_check
+    activity_stream     = { enabled = true, mode = "async" }
+    proxy = {
+      enabled           = true
+      use_master_secret = true
+      ingress_rules     = { app = { referenced_security_group_id = "sg-0123456789abcdef0", description = "orders service" } }
+      egress_rules      = { secrets = { referenced_security_group_id = "sg-0123456789abcdef5", port = 443, description = "Secrets Manager endpoint" } }
+    }
+  }
+
+  assert {
+    condition     = length(output.kms_key_policy_requirements) == 9
+    error_message = "storage, master secret and its readers, Performance Insights and its readers, log groups, both activity stream statements and the proxy: every entry is in scope."
+  }
+
+  assert {
+    condition = alltrue([
+      for r in output.kms_key_policy_requirements :
+      can(regex("^[A-Za-z0-9]+$", r.sid)) && can(tolist(r.principals.services)) && can(tolist(r.principals.arns)) && can(tolist(r.principals.roles))
+      && length(r.actions) > 0 && can(tolist(r.conditions))
+    ])
+    error_message = "modules/kms compiles only entries with sid, principals.services/arns/roles, actions and conditions; anything else is reported as prose."
+  }
+
+  assert {
+    condition     = length(distinct([for r in output.kms_key_policy_requirements : r.sid])) == length(output.kms_key_policy_requirements)
+    error_message = "sids are unique: modules/kms builds statement Sids from them."
+  }
+
+  assert {
+    condition = alltrue([
+      for r in output.kms_key_policy_requirements :
+      length(r.principals.services) + length(r.principals.arns) + length(r.principals.roles) > 0
+      && alltrue([for c in r.conditions : length(c.values) > 0 && c.test != "" && c.variable != ""])
+    ])
+    error_message = "every entry names a principal, and every condition has a test, a variable and values."
+  }
+
+  assert {
+    condition = alltrue([
+      for r in output.kms_key_policy_requirements : !contains([for c in r.conditions : c.variable], "kms:ViaService")
+      if length(r.principals.arns) + length(r.principals.roles) == 0
+    ])
+    error_message = "a service principal calls KMS itself; kms:ViaService on it would deny every call."
+  }
+
+  assert {
+    condition = alltrue([
+      for r in output.kms_key_policy_requirements : contains(r.principals.arns, aws_iam_role.proxy[0].arn) if r.sid == "ProxySecrets"
+    ])
+    error_message = "the proxy entry names the role the module created, not a symbolic role."
   }
 }
