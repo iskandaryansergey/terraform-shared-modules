@@ -21,8 +21,7 @@ locals {
   native_events     = [for e in var.notifications.events : local.native_event_types[e] if contains(keys(local.native_event_types), e)]
   cloudtrail_events = distinct(flatten([for e in var.notifications.events : lookup(local.cloudtrail_event_names, e, [])]))
 
-  notify         = local.create && var.notifications.sns_topic_arn != ""
-  notify_replica = local.create && var.notifications.replica_sns_topic_arn != "" && length(local.replicated_keys) > 0
+  notify = local.create && var.notifications.sns_topic_arn != ""
 
   rule_tags = merge(var.tags, { ManagedBy = "Terraform", Module = "kms", KeySet = var.name })
 
@@ -31,7 +30,7 @@ locals {
     for which in keys(local.regions) : which => jsonencode({
       source        = ["aws.kms"]
       "detail-type" = local.native_events
-      resources     = which == "primary" ? [for k, key in aws_kms_key.this : key.arn] : [for k, key in aws_kms_replica_key.this : key.arn]
+      resources     = which == "primary" ? [for k in sort(keys(local.key_arn)) : local.key_arn[k]] : values(local.replica_arns)
     })
   }
   cloudtrail_pattern = {
@@ -40,8 +39,9 @@ locals {
       "detail-type" = ["AWS API Call via CloudTrail"]
       detail = {
         eventSource = ["kms.amazonaws.com"]
-        eventName   = local.cloudtrail_events
-        resources   = { ARN = which == "primary" ? [for k, key in aws_kms_key.this : key.arn] : [for k, key in aws_kms_replica_key.this : key.arn] }
+        # ReplicateKey is logged in the primary's region only.
+        eventName = which == "primary" ? local.cloudtrail_events : [for e in local.cloudtrail_events : e if e != "ReplicateKey"]
+        resources = { ARN = which == "primary" ? [for k in sort(keys(local.key_arn)) : local.key_arn[k]] : values(local.replica_arns) }
       }
     })
   }
@@ -54,6 +54,13 @@ resource "aws_cloudwatch_event_rule" "native" {
   description   = "KMS key events for the ${var.name} key set"
   event_pattern = local.native_pattern.primary
   tags          = local.rule_tags
+
+  lifecycle {
+    precondition {
+      condition     = length(local.native_pattern.primary) <= 4096
+      error_message = "the native event pattern for this key set is ${length(local.native_pattern.primary)} characters; EventBridge allows 4096. Split the keys across key sets."
+    }
+  }
 }
 
 resource "aws_cloudwatch_event_target" "native" {
@@ -71,6 +78,13 @@ resource "aws_cloudwatch_event_rule" "cloudtrail" {
   description   = "KMS calls on the ${var.name} key set (needs an active CloudTrail trail)"
   event_pattern = local.cloudtrail_pattern.primary
   tags          = local.rule_tags
+
+  lifecycle {
+    precondition {
+      condition     = length(local.cloudtrail_pattern.primary) <= 4096
+      error_message = "the cloudtrail event pattern for this key set is ${length(local.cloudtrail_pattern.primary)} characters; EventBridge allows 4096. Split the keys across key sets."
+    }
+  }
 }
 
 resource "aws_cloudwatch_event_target" "cloudtrail" {
@@ -79,42 +93,4 @@ resource "aws_cloudwatch_event_target" "cloudtrail" {
   rule      = aws_cloudwatch_event_rule.cloudtrail[0].name
   target_id = "sns"
   arn       = var.notifications.sns_topic_arn
-}
-
-resource "aws_cloudwatch_event_rule" "replica_native" {
-  count    = local.notify_replica && length(local.native_events) > 0 ? 1 : 0
-  provider = aws.replica
-
-  name          = "${var.name}-kms-key-events"
-  description   = "KMS key events for the ${var.name} key set's replicas"
-  event_pattern = local.native_pattern.replica
-  tags          = local.rule_tags
-}
-
-resource "aws_cloudwatch_event_target" "replica_native" {
-  count    = length(aws_cloudwatch_event_rule.replica_native)
-  provider = aws.replica
-
-  rule      = aws_cloudwatch_event_rule.replica_native[0].name
-  target_id = "sns"
-  arn       = var.notifications.replica_sns_topic_arn
-}
-
-resource "aws_cloudwatch_event_rule" "replica_cloudtrail" {
-  count    = local.notify_replica && length(local.cloudtrail_events) > 0 ? 1 : 0
-  provider = aws.replica
-
-  name          = "${var.name}-kms-key-changes"
-  description   = "KMS calls on the ${var.name} key set's replicas (needs an active CloudTrail trail)"
-  event_pattern = local.cloudtrail_pattern.replica
-  tags          = local.rule_tags
-}
-
-resource "aws_cloudwatch_event_target" "replica_cloudtrail" {
-  count    = length(aws_cloudwatch_event_rule.replica_cloudtrail)
-  provider = aws.replica
-
-  rule      = aws_cloudwatch_event_rule.replica_cloudtrail[0].name
-  target_id = "sns"
-  arn       = var.notifications.replica_sns_topic_arn
 }

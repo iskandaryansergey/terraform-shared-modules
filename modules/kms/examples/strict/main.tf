@@ -53,8 +53,7 @@ variable "security_topic_arn" {
 }
 
 module "kms" {
-  source    = "../.."
-  providers = { aws = aws, aws.replica = aws }
+  source = "../.."
 
   name = "cardholder"
 

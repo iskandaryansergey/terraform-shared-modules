@@ -88,7 +88,7 @@ output "instance_endpoints" {
 
 output "writer_instance_key" {
   description = "Key of the instance that is the writer as of the last refresh. It moves with every failover."
-  value       = one([for k, i in aws_rds_cluster_instance.this : k if i.writer])
+  value       = one([for k, i in aws_rds_cluster_instance.this : k if i.writer == true])
 }
 
 output "custom_endpoints" {

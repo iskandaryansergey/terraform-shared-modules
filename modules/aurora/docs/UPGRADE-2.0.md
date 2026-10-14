@@ -2,7 +2,7 @@
 
 From the 1.x interface (`cluster_identifier`, `aws_rds_cluster.main`) to 2.0.0,
 in an HCP Terraform workspace. The cluster, its instances, its endpoints and its
-log groups carry over through ten `moved` blocks and plan as updates — **if**
+log groups carry over through 11 `moved` blocks and plan as updates — **if**
 the inputs that force replacement still match what is running. Several defaults
 changed underneath them; this page lists every one.
 
@@ -42,6 +42,14 @@ aws rds describe-db-clusters --db-cluster-identifier <old cluster_identifier> \
 | `instance_class`, `instances` | Both now required. The same keys as the old `instances` map, valid under the new rules (lowercase, 1–20 characters). 1.x defaulted to `{ writer = { instance_class = "db.t3.medium", promotion_tier = 0 } }` — write that out if you relied on it | A changed key replaces that instance; a missing one deletes it |
 | `port` | The running port, or `0` for the engine default | In place, with a restart |
 | `master_username`, `database_name` | The running values. 1.x defaulted `master_username = "admin"`; 2.0 defaults `"dbadmin"` | Not a replacement — 2.0 ignores both after creation, and `output.connection` reports the values the cluster has. Set them to the running values anyway, so the code says what runs |
+
+**Performance Insights** defaults to on in 2.0 (1.x: off). On a cluster that
+had it off and uses a customer-managed key, the first plan is **refused**: the
+provider would not send the key, and AWS would encrypt Performance Insights
+with `aws/rds` for good. Either set `performance_insights_enabled = false`
+for the upgrade apply and turn it on in a later change, or run the
+`aws rds modify-db-cluster --enable-performance-insights
+--performance-insights-kms-key-id <key>` the refusal prints, then plan again.
 
 Two things must already be true of the 1.x cluster, or it cannot be adopted
 without replacement: `storage_encrypted = true` (2.0 has no off switch) and
@@ -88,6 +96,9 @@ as the rotation — RDS has just replaced it.
 3. Set `sns_topic_arn`, or set `create_alarms = false` and
    `create_event_subscriptions = false` — 2.0 refuses alarms with nowhere to go.
 4. Open a pull request. The VCS-connected workspace runs a speculative plan.
+   Download its JSON (or `terraform show -json` a local plan) and run
+   `python3 tests/check_plan.py plan.json`: it fails on a replaced or deleted
+   cluster, instance, global cluster, subnet group or log group.
 5. In the plan, look for these, in this order:
    - `module.<x>.aws_rds_cluster.this[0] must be replaced` — **must not appear.**
      Find the attribute marked `# forces replacement`, fix the input in §2, push,
@@ -115,7 +126,7 @@ as the rotation — RDS has just replaced it.
 | `aws_rds_cluster.main` | `aws_rds_cluster.this[0]` |
 | `aws_rds_cluster_instance.instances[*]` | `aws_rds_cluster_instance.this[*]` |
 | `aws_rds_global_cluster.main[0]` | `aws_rds_global_cluster.this[0]` |
-| `aws_db_subnet_group.main[0]` | `aws_db_subnet_group.this[0]` |
+| `aws_db_subnet_group.main` (early 1.x) or `aws_db_subnet_group.main[0]` (late 1.x) | `aws_db_subnet_group.this[0]`, in two chained blocks so both shapes arrive |
 | `aws_rds_cluster_parameter_group.main[0]` | `aws_rds_cluster_parameter_group.this[0]` |
 | `aws_db_parameter_group.main[0]` | `aws_db_parameter_group.this[0]` |
 | `aws_security_group.aurora[0]` | `aws_security_group.this[0]` |
@@ -126,6 +137,12 @@ as the rotation — RDS has just replaced it.
 `aws_rds_cluster_role_association.this` and `aws_rds_cluster_activity_stream.this`
 keep their 1.x addresses. These blocks stay in every later version, so a
 workspace can go from 1.x to any 2.x directly.
+
+**Rehearsed, without AWS.** `tests/check_moved.py` plans this module over a
+1.x state in both shapes, with the inputs in §2, and fails unless every
+object moves and no cluster, instance, subnet group or log group is replaced
+or deleted. It passes on provider 5.100 and 6.x. It cannot know your inputs:
+the gate on your own plan is `tests/check_plan.py` (§4).
 
 ---
 
@@ -141,7 +158,7 @@ Expected, with the inputs in §2 right.
 | Enhanced Monitoring role | Replaced: `<id>-rds-monitoring-role` → `<name>-<region>-monitor`; or created, since the interval default went 0 → 60 | The managed-policy attachment is destroyed and a scoped inline policy created. A short gap in OS metrics |
 | Alarms | The four 1.x alarms destroyed; up to ten kinds created | 1.x alarms had no actions, read cluster averages, and watched `FreeStorageSpace` and `AuroraBinlogReplicaLag`, which do not measure Aurora local storage or replica lag |
 | Event subscriptions | Created | Cluster and instance events to `sns_topic_arn` |
-| Cluster | In place | Tags; Performance Insights on (default `false` → `true`); `delete_automated_backups` `true` → `false`; the new parameter and security groups; `final_snapshot_identifier`; maintenance window if you used the 1.x default (`sun:03:00` → `sun:04:00`) |
+| Cluster | In place | Tags; Performance Insights on (default `false` → `true`; refused on a CMK cluster that had it off - §2); `delete_automated_backups` `true` → `false`; the new parameter and security groups; `final_snapshot_identifier`; maintenance window if you used the 1.x default (`sun:03:00` → `sun:04:00`) |
 | Instances | In place | Parameter group, Performance Insights, Enhanced Monitoring, `auto_minor_version_upgrade` `true` → `false`, tags, the cluster's maintenance window (1.x left AWS's), the CA if it is not `rds-ca-rsa2048-g1` — clients must trust the new one |
 | Subnet group | In place | Description and tags |
 | Log groups | In place | Retention 7 → 30 if you used the default, the key if one is set, tags |

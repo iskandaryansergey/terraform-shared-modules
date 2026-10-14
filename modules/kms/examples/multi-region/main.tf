@@ -1,6 +1,7 @@
-# A multi-Region key with a replica for disaster recovery. The replica gets its
-# own policy, built for its region (the logs preset names logs.eu-west-1 there),
-# and its own aliases.
+# A multi-Region key with a disaster-recovery replica. The key set compiles
+# the replica's policy for eu-west-1; modules/replica creates it there. Here
+# both live in one configuration; README shows the split into a separate
+# disaster-recovery workspace.
 
 terraform {
   required_version = ">= 1.9.0"
@@ -40,11 +41,11 @@ variable "dr_security_topic_arn" {
 }
 
 module "kms" {
-  source    = "../.."
-  providers = { aws = aws, aws.replica = aws.dr }
+  source = "../.."
 
-  name      = "ledger"
-  deployers = [var.deployer_role_arn]
+  name           = "ledger"
+  deployers      = [var.deployer_role_arn]
+  replica_region = "eu-west-1"
 
   keys = {
     data = {
@@ -59,20 +60,34 @@ module "kms" {
   }
 
   notifications = {
-    sns_topic_arn         = var.security_topic_arn
-    replica_sns_topic_arn = var.dr_security_topic_arn
+    sns_topic_arn = var.security_topic_arn
   }
+}
+
+module "kms_dr" {
+  source    = "../../modules/replica"
+  providers = { aws = aws.dr }
+
+  replicas      = module.kms.replicas
+  sns_topic_arn = var.dr_security_topic_arn
 }
 
 output "keys" {
   value = module.kms.keys
 }
 
+output "replica_key_arns" {
+  value = module.kms_dr.key_arns
+}
+
 output "cost" {
   value = module.kms.cost
 }
 
-output "sns_topic_policy_requirement" {
+output "sns_topic_policy_requirements" {
   description = "primary goes into the eu-west-2 topic's policy, replica into the eu-west-1 one."
-  value       = module.kms.sns_topic_policy_requirement
+  value = {
+    primary = module.kms.sns_topic_policy_requirement
+    replica = module.kms_dr.sns_topic_policy_requirement
+  }
 }

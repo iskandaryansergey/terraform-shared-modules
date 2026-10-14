@@ -150,7 +150,7 @@ check "minor_upgrades_do_not_fight_the_pin" {
 check "extended_support_matches_the_setting" {
   assert {
     condition     = !local.create ? true : (contains(local.acknowledged, "extended_support_matches_the_setting") ? true : try(aws_rds_cluster.this[0].engine_lifecycle_support == var.engine_lifecycle_support, true))
-    error_message = "the cluster was created with engine_lifecycle_support = ${try(aws_rds_cluster.this[0].engine_lifecycle_support, "unknown")}, and AWS cannot change it in place. var.engine_lifecycle_support only applies to a new cluster. A restore from snapshot is the only way to change it. ${local.ack_hint}"
+    error_message = "the cluster was created with engine_lifecycle_support = ${coalesce(try(aws_rds_cluster.this[0].engine_lifecycle_support, ""), "unknown")}, and AWS cannot change it in place. var.engine_lifecycle_support only applies to a new cluster. A restore from snapshot is the only way to change it. ${local.ack_hint}"
   }
 }
 
@@ -228,7 +228,7 @@ check "performance_insights_key_is_the_one_configured" {
     condition = !local.create ? true : (contains(local.acknowledged, "performance_insights_key_is_the_one_configured") ? true : (
       !var.performance_insights_enabled ? true : (local.performance_insights_kms_key == "" ? true : try(aws_rds_cluster.this[0].performance_insights_kms_key_id == local.performance_insights_kms_key, true))
     ))
-    error_message = "Performance Insights data is encrypted with ${try(aws_rds_cluster.this[0].performance_insights_kms_key_id, "unknown")}, not ${local.performance_insights_kms_key}. AWS cannot change it once set. ${local.ack_hint}"
+    error_message = "Performance Insights data is encrypted with ${coalesce(try(aws_rds_cluster.this[0].performance_insights_kms_key_id, ""), "unknown")}, not ${local.performance_insights_kms_key}. AWS cannot change it once set. ${local.ack_hint}"
   }
 }
 
@@ -239,7 +239,7 @@ check "activity_stream_key_is_the_one_configured" {
       reverse(split("/", aws_rds_cluster_activity_stream.this[0].kms_key_id))[0] == reverse(split("/", local.activity_stream_kms_key_arn))[0],
       true
     ))
-    error_message = "the activity stream runs with key ${try(aws_rds_cluster_activity_stream.this[0].kms_key_id, "unknown")}, not ${local.activity_stream_kms_key_arn}. The module does not restart a stream to change its key; stop and start it (activity_stream.enabled false, apply, true, apply) if the new key is required. ${local.ack_hint}"
+    error_message = "the activity stream runs with key ${coalesce(try(aws_rds_cluster_activity_stream.this[0].kms_key_id, ""), "unknown")}, not ${local.activity_stream_kms_key_arn}. The module does not restart a stream to change its key; stop and start it (activity_stream.enabled false, apply, true, apply) if the new key is required. ${local.ack_hint}"
   }
 }
 

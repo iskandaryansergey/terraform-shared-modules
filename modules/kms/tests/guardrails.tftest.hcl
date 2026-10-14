@@ -19,17 +19,11 @@ mock_provider "aws" {
   }
 }
 
-mock_provider "aws" {
-  alias = "replica"
-  mock_data "aws_region" {
-    defaults = { name = "eu-west-1" }
-  }
-}
-
 variables {
-  name      = "payments"
-  deployers = ["arn:aws:iam::111122223333:role/workspace"]
-  keys      = { main = {} }
+  replica_region = "eu-west-1"
+  name           = "payments"
+  deployers      = ["arn:aws:iam::111122223333:role/workspace"]
+  keys           = { main = {} }
   guardrails = {
     organization_id  = "o-abcdef1234"
     trusted_accounts = ["999988887777"]
@@ -120,10 +114,10 @@ run "the_vpc_endpoint_perimeter_denies_only_direct_crypto" {
       Condition = {
         StringNotEqualsIfExists = { "aws:SourceVpce" = ["vpce-0123456789abcdef0"] }
         BoolIfExists            = { "aws:PrincipalIsAWSService" = "false", "aws:ViaAWSService" = "false" }
-        ArnNotLikeIfExists      = { "aws:PrincipalArn" = ["arn:aws:iam::*:role/aws:ec2-infrastructure*", "arn:aws:iam::111122223333:role/lambda-*"] }
+        ArnNotLikeIfExists      = { "aws:PrincipalArn" = ["arn:aws:iam::*:role/aws:ec2-infrastructure*", "arn:aws:iam::*:role/aws-service-role/*", "arn:aws:iam::111122223333:role/lambda-*"] }
       }
     }
-    error_message = "the endpoint perimeter must deny direct crypto only - never management, which would lock Terraform out - and exempt service calls, EBS and the named principals."
+    error_message = "the endpoint perimeter must deny direct crypto only - never management, which would lock Terraform out - and exempt service calls, EBS, service-linked roles and the named principals."
   }
 }
 
@@ -326,5 +320,83 @@ run "the_strict_example_plans_clean" {
   assert {
     condition     = !strcontains(output.policies.data.primary, "EnableIamPolicies") && strcontains(output.policies.data.primary, "DenyCryptoOutsideVpcEndpoints")
     error_message = "the strict example has no account-root statement and keeps the VPC endpoint deny."
+  }
+}
+
+# ---------------------------------------------------------------------------
+# Multi-Region keys: where they may go, and who owns the replicas
+# ---------------------------------------------------------------------------
+
+run "a_multi_region_key_replicates_only_to_the_replica_region" {
+  command = plan
+
+  variables {
+    keys = { main = { multi_region = true, replicate = true } }
+  }
+
+  assert {
+    condition = jsonencode([for s in jsondecode(output.policies["main"].primary).Statement : s if startswith(try(s.Sid, ""), "Deny") ? contains(["kms:ReplicateKey", "kms:UpdatePrimaryRegion"], try(s.Action, "")) : false]) == jsonencode([
+      { Action = "kms:ReplicateKey", Condition = { StringNotEquals = { "kms:ReplicaRegion" = ["eu-west-1"] } }, Effect = "Deny", Principal = "*", Resource = "*", Sid = "DenyReplicationOutsideTheReplicaRegion" },
+      { Action = "kms:UpdatePrimaryRegion", Condition = { StringNotEquals = { "kms:PrimaryRegion" = ["eu-west-2", "eu-west-1"] } }, Effect = "Deny", Principal = "*", Resource = "*", Sid = "DenyPromotionOutsideTheTwoRegions" },
+    ])
+    error_message = "ReplicateKey sets the copy's policy, so a copy elsewhere escapes every statement here: deny replication outside replica_region and promotion outside the two regions, to everyone."
+  }
+}
+
+run "a_single_region_key_has_no_replication_statements" {
+  command = plan
+
+  assert {
+    condition     = !strcontains(output.policies["main"].primary, "ReplicateKey") && !strcontains(output.policies["main"].primary, "UpdatePrimaryRegion")
+    error_message = "a single-Region key cannot replicate: no replication statements at all."
+  }
+}
+
+run "replica_deployers_replicate_the_primary_and_own_the_replica" {
+  command = plan
+
+  variables {
+    keys              = { main = { multi_region = true, replicate = true } }
+    replica_deployers = ["arn:aws:iam::111122223333:role/dr-workspace"]
+  }
+
+  assert {
+    condition     = jsonencode(one([for s in jsondecode(output.policies["main"].primary).Statement : s.Action if try(s.Sid, "") == "ReplicaDeployers"])) == jsonencode(["kms:DescribeKey", "kms:ReplicateKey"])
+    error_message = "on the primary, the disaster-recovery role may only describe and replicate the key."
+  }
+
+  assert {
+    condition     = contains(one([for s in jsondecode(output.policies["main"].replica).Statement : s.Action if try(s.Sid, "") == "ReplicaDeployers"]), "kms:PutKeyPolicy")
+    error_message = "on the replica, the disaster-recovery role owns the key: it must be able to change its policy, or KMS's lockout check refuses the replica."
+  }
+
+  assert {
+    condition     = contains(one([for s in jsondecode(output.policies["main"].replica).Statement : s.Condition.ArnNotLike["aws:PrincipalArn"] if try(s.Sid, "") == "DenyDeletionAndDisable"]), "arn:aws:iam::111122223333:role/dr-workspace")
+    error_message = "the replica's guardrails exempt its owner."
+  }
+
+  assert {
+    condition     = !contains(one([for s in jsondecode(output.policies["main"].primary).Statement : s.Condition.ArnNotLike["aws:PrincipalArn"] if try(s.Sid, "") == "DenyDeletionAndDisable"]), "arn:aws:iam::111122223333:role/dr-workspace")
+    error_message = "the primary's guardrails do not exempt the disaster-recovery role."
+  }
+}
+
+run "a_key_in_use_cannot_be_scheduled_for_deletion" {
+  command = plan
+
+  variables {
+    guardrails = { min_days_unused_before_deletion = 30 }
+  }
+
+  assert {
+    condition = one([for s in jsondecode(output.policies["main"].primary).Statement : s if try(s.Sid, "") == "DenyDeletionOfKeysInUse"]) == {
+      Sid       = "DenyDeletionOfKeysInUse"
+      Effect    = "Deny"
+      Principal = "*"
+      Action    = "kms:ScheduleKeyDeletion"
+      Resource  = "*"
+      Condition = { NumericLessThan = { "kms:TrailingDaysWithoutKeyUsage" = "30" } }
+    }
+    error_message = "deny deleting a key used in the last N days, to everyone."
   }
 }

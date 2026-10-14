@@ -1,27 +1,35 @@
 locals {
   create = var.create
 
-  partition      = coalesce(one(data.aws_partition.current[*].partition), "aws")
-  region         = coalesce(one(data.aws_region.current[*].name), "us-east-1")
-  account_id     = coalesce(one(data.aws_caller_identity.current[*].account_id), "000000000000")
-  replica_region = coalesce(one(data.aws_region.replica[*].name), local.region)
+  partition  = coalesce(one(data.aws_partition.current[*].partition), "aws")
+  region     = coalesce(one(data.aws_region.current[*].name), "us-east-1")
+  account_id = coalesce(one(data.aws_caller_identity.current[*].account_id), "000000000000")
+  # Replicas are created by modules/replica, in a provider for this region;
+  # this module only compiles what they need.
+  replica_region = var.replica_region != "" ? var.replica_region : local.region
   regions        = { primary = local.region, replica = local.replica_region }
 
   acknowledged = toset(var.acknowledged_checks)
   root_arn     = "arn:${local.partition}:iam::${local.account_id}:root"
-  iam_arn_re   = "^arn:aws[a-z-]*:iam::[0-9]{12}:(root|role/.+|user/.+)$"
+  # KMS rejects wildcards in principal ARNs.
+  iam_arn_re = "^arn:aws[a-z-]*:iam::[0-9]{12}:(root|role/[^*?]+|user/[^*?]+)$"
 
   # -------------------------------------------------------------------------
   # Deployers: named, or the role running the plan
   # -------------------------------------------------------------------------
 
-  detected_deployer = one(data.aws_iam_session_context.deployer[*].issuer_arn)
+  # A federated-user or root session has no IAM role behind it: no deployer.
+  detected_issuer   = one(data.aws_iam_session_context.deployer[*].issuer_arn)
+  detected_deployer = can(regex(local.iam_arn_re, local.detected_issuer)) ? local.detected_issuer : null
   deployers         = length(var.deployers) > 0 ? var.deployers : compact([local.detected_deployer])
   deployers_source  = length(var.deployers) > 0 ? "named" : (local.detected_deployer != null ? "detected" : "none")
-  deployer_accounts = distinct([for p in local.deployers : regex("^arn:aws[a-z-]*:iam::([0-9]{12}):", p)[0]])
+  deployer_accounts = distinct(compact([for p in local.deployers : try(regex("^arn:aws[a-z-]*:iam::([0-9]{12}):", p)[0], "")]))
 
   break_glass = var.guardrails.break_glass
   exempt      = distinct(concat(local.deployers, local.break_glass))
+  # A disaster-recovery workspace's role owns the replicas, so the replicas'
+  # guardrails exempt it too; the primary's do not.
+  exempt_in = { primary = local.exempt, replica = distinct(concat(local.exempt, var.replica_deployers)) }
 
   # -------------------------------------------------------------------------
   # Keys, with profiles and defaults resolved
@@ -63,12 +71,34 @@ locals {
     SM2               = ["ENCRYPT_DECRYPT", "SIGN_VERIFY", "KEY_AGREEMENT"]
   }
 
-  keys = {
-    for k, v in var.keys : k => merge(v, {
-      spec  = v.spec != "" ? v.spec : local.profiles[v.purpose].spec
-      usage = v.usage != "" ? v.usage : (v.spec != "" ? local.usage_for_spec[v.spec] : local.profiles[v.purpose].usage)
+  # A key with generations becomes one key per generation, <key>-<generation>;
+  # the last is active. Everything below works on these names.
+  expanded_keys = merge([
+    for k, v in var.keys : {
+      for i, g in(length(v.generations) == 0 ? [""] : v.generations) : (g == "" ? k : "${k}-${g}") => merge(v, {
+        base       = k
+        generation = g
+        active     = i == max(length(v.generations), 1) - 1
+      })
+    }
+  ]...)
 
-      aliases              = length(v.aliases) > 0 ? v.aliases : ["${var.name}-${k}"]
+  keys = {
+    for k, v in local.expanded_keys : k => merge(v, {
+      spec = v.spec != "" ? v.spec : local.profiles[v.purpose].spec
+      # A spec without a usage keeps the purpose's usage when the two combine
+      # (signing + RSA_2048 is SIGN_VERIFY), else takes the spec's natural one.
+      usage = v.usage != "" ? v.usage : (v.spec == "" ? local.profiles[v.purpose].usage : (
+        (v.purpose != "" ? contains(lookup(local.valid_usages, v.spec, []), local.profiles[v.purpose].usage) : false)
+        ? local.profiles[v.purpose].usage : lookup(local.usage_for_spec, v.spec, "")
+      ))
+
+      # The active key takes the key's aliases; every generation also has
+      # its own, <name>-<key>-<generation>.
+      aliases              = v.active ? concat(length(v.aliases) > 0 ? v.aliases : ["${var.name}-${v.base}"], v.generation != "" ? ["${var.name}-${k}"] : []) : ["${var.name}-${k}"]
+      grants               = v.active ? v.grants : {}
+      external             = v.origin == "EXTERNAL"
+      key_custodians       = distinct(concat(var.key_custodians, v.key_custodians))
       services             = distinct(concat(local.profiles[v.purpose].services, v.services))
       rotation             = v.rotation != null ? v.rotation : var.key_defaults.rotation
       rotation_period_days = v.rotation_period_days != null ? v.rotation_period_days : var.key_defaults.rotation_period_days
@@ -96,9 +126,22 @@ locals {
 
   # Automatic rotation exists for symmetric keys with AWS-generated material
   # outside custom key stores, and nowhere else.
-  rotates = { for k, v in local.keys : k => v.rotation ? (local.key_kind[k] == "symmetric" ? !v.custom_store : false) : false }
+  rotates = { for k, v in local.keys : k => v.rotation ? (local.key_kind[k] == "symmetric" ? !(v.custom_store || v.external) : false) : false }
+
+  # The active key of each key with generations.
+  active_key = { for k, v in local.keys : v.base => k if v.active }
+
+  # The two key resources, one map: AWS-generated material and imported.
+  key_arn = !local.create ? {} : { for k, v in local.keys : k => v.external ? aws_kms_external_key.this[k].arn : aws_kms_key.this[k].arn }
+  key_id  = !local.create ? {} : { for k, v in local.keys : k => v.external ? aws_kms_external_key.this[k].id : aws_kms_key.this[k].key_id }
 
   replicated_keys = { for k, v in local.keys : k => v if v.replicate }
+
+  # A multi-Region replica keeps its primary's key ID, so its ARN is known as
+  # soon as the primary exists - before modules/replica creates it.
+  replica_arns = !local.create ? {} : {
+    for k, v in local.replicated_keys : k => "arn:${local.partition}:kms:${local.replica_region}:${local.account_id}:key/${local.key_id[k]}"
+  }
 
   key_tags = {
     for k, v in local.keys : k => merge(var.tags, var.key_defaults.tags, v.tags, {
@@ -106,11 +149,13 @@ locals {
       Module    = "kms"
       KeySet    = var.name
       Key       = k
-    })
+    }, { for g in compact([v.generation]) : "Generation" => g })
   }
 
+  # Keyed by alias name alone (unique, validated), so moving an alias to
+  # another key in the set updates it in place instead of recreating it.
   aliases = merge([
-    for k, v in local.keys : { for a in v.aliases : "${k}/${a}" => { key = k, name = "alias/${a}" } }
+    for k, v in local.keys : { for a in v.aliases : a => { key = k, name = "alias/${a}" } }
   ]...)
 
   # -------------------------------------------------------------------------
@@ -128,10 +173,13 @@ locals {
   ]
   multi_region_actions = ["kms:ReplicateKey", "kms:UpdatePrimaryRegion"]
 
-  # Deployers and break-glass also change the policy and create the module's
-  # grants; administrators do neither unless administrators_can_change_policy.
+  # Deployers and break-glass also change the policy, create the module's
+  # grants and replicate multi-Region keys; administrators do none of these
+  # (PutKeyPolicy only with administrators_can_change_policy). ReplicateKey
+  # takes a caller-chosen policy for the copy, so it is as strong as
+  # PutKeyPolicy over the key material.
   owner_actions = { for k, v in local.keys : k => concat(local.manage_actions, ["kms:PutKeyPolicy", "kms:CreateGrant"], v.multi_region ? local.multi_region_actions : []) }
-  admin_actions = { for k, v in local.keys : k => concat(local.manage_actions, var.administrators_can_change_policy ? ["kms:PutKeyPolicy"] : [], v.multi_region ? local.multi_region_actions : []) }
+  admin_actions = { for k, v in local.keys : k => concat(local.manage_actions, var.administrators_can_change_policy ? ["kms:PutKeyPolicy"] : []) }
 
   audit_actions = {
     for k, v in local.keys : k => concat(
@@ -170,12 +218,14 @@ locals {
     "kms:UpdatePrimaryRegion", "kms:ImportKeyMaterial", "kms:DeleteImportedKeyMaterial", "kms:CreateKey",
   ]
 
-  # Required encryption context on direct use, as Null conditions (each key
-  # must be present). Symmetric keys only: the others take no context.
+  # Encryption context on direct use: required keys as Null conditions, and
+  # allowed values as StringEquals (tenant isolation, policy variables).
+  # Symmetric keys only: the others take no context.
   context_condition = {
-    for k, v in local.keys : k => (local.key_kind[k] == "symmetric" ? length(v.require_encryption_context) > 0 : false) ? {
-      Null = { for c in v.require_encryption_context : "kms:EncryptionContext:${c}" => "false" }
-    } : {}
+    for k, v in local.keys : k => merge(
+      (local.key_kind[k] == "symmetric" ? length(v.require_encryption_context) > 0 : false) ? { Null = { for c in v.require_encryption_context : "kms:EncryptionContext:${c}" => "false" } } : {},
+      (local.key_kind[k] == "symmetric" ? length(v.encryption_context_values) > 0 : false) ? { StringEquals = { for c, vals in v.encryption_context_values : "kms:EncryptionContext:${c}" => vals } } : {},
+    )
   }
 
   # -------------------------------------------------------------------------
@@ -245,6 +295,25 @@ locals {
           Condition = { Bool = { "kms:GrantIsForAWSResource" = "true" } }
         },
       ] : s if length(v.account_roots) == 0 ? false : (s.Sid == "OtherAccounts" ? true : local.key_kind[k] == "symmetric")],
+      # Imported material: custodians fetch import parameters (with a SHA-256
+      # wrapping only) and import or delete the material.
+      [for s in [
+        {
+          Sid       = "KeyCustodiansImportParameters"
+          Effect    = "Allow"
+          Principal = { AWS = v.key_custodians }
+          Action    = "kms:GetParametersForImport"
+          Resource  = "*"
+          Condition = { StringEquals = { "kms:WrappingAlgorithm" = ["RSAES_OAEP_SHA_256", "RSA_AES_KEY_WRAP_SHA_256"] } }
+        },
+        {
+          Sid       = "KeyCustodians"
+          Effect    = "Allow"
+          Principal = { AWS = v.key_custodians }
+          Action    = ["kms:DescribeKey", "kms:ImportKeyMaterial", "kms:DeleteImportedKeyMaterial"]
+          Resource  = "*"
+        },
+      ] : s if v.external ? length(v.key_custodians) > 0 : false],
     )
   }
 
@@ -289,7 +358,6 @@ locals {
     codeartifact     = ["codeartifact.%s.amazonaws.com"]
     directoryservice = ["directoryservice.%s.amazonaws.com"]
     storagegateway   = ["storagegateway.%s.amazonaws.com"]
-    ses              = ["ses.%s.amazonaws.com"]
     connect          = ["connect.%s.amazonaws.com"]
     workspaces       = ["workspaces.%s.amazonaws.com"]
     xray             = ["xray.%s.amazonaws.com"]
@@ -308,6 +376,9 @@ locals {
     "eventbridge-to-sqs" = { principal = "events.amazonaws.com", actions = ["kms:GenerateDataKey", "kms:Decrypt"], scoped = true }
     "s3-events-to-sqs"   = { principal = "s3.amazonaws.com", actions = ["kms:GenerateDataKey", "kms:Decrypt"], scoped = true }
     "sns-to-sqs"         = { principal = "sns.amazonaws.com", actions = ["kms:GenerateDataKey", "kms:Decrypt"], scoped = true }
+    # SES receiving mail (to S3/SNS) and publishing to an encrypted topic
+    # calls KMS as itself, not through a caller's forward access session.
+    ses = { principal = "ses.amazonaws.com", actions = ["kms:GenerateDataKey*", "kms:Decrypt"], scoped = true }
   }
 
   autoscaling_slr = "arn:${local.partition}:iam::${local.account_id}:role/aws-service-role/autoscaling.amazonaws.com/AWSServiceRoleForAutoScaling"
@@ -473,7 +544,9 @@ locals {
     }
   }
 
-  extra_statements = { for k, v in local.keys : k => v.extra_statements == "" ? [] : jsondecode(v.extra_statements) }
+  # Decoded from "[]" when empty: a ternary between [] and the decoded tuple
+  # is a type error for any list of two or more statements.
+  extra_statements = { for k, v in local.keys : k => jsondecode(v.extra_statements == "" ? "[]" : v.extra_statements) }
 
   # -------------------------------------------------------------------------
   # Consumer contracts
@@ -501,50 +574,76 @@ locals {
         actions    = try([for s in r.actions : tostring(s)], [])
         conditions = try([for x in r.conditions : { test = tostring(x.test), variable = tostring(x.variable), values = [for y in x.values : tostring(y)] }], [])
         purpose    = try(tostring(r.purpose), try(tostring(r.why), ""))
-        machine    = can(r.principals) && can(r.sid) && length(try(r.actions, [])) > 0
-        label      = "${c}[${i}]${try(" ${tostring(r.sid)}", "")}"
+        machine    = can(r.principals) && can(r.sid) && (can(concat(r.actions, [])) ? length(r.actions) > 0 : false)
+        # A field present with the wrong shape (a string where a list belongs)
+        # would otherwise compile to an empty list.
+        misshapen = !can(concat(try(r.actions, []), [])) || anytrue([
+          for f in ["services", "arns", "roles"] : !can(concat(try(r.principals[f], []), []))
+        ]) || !can(concat(try(r.conditions, []), []))
+        label = "${c}[${i}]${try(" ${tostring(r.sid)}", "")}"
       }
     ] : []
   ])
 
   # A requirement whose key is empty belongs to a feature the producer has off.
   not_applicable = [for r in local.requirements : r.label if r.key == ""]
-  applicable     = [for r in local.requirements : r if r.key != ""]
 
+  grant_actions = ["kms:creategrant", "kms:listgrants", "kms:revokegrant"]
+
+  # Classified whatever the key: on a first plan the key ARNs are unknown,
+  # and a refusal must still stop the plan before any key is created.
   classified = [
-    for r in local.applicable : merge(r, {
+    for r in local.requirements : merge(r, {
+      applicable = r.key != ""
+      # Action names are case-insensitive and may end in *: compared as
+      # patterns, so kms:Put* or kms:putkeypolicy count as PutKeyPolicy.
+      patterns = [for a in r.actions : "^${replace(lower(a), "*", ".*")}$"]
+    })
+  ]
+
+  classified_full = [
+    for r in local.classified : merge(r, {
       aws              = distinct(concat(r.arns, flatten([for role in r.roles : lookup(local.principal_roles, role, [])])))
       unresolved_roles = [for role in r.roles : role if length(lookup(local.principal_roles, role, [])) == 0]
       # Refused at plan: a public principal, a principal that is no IAM ARN,
-      # or an action that is not a plain kms: action, kms:*, or a management
-      # action no consumer needs.
+      # or an action that is not a plain kms: action, kms:*, or one that
+      # covers a management action no consumer needs.
       rejected = r.machine ? (
         anytrue([for a in r.arns : !can(regex(local.iam_arn_re, a))]) ||
         anytrue([for s in r.services : !can(regex("^[a-z0-9.-]+\\.amazonaws\\.com(\\.cn)?$", s))]) ||
         anytrue([for a in r.actions : !can(regex("^kms:[A-Za-z]+\\*?$", a))]) ||
-        anytrue([for a in r.actions : contains(local.management_only_actions, a)])
+        anytrue([for p in r.patterns : anytrue([for m in local.management_only_actions : can(regex(p, lower(m)))])])
       ) : false
-      # Not compiled: a condition without values, or the same test and key
-      # twice - merging them would turn an AND into an OR.
+      # Not compiled: a condition without values, the same test and key twice
+      # (merging them would turn an AND into an OR), or a field of the wrong
+      # shape.
       malformed = r.machine ? (
+        r.misshapen ||
         anytrue([for c in r.conditions : length(c.values) == 0 || c.test == "" || c.variable == ""]) ||
         length(r.conditions) != length(distinct([for c in r.conditions : "${c.test}|${c.variable}"]))
-      ) : false
+      ) : r.misshapen
+      # Grant actions with neither kms:ViaService nor kms:GrantIsForAWSResource
+      # would let the principal grant the key to anyone: they are compiled
+      # into a second statement that only allows grants for AWS resources.
+      grant_list = [for i, a in r.actions : a if anytrue([for g in local.grant_actions : can(regex(r.patterns[i], g))])]
+      grants_scoped = anytrue([
+        for c in r.conditions : contains(["kms:viaservice", "kms:grantisforawsresource"], lower(c.variable))
+      ])
     })
   ]
 
-  machine = [for r in local.classified : r if r.machine && !r.rejected && !r.malformed]
+  machine = [for r in local.classified_full : r if r.applicable && r.machine && !r.rejected && !r.malformed]
 
   key_match_ids = {
     for k, v in local.keys : k => {
       primary = concat(
         [for a in v.aliases : "arn:${local.partition}:kms:${local.region}:${local.account_id}:alias/${a}"],
         [for a in v.aliases : "alias/${a}"],
-        local.create ? [aws_kms_key.this[k].arn, aws_kms_key.this[k].key_id] : [],
+        local.create ? [local.key_arn[k], local.key_id[k]] : [],
       )
       replica = !v.replicate ? [] : concat(
         [for a in v.aliases : "arn:${local.partition}:kms:${local.replica_region}:${local.account_id}:alias/${a}"],
-        local.create ? [aws_kms_replica_key.this[k].arn] : [],
+        local.create ? [local.replica_arns[k]] : [],
       )
     }
   }
@@ -558,20 +657,38 @@ locals {
   contract_statements = {
     for k, v in local.keys : k => {
       for which in keys(local.regions) : which => [
-        for r in local.requirements_by_key[k][which] : merge(
-          {
-            Sid    = "Consumer${replace(title(replace(r.consumer, "/[-_]/", " ")), " ", "")}${r.index}${replace(r.sid, "/[^A-Za-z0-9]/", "")}"
-            Effect = "Allow"
-            Principal = merge(
-              length(r.services) > 0 ? { Service = r.services } : {},
-              length(r.aws) > 0 ? { AWS = r.aws } : {},
-            )
-            Action   = r.actions
-            Resource = "*"
-          },
-          length(r.conditions) > 0 ? { Condition = { for t in distinct([for c in r.conditions : c.test]) : t => { for c in r.conditions : c.variable => c.values if c.test == t } } } : {},
-        )
-        if length(r.services) + length(r.aws) > 0
+        for s in flatten([
+          for r in local.requirements_by_key[k][which] : [
+            for part in(r.grants_scoped || length(r.grant_list) == 0 ? [
+              { suffix = "", actions = r.actions, grants_only = false },
+              ] : [
+              { suffix = "", actions = [for a in r.actions : a if !contains(r.grant_list, a)], grants_only = false },
+              { suffix = "Grants", actions = r.grant_list, grants_only = true },
+              ]) : merge(
+              {
+                Sid    = "Consumer${replace(title(replace(r.consumer, "/[-_]/", " ")), " ", "")}${r.index}${replace(r.sid, "/[^A-Za-z0-9]/", "")}${part.suffix}"
+                Effect = "Allow"
+                Principal = merge(
+                  length(r.services) > 0 ? { Service = r.services } : {},
+                  length(r.aws) > 0 ? { AWS = r.aws } : {},
+                )
+                Action   = part.actions
+                Resource = "*"
+              },
+              length(r.conditions) + (part.grants_only ? 1 : 0) > 0 ? {
+                Condition = merge(
+                  { for t in distinct([for c in r.conditions : c.test]) : t => { for c in r.conditions : c.variable => c.values if c.test == t } },
+                  part.grants_only ? {
+                    Bool = merge(
+                      { for c in r.conditions : c.variable => c.values if c.test == "Bool" },
+                      { "kms:GrantIsForAWSResource" = "true" },
+                    )
+                  } : {},
+                )
+              } : {},
+            ) if length(part.actions) > 0
+          ] if length(r.services) + length(r.aws) > 0
+        ]) : s
       ]
     }
   }
@@ -580,7 +697,7 @@ locals {
   # Guardrails
   # -------------------------------------------------------------------------
 
-  org_exempt_accounts = distinct(concat(var.guardrails.trusted_accounts, local.deployer_accounts))
+  org_exempt_accounts = distinct(concat(var.guardrails.trusted_accounts, local.deployer_accounts, [for p in var.replica_deployers : regex("^arn:aws[a-z-]*:iam::([0-9]{12}):", p)[0]]))
   vpce_ids            = { primary = var.guardrails.vpc_endpoint_ids, replica = var.guardrails.replica_vpc_endpoint_ids }
 
   guardrail_statements = {
@@ -626,12 +743,14 @@ locals {
           StringNotEqualsIfExists = { "aws:SourceVpce" = local.vpce_ids[which] }
           BoolIfExists            = { "aws:PrincipalIsAWSService" = "false", "aws:ViaAWSService" = "false" }
           # EBS decrypts with an instance identity role from the service network.
-          ArnNotLikeIfExists = { "aws:PrincipalArn" = concat(["arn:${local.partition}:iam::*:role/aws:ec2-infrastructure*"], var.guardrails.vpc_endpoint_exempt_principals) }
+          # Service-linked roles (e.g. Auto Scaling's, for encrypted volumes)
+          # call KMS directly from the service's network.
+          ArnNotLikeIfExists = { "aws:PrincipalArn" = concat(["arn:${local.partition}:iam::*:role/aws:ec2-infrastructure*", "arn:${local.partition}:iam::*:role/aws-service-role/*"], var.guardrails.vpc_endpoint_exempt_principals) }
         }
       }] : s if length(local.vpce_ids[which]) > 0],
       [for s in [merge(
         { Sid = "DenyDeletionAndDisable", Effect = "Deny", Principal = "*", Action = ["kms:ScheduleKeyDeletion", "kms:DisableKey"], Resource = "*" },
-        length(local.exempt) > 0 ? { Condition = { ArnNotLike = { "aws:PrincipalArn" = local.exempt } } } : {},
+        length(local.exempt_in[which]) > 0 ? { Condition = { ArnNotLike = { "aws:PrincipalArn" = local.exempt_in[which] } } } : {},
       )] : s if var.guardrails.deletion_protection],
       [for s in [{
         Sid       = "DenyShortDeletionWindow"
@@ -642,12 +761,47 @@ locals {
         Condition = { NumericLessThan = { "kms:ScheduleKeyDeletionPendingWindowInDays" = tostring(var.guardrails.min_deletion_window_days) } }
       }] : s if var.guardrails.min_deletion_window_days > 0],
       [for s in [{
+        Sid       = "DenyLongerRotationPeriods"
+        Effect    = "Deny"
+        Principal = "*"
+        Action    = "kms:EnableKeyRotation"
+        Resource  = "*"
+        Condition = { NumericGreaterThan = { "kms:RotationPeriodInDays" = tostring(var.guardrails.max_rotation_period_days) } }
+      }] : s if var.guardrails.max_rotation_period_days > 0],
+      [for s in [{
+        Sid       = "DenyTagChanges"
+        Effect    = "Deny"
+        Principal = "*"
+        Action    = ["kms:TagResource", "kms:UntagResource"]
+        Resource  = "*"
+        Condition = { ArnNotLike = { "aws:PrincipalArn" = local.exempt_in[which] } }
+      }] : s if var.guardrails.protect_tags && length(local.exempt) > 0],
+      [for s in [{
+        Sid       = "DenyBreakGlassWithoutMfa"
+        Effect    = "Deny"
+        Principal = "*"
+        Action    = "kms:*"
+        Resource  = "*"
+        Condition = {
+          ArnLike      = { "aws:PrincipalArn" = local.break_glass }
+          BoolIfExists = { "aws:MultiFactorAuthPresent" = "false" }
+        }
+      }] : s if var.guardrails.break_glass_requires_mfa && length(local.break_glass) > 0],
+      [for s in [{
+        Sid       = "DenyDeletionOfKeysInUse"
+        Effect    = "Deny"
+        Principal = "*"
+        Action    = "kms:ScheduleKeyDeletion"
+        Resource  = "*"
+        Condition = { NumericLessThan = { "kms:TrailingDaysWithoutKeyUsage" = tostring(var.guardrails.min_days_unused_before_deletion) } }
+      }] : s if var.guardrails.min_days_unused_before_deletion > 0],
+      [for s in [{
         Sid       = "DenyPolicyChanges"
         Effect    = "Deny"
         Principal = "*"
         Action    = "kms:PutKeyPolicy"
         Resource  = "*"
-        Condition = { ArnNotLike = { "aws:PrincipalArn" = local.exempt } }
+        Condition = { ArnNotLike = { "aws:PrincipalArn" = local.exempt_in[which] } }
       }] : s if var.guardrails.protect_policy && length(local.exempt) > 0],
       [for s in [{
         Sid       = "DenyAliasAndRotationChanges"
@@ -655,9 +809,58 @@ locals {
         Principal = "*"
         Action    = ["kms:CreateAlias", "kms:UpdateAlias", "kms:DeleteAlias", "kms:DisableKeyRotation"]
         Resource  = "*"
-        Condition = { ArnNotLike = { "aws:PrincipalArn" = local.exempt } }
+        Condition = { ArnNotLike = { "aws:PrincipalArn" = local.exempt_in[which] } }
       }] : s if var.guardrails.protect_aliases_and_rotation && length(local.exempt) > 0],
     )
+  }
+
+  # Per key and region. A multi-Region key replicates only to replica_region
+  # and is promoted only between its two regions: ReplicateKey sets the copy's
+  # policy, so a copy elsewhere would escape every statement here. Owners of
+  # the replicas (replica_deployers) replicate the key from the primary and
+  # own the replica.
+  key_region_statements = {
+    for k, v in local.keys : k => {
+      for which in keys(local.regions) : which => concat(
+        [for s in [
+          {
+            Sid       = "DenyReplicationOutsideTheReplicaRegion"
+            Effect    = "Deny"
+            Principal = "*"
+            Action    = "kms:ReplicateKey"
+            Resource  = "*"
+            Condition = { StringNotEquals = { "kms:ReplicaRegion" = [local.replica_region] } }
+          },
+          {
+            Sid       = "DenyPromotionOutsideTheTwoRegions"
+            Effect    = "Deny"
+            Principal = "*"
+            Action    = "kms:UpdatePrimaryRegion"
+            Resource  = "*"
+            Condition = { StringNotEquals = { "kms:PrimaryRegion" = distinct([local.region, local.replica_region]) } }
+          },
+        ] : s if v.multi_region ? var.replica_region != "" : false],
+        [for s in [{
+          Sid       = "DenyOtherAlgorithms"
+          Effect    = "Deny"
+          Principal = "*"
+          Action    = local.algorithm_actions[local.key_kind[k]].actions
+          Resource  = "*"
+          Condition = { StringNotEquals = { (local.algorithm_actions[local.key_kind[k]].key) = v.allowed_algorithms } }
+        }] : s if length(v.allowed_algorithms) > 0 ? local.algorithm_actions[local.key_kind[k]].key != "" : false],
+        [for s in [merge(
+          { Sid = "DenyKeyMaterialDeletion", Effect = "Deny", Principal = "*", Action = "kms:DeleteImportedKeyMaterial", Resource = "*" },
+          length(local.break_glass) > 0 ? { Condition = { ArnNotLike = { "aws:PrincipalArn" = local.break_glass } } } : {},
+        )] : s if v.external ? var.guardrails.protect_key_material : false],
+        [for s in [{
+          Sid       = "ReplicaDeployers"
+          Effect    = "Allow"
+          Principal = { AWS = var.replica_deployers }
+          Action    = which == "primary" ? ["kms:DescribeKey", "kms:ReplicateKey"] : local.owner_actions[k]
+          Resource  = "*"
+        }] : s if v.replicate ? length(var.replica_deployers) > 0 : false],
+      )
+    }
   }
 
   # -------------------------------------------------------------------------
@@ -671,7 +874,7 @@ locals {
   bootstrap_statements = {
     for k, v in local.keys : k => {
       for which in keys(local.regions) : which => concat(
-        local.role_statements[k], local.preset_statements[k][which], local.extra_statements[k], local.guardrail_statements[which],
+        local.role_statements[k], local.key_region_statements[k][which], local.preset_statements[k][which], local.extra_statements[k], local.guardrail_statements[which],
       )
     }
   }
@@ -679,7 +882,7 @@ locals {
   final_statements = {
     for k, v in local.keys : k => {
       for which in keys(local.regions) : which => concat(
-        local.role_statements[k], local.preset_statements[k][which], local.contract_statements[k][which],
+        local.role_statements[k], local.key_region_statements[k][which], local.preset_statements[k][which], local.contract_statements[k][which],
         local.extra_statements[k], local.guardrail_statements[which],
       )
     }
@@ -697,11 +900,33 @@ locals {
     }
   }
 
+  # Sid is optional; only repeated non-empty ones are a problem. Both regions:
+  # the replica's policy carries its own consumer statements.
   duplicate_sids = {
-    for k, v in local.keys : k => [
-      for sid in distinct([for s in local.final_statements[k].primary : try(s.Sid, "")]) : sid
-      if length([for s in local.final_statements[k].primary : 1 if try(s.Sid, "") == sid]) > 1
-    ]
+    for k, v in local.keys : k => distinct(flatten([
+      for which in keys(local.regions) : [
+        for sid in distinct(compact([for s in local.final_statements[k][which] : try(s.Sid, "")])) : sid
+        if length([for s in local.final_statements[k][which] : 1 if try(s.Sid, "") == sid]) > 1
+      ]
+    ]))
+  }
+
+  # The algorithm condition key and the operations it governs, per key kind.
+  algorithm_actions = {
+    symmetric          = { key = "", actions = [] }
+    asymmetric_encrypt = { key = "kms:EncryptionAlgorithm", actions = ["kms:Encrypt", "kms:Decrypt", "kms:ReEncrypt*"] }
+    sign               = { key = "kms:SigningAlgorithm", actions = ["kms:Sign", "kms:Verify"] }
+    mac                = { key = "kms:MacAlgorithm", actions = ["kms:GenerateMac", "kms:VerifyMac"] }
+    agreement          = { key = "", actions = [] }
+  }
+
+  # What CreateGrant accepts per key kind.
+  grant_operations_by_kind = {
+    symmetric          = ["Decrypt", "Encrypt", "GenerateDataKey", "GenerateDataKeyWithoutPlaintext", "GenerateDataKeyPair", "GenerateDataKeyPairWithoutPlaintext", "ReEncryptFrom", "ReEncryptTo", "CreateGrant", "RetireGrant", "DescribeKey"]
+    asymmetric_encrypt = ["Encrypt", "Decrypt", "ReEncryptFrom", "ReEncryptTo", "GetPublicKey", "CreateGrant", "RetireGrant", "DescribeKey"]
+    sign               = ["Sign", "Verify", "GetPublicKey", "CreateGrant", "RetireGrant", "DescribeKey"]
+    mac                = ["GenerateMac", "VerifyMac", "CreateGrant", "RetireGrant", "DescribeKey"]
+    agreement          = ["DeriveSharedSecret", "GetPublicKey", "CreateGrant", "RetireGrant", "DescribeKey"]
   }
 
   # KMS accepts tab, newline, carriage return and U+0020 to U+00FF.

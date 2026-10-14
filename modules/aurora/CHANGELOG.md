@@ -10,8 +10,10 @@ Moving from 1.x is covered step by step in [docs/UPGRADE-2.0.md](docs/UPGRADE-2.
 
 ## [2.0.0] - unreleased
 
-A rewrite. The interface, defaults and resource addresses change; ten `moved`
-blocks carry existing deployments across.
+A rewrite. The interface, defaults and resource addresses change; 11 `moved`
+blocks carry existing deployments across, from both 1.x layouts (the subnet
+group with and without `count`). `tests/check_moved.py` rehearses the upgrade
+against the module without AWS.
 
 ### Added
 

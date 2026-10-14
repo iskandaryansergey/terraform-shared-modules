@@ -50,7 +50,8 @@ variable "acknowledged_checks" {
     keys_have_an_organization_perimeter, deletion_protection_has_an_exemption,
     cloudtrail_events_need_a_trail, multi_region_keys_are_replicated,
     key_policies_leave_room_to_grow, strict_mode_keeps_services_named,
-    replicas_have_their_vpc_endpoints.
+    replicas_have_their_vpc_endpoints, duties_are_separated,
+    imported_material_expiry_is_watched.
   EOT
   type        = list(string)
   default     = []
@@ -70,6 +71,8 @@ variable "acknowledged_checks" {
       "key_policies_leave_room_to_grow",
       "strict_mode_keeps_services_named",
       "replicas_have_their_vpc_endpoints",
+      "duties_are_separated",
+      "imported_material_expiry_is_watched",
     ], c)])
     error_message = "acknowledged_checks names a check that does not exist: ${join(", ", var.acknowledged_checks)}. See this variable's description for the names."
   }
@@ -90,13 +93,21 @@ variable "keys" {
                        mac (HMAC_256), dnssec (Route 53 DNSSEC key-signing key).
                        Its presets are added to services; spec and usage
                        override it.
+    description        default "<name> <key> (<purpose>), managed by Terraform".
     spec / usage       default SYMMETRIC_DEFAULT / ENCRYPT_DECRYPT, the only
-                       kind AWS services use. Force a new key when changed.
-    aliases            names without "alias/"; default ["<name>-<key>"].
+                       kind AWS services use. A spec without a usage keeps the
+                       purpose's usage when they combine, else takes the
+                       spec's own (ECC -> SIGN_VERIFY, HMAC -> GENERATE_VERIFY_MAC).
+                       Force a new key when changed.
+    aliases            names without "alias/"; default ["<name>-<key>"]. Unique
+                       across the set, defaults included.
+    enabled            false disables the key (deletion protection then needs
+                       the deployer to do it).
     rotation, rotation_period_days, deletion_window_days, service_access
                        null takes key_defaults.
     multi_region       a multi-Region primary. Forces a new key when changed.
-    replicate          a replica in the aws.replica provider's region.
+    replicate          a replica in replica_region, created by
+                       modules/replica from output.replicas.
     services           service presets (README "Service presets").
     via_services       extra caller-path services as kms:ViaService names,
                        "<service>.%s.amazonaws.com" (%s = the key's region).
@@ -111,11 +122,35 @@ variable "keys" {
     require_encryption_context
                        encryption context keys that direct use by users,
                        encrypters and decrypters must carry (symmetric keys).
+    encryption_context_values
+                       context key => allowed values for that direct use
+                       (StringEquals; policy variables such as
+                       "$${aws:PrincipalTag/tenant}" work): tenant isolation.
+    allowed_algorithms deny every other algorithm for this key's operations
+                       (kms:EncryptionAlgorithm, SigningAlgorithm or
+                       MacAlgorithm by kind), e.g. ["RSASSA_PSS_SHA_256"].
     custom_key_store_id / xks_key_id
                        create the key in an existing CloudHSM or external key
                        store (symmetric, single-Region, no rotation).
+    origin             "EXTERNAL": imported key material (BYOK). Symmetric on
+                       provider 5.x, no automatic rotation. The key is created
+                       pending import; key_custodians import the material out
+                       of band, so it never reaches Terraform state.
+    key_custodians     added to the module-level key_custodians for this key.
+    generations        e.g. ["2025", "2026"]: one key per generation, named
+                       <key>-<generation>, for kinds that cannot rotate
+                       automatically (signing, MAC, imported material). The
+                       last is active: it takes the key's aliases and grants,
+                       and key_arns["<key>"] points at it. Earlier ones stay
+                       for decrypting and verifying, with an alias
+                       <name>-<key>-<generation> each.
     grants             explicit grants; any change recreates the grant.
-    extra_statements   JSON list of policy statements, the escape hatch.
+                       retire_on_delete needs a retiring_principal, or
+                       kms:RetireGrant in the deployer's IAM policy.
+    extra_statements   JSON list of policy statements, the escape hatch. Sids
+                       are optional; present ones must be unique.
+    tags               merged over key_defaults.tags and tags; the module's
+                       ManagedBy, Module, KeySet and Key win. 50 at most.
   EOT
   type = map(object({
     description                = optional(string, "")
@@ -140,8 +175,13 @@ variable "keys" {
     decrypters                 = optional(list(string), [])
     grant_users                = optional(list(string), [])
     require_encryption_context = optional(list(string), [])
+    encryption_context_values  = optional(map(list(string)), {})
+    allowed_algorithms         = optional(list(string), [])
     custom_key_store_id        = optional(string, "")
     xks_key_id                 = optional(string, "")
+    origin                     = optional(string, "AWS_KMS")
+    key_custodians             = optional(list(string), [])
+    generations                = optional(list(string), [])
     grants = optional(map(object({
       grantee_principal         = string
       operations                = list(string)
@@ -186,7 +226,7 @@ variable "keys" {
 
   validation {
     condition     = alltrue([for k, v in var.keys : v.rotation_period_days == null ? true : (v.rotation_period_days >= 90 && v.rotation_period_days <= 2560 && floor(v.rotation_period_days) == v.rotation_period_days)])
-    error_message = "keys[*].rotation_period_days must be a whole number of days from 90 to 2560: ${join(", ", [for k, v in var.keys : k if v.rotation_period_days == null ? false : !(v.rotation_period_days >= 90 && v.rotation_period_days <= 2560)])}."
+    error_message = "keys[*].rotation_period_days must be a whole number of days from 90 to 2560: ${join(", ", [for k, v in var.keys : k if v.rotation_period_days == null ? false : !(v.rotation_period_days >= 90 && v.rotation_period_days <= 2560 && floor(v.rotation_period_days) == v.rotation_period_days)])}."
   }
 
   validation {
@@ -207,8 +247,8 @@ variable "keys" {
   }
 
   validation {
-    condition     = length(flatten([for k, v in var.keys : v.aliases])) == length(distinct(flatten([for k, v in var.keys : v.aliases])))
-    error_message = "keys[*].aliases: an alias name is used by more than one key. An alias points at exactly one key per region."
+    condition     = length(flatten([for k, v in var.keys : length(v.aliases) > 0 ? v.aliases : ["${var.name}-${k}"]])) == length(distinct(flatten([for k, v in var.keys : length(v.aliases) > 0 ? v.aliases : ["${var.name}-${k}"]])))
+    error_message = "keys[*].aliases: an alias name is used by more than one key - counting the default <name>-<key> of keys without aliases. An alias points at exactly one key per region."
   }
 
   validation {
@@ -246,7 +286,7 @@ variable "keys" {
   validation {
     condition = alltrue(flatten([for k, v in var.keys : [
       for p in concat(v.administrators, v.users, v.auditors, v.encrypters, v.decrypters, v.grant_users) :
-      can(regex("^arn:aws[a-z-]*:iam::[0-9]{12}:(root|role/.+|user/.+)$", p))
+      can(regex("^arn:aws[a-z-]*:iam::[0-9]{12}:(root|role/[^*?]+|user/[^*?]+)$", p))
     ]]))
     error_message = "keys[*] principals (administrators, users, auditors, encrypters, decrypters, grant_users) must be IAM role, user or account-root ARNs. Assumed-role session ARNs (arn:aws:sts::...) change with every session and do not belong in a key policy."
   }
@@ -290,8 +330,63 @@ variable "keys" {
   }
 
   validation {
-    condition     = alltrue([for k, v in var.keys : v.extra_statements == "" ? true : can(tolist(jsondecode(v.extra_statements)))])
+    condition = alltrue([
+      for k, v in var.keys : v.extra_statements == "" ? true : (
+        can(concat(jsondecode(v.extra_statements), [])) ? alltrue([for st in jsondecode(v.extra_statements) : can(st.Effect)]) : false
+      )
+    ])
     error_message = "keys[*].extra_statements must be a JSON list of policy statements, e.g. jsonencode([{ Sid = \"...\", ... }])."
+  }
+
+  validation {
+    condition     = alltrue(flatten([for k, v in var.keys : [for t, x in v.tags : length(t) <= 128 && length(x) <= 256 && !startswith(lower(t), "aws:")]]))
+    error_message = "keys[*].tags keys must be <= 128 chars, values <= 256 chars, and no key may use the reserved \"aws:\" prefix."
+  }
+
+  validation {
+    condition     = alltrue([for k, v in var.keys : contains(["AWS_KMS", "EXTERNAL"], v.origin)])
+    error_message = "keys[*].origin must be AWS_KMS or EXTERNAL (imported key material)."
+  }
+
+  validation {
+    condition     = alltrue([for k, v in var.keys : v.origin == "EXTERNAL" ? (v.custom_key_store_id == "" && contains(["", "SYMMETRIC_DEFAULT"], v.spec) && contains(["", "ENCRYPT_DECRYPT"], v.usage) && contains(["", "logs", "secrets", "database", "storage", "messaging"], v.purpose)) : true])
+    error_message = "keys[*] with origin = EXTERNAL must be symmetric (provider 5.x imports symmetric material only) and outside a custom key store: ${join(", ", [for k, v in var.keys : k if v.origin == "EXTERNAL" ? !(v.custom_key_store_id == "" && contains(["", "SYMMETRIC_DEFAULT"], v.spec) && contains(["", "ENCRYPT_DECRYPT"], v.usage) && contains(["", "logs", "secrets", "database", "storage", "messaging"], v.purpose)) : false])}."
+  }
+
+  validation {
+    condition = alltrue([for k, v in var.keys : length(v.generations) == length(distinct(v.generations)) ? alltrue([
+      for g in v.generations : can(regex("^[a-z0-9]{1,10}$", g)) ? length(k) + 1 + length(g) <= 31 : false
+    ]) : false])
+    error_message = "keys[*].generations must be distinct, 1-10 lowercase letters or digits each, and <key>-<generation> at most 31 characters."
+  }
+
+  validation {
+    condition = length(flatten([for k, v in var.keys : length(v.generations) == 0 ? [k] : [for g in v.generations : "${k}-${g}"]])) == length(distinct(flatten([
+      for k, v in var.keys : length(v.generations) == 0 ? [k] : [for g in v.generations : "${k}-${g}"]
+    ])))
+    error_message = "keys: a generation's name <key>-<generation> collides with another key's name."
+  }
+
+  validation {
+    condition = alltrue(flatten([for k, v in var.keys : [for a in v.allowed_algorithms : contains([
+      "SYMMETRIC_DEFAULT", "RSAES_OAEP_SHA_1", "RSAES_OAEP_SHA_256", "SM2PKE",
+      "RSASSA_PSS_SHA_256", "RSASSA_PSS_SHA_384", "RSASSA_PSS_SHA_512", "RSASSA_PKCS1_V1_5_SHA_256", "RSASSA_PKCS1_V1_5_SHA_384", "RSASSA_PKCS1_V1_5_SHA_512",
+      "ECDSA_SHA_256", "ECDSA_SHA_384", "ECDSA_SHA_512", "SM2DSA",
+      "HMAC_SHA_224", "HMAC_SHA_256", "HMAC_SHA_384", "HMAC_SHA_512",
+    ], a)]]))
+    error_message = "keys[*].allowed_algorithms has a name KMS does not use (e.g. RSASSA_PSS_SHA_256, RSAES_OAEP_SHA_256, ECDSA_SHA_256, HMAC_SHA_256)."
+  }
+
+  validation {
+    condition     = alltrue(flatten([for k, v in var.keys : [for c, vals in v.encryption_context_values : can(regex("^[A-Za-z0-9:_./-]{1,128}$", c)) ? length(vals) > 0 : false]]))
+    error_message = "keys[*].encryption_context_values maps context key names to a non-empty list of allowed values."
+  }
+
+  validation {
+    condition = alltrue(flatten([for k, v in var.keys : [
+      for p in v.key_custodians : can(regex("^arn:aws[a-z-]*:iam::[0-9]{12}:(role/[^*?]+|user/[^*?]+)$", p))
+    ]]))
+    error_message = "keys[*].key_custodians must be IAM role or user ARNs."
   }
 
   validation {
@@ -313,12 +408,12 @@ variable "key_defaults" {
   nullable = false
 
   validation {
-    condition     = var.key_defaults.rotation_period_days >= 90 && var.key_defaults.rotation_period_days <= 2560
-    error_message = "key_defaults.rotation_period_days must be from 90 to 2560."
+    condition     = var.key_defaults.rotation_period_days >= 90 && var.key_defaults.rotation_period_days <= 2560 && floor(var.key_defaults.rotation_period_days) == var.key_defaults.rotation_period_days
+    error_message = "key_defaults.rotation_period_days must be a whole number from 90 to 2560."
   }
 
   validation {
-    condition     = var.key_defaults.deletion_window_days >= 7 && var.key_defaults.deletion_window_days <= 30
+    condition     = var.key_defaults.deletion_window_days >= 7 && var.key_defaults.deletion_window_days <= 30 && floor(var.key_defaults.deletion_window_days) == var.key_defaults.deletion_window_days
     error_message = "key_defaults.deletion_window_days must be from 7 to 30."
   }
 
@@ -326,11 +421,28 @@ variable "key_defaults" {
     condition     = contains(["account", "named"], var.key_defaults.service_access)
     error_message = "key_defaults.service_access must be \"account\" or \"named\"."
   }
+
+  validation {
+    condition     = alltrue([for t, x in var.key_defaults.tags : length(t) <= 128 && length(x) <= 256 && !startswith(lower(t), "aws:")])
+    error_message = "key_defaults.tags keys must be <= 128 chars, values <= 256 chars, and no key may use the reserved \"aws:\" prefix."
+  }
 }
 
 # ---------------------------------------------------------------------------
 # Who
 # ---------------------------------------------------------------------------
+
+variable "replica_region" {
+  description = "Region of the replicas of keys with replicate = true, e.g. \"eu-west-1\". This module compiles their policies, aliases and notification patterns into output.replicas; modules/replica creates them there, with a provider for that region - in this workspace or a separate disaster-recovery one."
+  type        = string
+  default     = ""
+  nullable    = false
+
+  validation {
+    condition     = var.replica_region == "" ? true : can(regex("^[a-z]{2}(-gov|-iso[a-z]?)?-[a-z]+-[0-9]$", var.replica_region))
+    error_message = "replica_region must be empty or an AWS region name such as eu-west-1."
+  }
+}
 
 variable "iam_delegation" {
   description = <<-EOT
@@ -346,14 +458,38 @@ variable "iam_delegation" {
 }
 
 variable "deployers" {
-  description = "IAM role ARNs that run Terraform for these keys (the HCP Terraform workspace role). They manage the keys and their policy, create the module's grants, and are exempt from the deletion and policy guardrails. Empty: the role running the plan is detected (detect_deployer)."
+  description = "IAM role ARNs that run Terraform for these keys. They manage the keys and their policy, create the module's grants, replicate multi-Region keys, and are exempt from the deletion and policy guardrails. With HCP Terraform dynamic credentials using separate plan and apply roles, list both. Empty: the role running the plan is detected (detect_deployer) - which is the plan role, so protect_policy, protect_aliases_and_rotation and iam_delegation = false need them named."
   type        = list(string)
   default     = []
   nullable    = false
 
   validation {
-    condition     = alltrue([for p in var.deployers : can(regex("^arn:aws[a-z-]*:iam::[0-9]{12}:(role/.+|user/.+)$", p))])
+    condition     = alltrue([for p in var.deployers : can(regex("^arn:aws[a-z-]*:iam::[0-9]{12}:(role/[^*?]+|user/[^*?]+)$", p))])
     error_message = "deployers must be IAM role or user ARNs (not assumed-role session ARNs)."
+  }
+}
+
+variable "key_custodians" {
+  description = "Who imports key material into keys with origin = EXTERNAL, for every such key: GetParametersForImport (RSAES_OAEP_SHA_256 or RSA_AES_KEY_WRAP_SHA_256 wrapping only), ImportKeyMaterial, DeleteImportedKeyMaterial, DescribeKey. Typically the HSM ceremony role, not the Terraform role."
+  type        = list(string)
+  default     = []
+  nullable    = false
+
+  validation {
+    condition     = alltrue([for p in var.key_custodians : can(regex("^arn:aws[a-z-]*:iam::[0-9]{12}:(role/[^*?]+|user/[^*?]+)$", p))])
+    error_message = "key_custodians must be IAM role or user ARNs (not assumed-role session ARNs, no wildcards)."
+  }
+}
+
+variable "replica_deployers" {
+  description = "IAM role ARNs of a separate disaster-recovery workspace that runs modules/replica. They may replicate the primaries (kms:ReplicateKey, DescribeKey) and own the replicas: the replicas' policies give them the deployers' actions and exempt them from the replicas' guardrails. Not needed when modules/replica runs in this workspace."
+  type        = list(string)
+  default     = []
+  nullable    = false
+
+  validation {
+    condition     = alltrue([for p in var.replica_deployers : can(regex("^arn:aws[a-z-]*:iam::[0-9]{12}:(role/[^*?]+|user/[^*?]+)$", p))])
+    error_message = "replica_deployers must be IAM role or user ARNs (not assumed-role session ARNs, no wildcards)."
   }
 }
 
@@ -371,7 +507,7 @@ variable "administrators" {
   nullable    = false
 
   validation {
-    condition     = alltrue([for p in var.administrators : can(regex("^arn:aws[a-z-]*:iam::[0-9]{12}:(root|role/.+|user/.+)$", p))])
+    condition     = alltrue([for p in var.administrators : can(regex("^arn:aws[a-z-]*:iam::[0-9]{12}:(root|role/[^*?]+|user/[^*?]+)$", p))])
     error_message = "administrators must be IAM role, user or account-root ARNs."
   }
 }
@@ -390,7 +526,7 @@ variable "users" {
   nullable    = false
 
   validation {
-    condition     = alltrue([for p in var.users : can(regex("^arn:aws[a-z-]*:iam::[0-9]{12}:(root|role/.+|user/.+)$", p))])
+    condition     = alltrue([for p in var.users : can(regex("^arn:aws[a-z-]*:iam::[0-9]{12}:(root|role/[^*?]+|user/[^*?]+)$", p))])
     error_message = "users must be IAM role, user or account-root ARNs."
   }
 }
@@ -402,7 +538,7 @@ variable "auditors" {
   nullable    = false
 
   validation {
-    condition     = alltrue([for p in var.auditors : can(regex("^arn:aws[a-z-]*:iam::[0-9]{12}:(root|role/.+|user/.+)$", p))])
+    condition     = alltrue([for p in var.auditors : can(regex("^arn:aws[a-z-]*:iam::[0-9]{12}:(root|role/[^*?]+|user/[^*?]+)$", p))])
     error_message = "auditors must be IAM role, user or account-root ARNs."
   }
 }
@@ -426,7 +562,7 @@ variable "principal_roles" {
   }
 
   validation {
-    condition     = alltrue(flatten([for r, arns in var.principal_roles : [for p in arns : can(regex("^arn:aws[a-z-]*:iam::[0-9]{12}:(root|role/.+|user/.+)$", p))]]))
+    condition     = alltrue(flatten([for r, arns in var.principal_roles : [for p in arns : can(regex("^arn:aws[a-z-]*:iam::[0-9]{12}:(root|role/[^*?]+|user/[^*?]+)$", p))]]))
     error_message = "principal_roles values must be IAM role, user or account-root ARNs."
   }
 }
@@ -479,6 +615,21 @@ variable "guardrails" {
                               deployers and break_glass.
     min_deletion_window_days  deny scheduling a deletion with a shorter window,
                               to everyone. 0 is off.
+    min_days_unused_before_deletion
+                              deny scheduling the deletion of a key used in the
+                              last N days (kms:TrailingDaysWithoutKeyUsage),
+                              to everyone. 0 is off.
+    max_rotation_period_days  deny enabling rotation with a longer period, to
+                              everyone: a cryptoperiod nobody can stretch. 0 is
+                              off.
+    protect_key_material      deny DeleteImportedKeyMaterial (immediate,
+                              unrecoverable loss of an EXTERNAL key) except to
+                              break_glass.
+    protect_tags              deny tag changes except to deployers and
+                              break_glass - for keys whose access is granted by
+                              tag (ABAC).
+    break_glass_requires_mfa  deny break_glass principals every action unless
+                              their session was authenticated with MFA.
     protect_policy            deny PutKeyPolicy except to deployers and
                               break_glass.
     protect_aliases_and_rotation
@@ -493,16 +644,21 @@ variable "guardrails" {
     it is managed, not from its own workspace's destroy.
   EOT
   type = object({
-    organization_id                = optional(string, "")
-    trusted_accounts               = optional(list(string), [])
-    vpc_endpoint_ids               = optional(list(string), [])
-    replica_vpc_endpoint_ids       = optional(list(string), [])
-    vpc_endpoint_exempt_principals = optional(list(string), [])
-    deletion_protection            = optional(bool, true)
-    min_deletion_window_days       = optional(number, 0)
-    protect_policy                 = optional(bool, false)
-    protect_aliases_and_rotation   = optional(bool, false)
-    break_glass                    = optional(list(string), [])
+    organization_id                 = optional(string, "")
+    min_days_unused_before_deletion = optional(number, 0)
+    max_rotation_period_days        = optional(number, 0)
+    protect_key_material            = optional(bool, false)
+    protect_tags                    = optional(bool, false)
+    break_glass_requires_mfa        = optional(bool, false)
+    trusted_accounts                = optional(list(string), [])
+    vpc_endpoint_ids                = optional(list(string), [])
+    replica_vpc_endpoint_ids        = optional(list(string), [])
+    vpc_endpoint_exempt_principals  = optional(list(string), [])
+    deletion_protection             = optional(bool, true)
+    min_deletion_window_days        = optional(number, 0)
+    protect_policy                  = optional(bool, false)
+    protect_aliases_and_rotation    = optional(bool, false)
+    break_glass                     = optional(list(string), [])
   })
   default  = {}
   nullable = false
@@ -533,7 +689,17 @@ variable "guardrails" {
   }
 
   validation {
-    condition     = alltrue([for p in var.guardrails.break_glass : can(regex("^arn:aws[a-z-]*:iam::[0-9]{12}:(role/.+|user/.+)$", p))])
+    condition     = var.guardrails.min_days_unused_before_deletion >= 0 && floor(var.guardrails.min_days_unused_before_deletion) == var.guardrails.min_days_unused_before_deletion
+    error_message = "guardrails.min_days_unused_before_deletion must be a whole number of days, 0 for off."
+  }
+
+  validation {
+    condition     = var.guardrails.max_rotation_period_days == 0 ? true : (var.guardrails.max_rotation_period_days >= 90 && var.guardrails.max_rotation_period_days <= 2560 && floor(var.guardrails.max_rotation_period_days) == var.guardrails.max_rotation_period_days)
+    error_message = "guardrails.max_rotation_period_days must be 0 (off) or a whole number from 90 to 2560."
+  }
+
+  validation {
+    condition     = alltrue([for p in var.guardrails.break_glass : can(regex("^arn:aws[a-z-]*:iam::[0-9]{12}:(role/[^*?]+|user/[^*?]+)$", p))])
     error_message = "guardrails.break_glass must be IAM role or user ARNs."
   }
 }
@@ -551,25 +717,21 @@ variable "notifications" {
     active trail in the account: schedule_deletion, cancel_deletion, disable,
     enable, policy_change, rotation_disabled, rotate_on_demand, grant_change,
     alias_change, tag_change, replication.
-    replica_sns_topic_arn: a topic in the replica region, for the replicas'
-    events (EventBridge targets a topic in its own region).
-    The topic policies must let events.amazonaws.com publish: see
+    The same events are compiled for the replicas, which modules/replica
+    sends to a topic in their own region.
+    The topic policy must let events.amazonaws.com publish: see
     output.sns_topic_policy_requirement.
   EOT
   type = object({
-    sns_topic_arn         = optional(string, "")
-    replica_sns_topic_arn = optional(string, "")
-    events                = optional(list(string), ["deletion", "rotation", "import_expiry"])
+    sns_topic_arn = optional(string, "")
+    events        = optional(list(string), ["deletion", "rotation", "import_expiry"])
   })
   default  = {}
   nullable = false
 
   validation {
-    condition = alltrue([
-      for t in [var.notifications.sns_topic_arn, var.notifications.replica_sns_topic_arn] :
-      t == "" ? true : can(regex("^arn:aws[a-z-]*:sns:[a-z0-9-]+:[0-9]{12}:[A-Za-z0-9_-]+(\\.fifo)?$", t))
-    ])
-    error_message = "notifications.sns_topic_arn and replica_sns_topic_arn must be SNS topic ARNs."
+    condition     = var.notifications.sns_topic_arn == "" ? true : can(regex("^arn:aws[a-z-]*:sns:[a-z0-9-]+:[0-9]{12}:[A-Za-z0-9_-]+(\\.fifo)?$", var.notifications.sns_topic_arn))
+    error_message = "notifications.sns_topic_arn must be an SNS topic ARN."
   }
 
   validation {

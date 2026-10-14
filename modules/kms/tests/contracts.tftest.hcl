@@ -20,13 +20,6 @@ mock_provider "aws" {
   }
 }
 
-mock_provider "aws" {
-  alias = "replica"
-  mock_data "aws_region" {
-    defaults = { name = "eu-west-1" }
-  }
-}
-
 override_resource {
   target = aws_kms_key.this["data"]
   values = {
@@ -43,17 +36,10 @@ override_resource {
   }
 }
 
-override_resource {
-  target = aws_kms_replica_key.this["data"]
-  values = {
-    arn    = "arn:aws:kms:eu-west-1:111122223333:key/mrk-0123456789abcdef0123456789abcdef"
-    key_id = "mrk-0123456789abcdef0123456789abcdef"
-  }
-}
-
 variables {
-  name      = "payments"
-  deployers = ["arn:aws:iam::111122223333:role/workspace"]
+  replica_region = "eu-west-1"
+  name           = "payments"
+  deployers      = ["arn:aws:iam::111122223333:role/workspace"]
   keys = {
     data = { multi_region = true, replicate = true }
     logs = { services = ["logs"] }
@@ -453,7 +439,7 @@ run "a_public_principal_is_refused" {
     }
   }
 
-  expect_failures = [aws_kms_key_policy.this]
+  expect_failures = [terraform_data.contract_refusals]
 }
 
 run "kms_star_is_refused" {
@@ -471,7 +457,7 @@ run "kms_star_is_refused" {
     }
   }
 
-  expect_failures = [aws_kms_key_policy.this]
+  expect_failures = [terraform_data.contract_refusals]
 }
 
 run "a_management_action_is_refused" {
@@ -489,7 +475,7 @@ run "a_management_action_is_refused" {
     }
   }
 
-  expect_failures = [aws_kms_key_policy.this]
+  expect_failures = [terraform_data.contract_refusals]
 }
 
 run "a_non_kms_action_is_refused" {
@@ -507,7 +493,7 @@ run "a_non_kms_action_is_refused" {
     }
   }
 
-  expect_failures = [aws_kms_key_policy.this]
+  expect_failures = [terraform_data.contract_refusals]
 }
 
 run "a_colliding_sid_is_refused" {
@@ -522,4 +508,139 @@ run "a_colliding_sid_is_refused" {
   }
 
   expect_failures = [aws_kms_key_policy.this]
+}
+
+# ---------------------------------------------------------------------------
+# Refusals that pattern-match: IAM action names are case-insensitive and may
+# end in *, so an exact-match list alone lets PutKeyPolicy through.
+# ---------------------------------------------------------------------------
+
+run "a_wildcard_covering_a_management_action_is_refused" {
+  command = plan
+
+  variables {
+    consumers = {
+      sneaky = [{
+        key        = "arn:aws:kms:eu-west-2:111122223333:key/mrk-0123456789abcdef0123456789abcdef"
+        sid        = "Put"
+        principals = { services = [], arns = ["arn:aws:iam::111122223333:role/app"], roles = [] }
+        actions    = ["kms:Decrypt", "kms:Put*"]
+        conditions = []
+      }]
+    }
+  }
+
+  expect_failures = [terraform_data.contract_refusals]
+}
+
+run "a_management_action_in_another_case_is_refused" {
+  command = plan
+
+  variables {
+    consumers = {
+      sneaky = [{
+        key        = "arn:aws:kms:eu-west-2:111122223333:key/mrk-0123456789abcdef0123456789abcdef"
+        sid        = "Put"
+        principals = { services = [], arns = ["arn:aws:iam::111122223333:role/app"], roles = [] }
+        actions    = ["kms:putkeypolicy"]
+        conditions = []
+      }]
+    }
+  }
+
+  expect_failures = [terraform_data.contract_refusals]
+}
+
+run "a_refusal_stops_the_first_plan_before_any_key_exists" {
+  command = plan
+
+  # The key ARN this requirement names is unknown until apply; the refusal
+  # must not wait for it.
+  variables {
+    consumers = {
+      evil = [{
+        key        = "arn:aws:kms:eu-west-2:111122223333:key/not-created-yet"
+        sid        = "Open"
+        principals = { services = [], arns = ["arn:aws:iam::111122223333:role/*"], roles = [] }
+        actions    = ["kms:Decrypt"]
+        conditions = []
+      }]
+    }
+  }
+
+  expect_failures = [terraform_data.contract_refusals]
+}
+
+run "unscoped_grant_actions_only_grant_for_aws_resources" {
+  command = apply
+
+  variables {
+    consumers = {
+      copy = [{
+        key        = "arn:aws:kms:eu-west-2:111122223333:key/11111111-aaaa-bbbb-cccc-000000000002"
+        sid        = "CrossAccount"
+        principals = { services = [], arns = ["arn:aws:iam::444455556666:root"], roles = [] }
+        actions    = ["kms:DescribeKey", "kms:CreateGrant", "kms:Decrypt"]
+        conditions = []
+      }]
+    }
+    acknowledged_checks = ["keys_have_an_organization_perimeter"]
+  }
+
+  assert {
+    condition = jsonencode([for s in jsondecode(output.policies["logs"].primary).Statement : s if startswith(try(s.Sid, ""), "ConsumerCopy0")]) == jsonencode([
+      { Action = ["kms:DescribeKey", "kms:Decrypt"], Effect = "Allow", Principal = { AWS = ["arn:aws:iam::444455556666:root"] }, Resource = "*", Sid = "ConsumerCopy0CrossAccount" },
+      { Action = ["kms:CreateGrant"], Condition = { Bool = { "kms:GrantIsForAWSResource" = "true" } }, Effect = "Allow", Principal = { AWS = ["arn:aws:iam::444455556666:root"] }, Resource = "*", Sid = "ConsumerCopy0CrossAccountGrants" },
+    ])
+    error_message = "CreateGrant with neither kms:ViaService nor kms:GrantIsForAWSResource must land in its own statement that only allows grants for AWS resources - otherwise the principal could grant the key to anyone."
+  }
+}
+
+run "grant_actions_scoped_to_a_service_stay_together" {
+  command = apply
+
+  variables {
+    consumers = {
+      rds = [{
+        key        = "arn:aws:kms:eu-west-2:111122223333:key/11111111-aaaa-bbbb-cccc-000000000002"
+        sid        = "Storage"
+        principals = { services = [], arns = ["arn:aws:iam::111122223333:role/app"], roles = [] }
+        actions    = ["kms:CreateGrant", "kms:Decrypt"]
+        conditions = [{ test = "StringEquals", variable = "kms:ViaService", values = ["rds.eu-west-2.amazonaws.com"] }]
+      }]
+    }
+  }
+
+  assert {
+    condition     = length([for s in jsondecode(output.policies["logs"].primary).Statement : s if startswith(try(s.Sid, ""), "ConsumerRds0")]) == 1
+    error_message = "a grant through a named service (kms:ViaService) is already scoped and stays in one statement."
+  }
+}
+
+run "a_string_where_a_list_belongs_is_malformed" {
+  command = apply
+
+  variables {
+    consumers = {
+      sloppy = [{
+        key        = "arn:aws:kms:eu-west-2:111122223333:key/11111111-aaaa-bbbb-cccc-000000000002"
+        sid        = "Read"
+        principals = { services = [], arns = ["arn:aws:iam::111122223333:role/app"], roles = [] }
+        actions    = "kms:Decrypt"
+        conditions = []
+      }]
+    }
+  }
+
+  expect_failures = [check.every_requirement_is_machine_readable]
+
+  assert {
+    condition     = jsonencode(output.coverage.malformed) == jsonencode(["sloppy[0] Read"])
+    error_message = "a string where actions must be a list is reported as malformed."
+  }
+
+  assert {
+    condition     = length([for s in jsondecode(output.policies["logs"].primary).Statement : s if startswith(try(s.Sid, ""), "ConsumerSloppy")]) == 0
+    error_message = "a malformed requirement compiles nothing - not a statement with Action = []."
+  }
 }

@@ -19,16 +19,10 @@ mock_provider "aws" {
   }
 }
 
-mock_provider "aws" {
-  alias = "replica"
-  mock_data "aws_region" {
-    defaults = { name = "eu-west-1" }
-  }
-}
-
 variables {
-  name      = "payments"
-  deployers = ["arn:aws:iam::111122223333:role/workspace"]
+  replica_region = "eu-west-1"
+  name           = "payments"
+  deployers      = ["arn:aws:iam::111122223333:role/workspace"]
 }
 
 # ---------------------------------------------------------------------------
@@ -98,6 +92,26 @@ run "administrators_manage_but_cannot_grant_themselves_use" {
       if contains(try(tolist(s.Principal.AWS), []), "arn:aws:iam::111122223333:role/kms-admins") ? contains(s.Action, "kms:ScheduleKeyDeletion") : false
     ]) == 1
     error_message = "administrators still manage the key's lifecycle."
+  }
+}
+
+run "administrators_cannot_replicate_a_key" {
+  command = plan
+
+  variables {
+    administrators      = ["arn:aws:iam::111122223333:role/key-admin"]
+    keys                = { main = { multi_region = true } }
+    acknowledged_checks = ["multi_region_keys_are_replicated"]
+  }
+
+  assert {
+    condition     = !contains(one([for s in jsondecode(output.policies["main"].primary).Statement : s.Action if try(s.Sid, "") == "Administrators"]), "kms:ReplicateKey")
+    error_message = "ReplicateKey sets the copy's policy: as strong as PutKeyPolicy over the key material, so administrators do not get it."
+  }
+
+  assert {
+    condition     = contains(one([for s in jsondecode(output.policies["main"].primary).Statement : s.Action if try(s.Sid, "") == "Deployers"]), "kms:ReplicateKey")
+    error_message = "deployers still replicate multi-Region keys."
   }
 }
 
@@ -327,7 +341,6 @@ run "every_caller_path_preset_names_the_documented_service" {
       codeartifact     = ["codeartifact.eu-west-2.amazonaws.com"]
       directoryservice = ["directoryservice.eu-west-2.amazonaws.com"]
       storagegateway   = ["storagegateway.eu-west-2.amazonaws.com"]
-      ses              = ["ses.eu-west-2.amazonaws.com"]
       connect          = ["connect.eu-west-2.amazonaws.com"]
       workspaces       = ["workspaces.eu-west-2.amazonaws.com"]
       xray             = ["xray.eu-west-2.amazonaws.com"]
@@ -358,6 +371,7 @@ run "every_service_principal_preset_names_the_documented_principal" {
       "eventbridge-to-sqs" = ["events.amazonaws.com"]
       "s3-events-to-sqs"   = ["s3.amazonaws.com"]
       "sns-to-sqs"         = ["sns.amazonaws.com"]
+      ses                  = ["ses.amazonaws.com"]
     })
 
     error_message = "a service-principal preset names the wrong principal: ${jsonencode({ for name, stmts in output.service_presets.service_principal : name => distinct([for s in stmts : try(s.Principal.Service, s.Principal.AWS)]) })}"
@@ -384,6 +398,7 @@ run "every_service_principal_preset_is_scoped_as_documented" {
       "eventbridge-to-sqs" = ["StringEquals:aws:SourceAccount"]
       "s3-events-to-sqs"   = ["StringEquals:aws:SourceAccount"]
       "sns-to-sqs"         = ["StringEquals:aws:SourceAccount"]
+      ses                  = ["StringEquals:aws:SourceAccount"]
     })
 
     error_message = "a service-principal preset carries the wrong conditions (EventBridge to SNS must carry none): ${jsonencode({ for name, stmts in output.service_presets.service_principal : name => sort(distinct(flatten([for s in stmts : [for t, kv in try(s.Condition, {}) : [for key, val in kv : "${t}:${key}"]]]))) })}"

@@ -15,8 +15,14 @@ locals {
   ]
   unresolved_roles     = distinct(flatten([for r in local.machine : [for role in r.unresolved_roles : "${role} (${r.label})"]]))
   without_principals   = [for r in local.machine : r.label if length(r.services) + length(r.arns) + length(r.roles) == 0]
-  not_machine_readable = [for r in local.classified : "${r.label}${r.purpose != "" ? ": ${r.purpose}" : ""}" if !r.machine]
-  malformed            = [for r in local.classified : r.label if r.malformed]
+  not_machine_readable = [for r in local.classified_full : "${r.label}${r.purpose != "" ? ": ${r.purpose}" : ""}" if r.applicable ? !r.machine : false]
+  malformed            = [for r in local.classified_full : r.label if r.malformed]
+
+  duty_overlaps = flatten([
+    for k, v in local.keys : [
+      for p in v.administrators : "${p} on ${k}" if contains(concat(v.users, v.encrypters, v.decrypters, v.grant_users), p)
+    ]
+  ])
 
   policy_sizes = { for k, v in local.keys : k => length(local.final_policy[k].primary) }
 
@@ -36,8 +42,8 @@ locals {
 
 check "symmetric_keys_rotate" {
   assert {
-    condition     = contains(local.acknowledged, "symmetric_keys_rotate") || !local.create ? true : length([for k, v in local.keys : k if local.key_kind[k] == "symmetric" && !v.custom_store && !v.rotation]) == 0
-    error_message = "these symmetric keys do not rotate: ${join(", ", [for k, v in local.keys : k if local.key_kind[k] == "symmetric" && !v.custom_store && !v.rotation])}. Rotation costs at most $2/month per key (the first two rotations) and limits what one key version protects."
+    condition     = contains(local.acknowledged, "symmetric_keys_rotate") || !local.create ? true : length([for k, v in local.keys : k if local.key_kind[k] == "symmetric" && !v.custom_store && !v.external && !v.rotation]) == 0
+    error_message = "these symmetric keys do not rotate: ${join(", ", [for k, v in local.keys : k if local.key_kind[k] == "symmetric" && !v.custom_store && !v.external && !v.rotation])}. Rotation costs at most $2/month per key (the first two rotations) and limits what one key version protects."
   }
 }
 
@@ -93,7 +99,7 @@ check "cloudtrail_events_need_a_trail" {
 check "multi_region_keys_are_replicated" {
   assert {
     condition     = contains(local.acknowledged, "multi_region_keys_are_replicated") || !local.create ? true : length([for k, v in local.keys : k if v.multi_region && !v.replicate]) == 0
-    error_message = "these multi-Region primaries have no replica here: ${join(", ", [for k, v in local.keys : k if v.multi_region && !v.replicate])}. Fine if another configuration replicates them; otherwise multi_region only made the key unchangeable back to single-Region."
+    error_message = "these multi-Region primaries have replicate = false: ${join(", ", [for k, v in local.keys : k if v.multi_region && !v.replicate])}. Fine if another configuration replicates them; otherwise multi_region only made the key unchangeable back to single-Region."
   }
 }
 
@@ -115,5 +121,21 @@ check "replicas_have_their_vpc_endpoints" {
   assert {
     condition     = contains(local.acknowledged, "replicas_have_their_vpc_endpoints") || !local.create ? true : (length(var.guardrails.vpc_endpoint_ids) == 0 || length(local.replicated_keys) == 0 || length(var.guardrails.replica_vpc_endpoint_ids) > 0)
     error_message = "the primaries only accept direct calls through KMS VPC endpoints, but replica_vpc_endpoint_ids is empty, so the replicas accept direct calls from anywhere. VPC endpoints are regional: list the replica region's."
+  }
+}
+
+# Separation of duties: whoever manages a key should not also use it.
+check "duties_are_separated" {
+  assert {
+    condition     = contains(local.acknowledged, "duties_are_separated") || !local.create ? true : length(local.duty_overlaps) == 0
+    error_message = "these principals both administer and use a key: ${join("; ", local.duty_overlaps)}. A key administrator who can also decrypt needs no one else to read the data."
+  }
+}
+
+# Imported material can expire, and the key stops working when it does.
+check "imported_material_expiry_is_watched" {
+  assert {
+    condition     = contains(local.acknowledged, "imported_material_expiry_is_watched") || !local.create ? true : length([for k, v in local.keys : k if v.external]) == 0 || (var.notifications.sns_topic_arn != "" && contains(var.notifications.events, "import_expiry"))
+    error_message = "keys with imported material (${join(", ", [for k, v in local.keys : k if v.external])}) have no import_expiry notification. When material imported with an expiry runs out, the key stops working; set notifications.sns_topic_arn, or acknowledge if the material never expires."
   }
 }

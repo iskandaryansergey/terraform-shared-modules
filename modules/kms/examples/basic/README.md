@@ -9,10 +9,9 @@ Two keys in one call:
 
 What it shows:
 
-- `providers = { aws = aws, aws.replica = aws }`: the module always takes a
-  replica provider. When nothing replicates, pass the default one.
-- The deploying role is named in `deployers`. It gets the administrator
-  actions, which lets the next apply change the policy. It is also exempt from
+- The deploying role is named in `deployers`. It gets the management
+  actions plus `PutKeyPolicy`, `CreateGrant` and replication, which lets the
+  next apply change the policy. It is also exempt from
   deletion protection, so `terraform destroy` still works.
 - `guardrails.organization_id` denies use of the keys by any principal outside
   the organization. AWS service principals are exempt.

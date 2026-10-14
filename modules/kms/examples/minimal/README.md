@@ -23,7 +23,9 @@ What fails in it:
 
 - **Detection needs `iam:GetRole`** on the workspace role. Without it the
   plan fails reading `aws_iam_session_context`. Name the role in `deployers`
-  instead, or set `detect_deployer = false`.
+  instead. (`detect_deployer = false` alone leaves no deployer: deletion
+  protection then denies deletion and disabling to everyone, and a check
+  warns.)
 - **A different identity planning later**, for example a developer running a
   local plan, shows as a policy change: the detected deployer changes. Name
   the workspace role in `deployers` to pin it.

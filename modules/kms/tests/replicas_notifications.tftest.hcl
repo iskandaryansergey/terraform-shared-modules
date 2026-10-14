@@ -18,13 +18,6 @@ mock_provider "aws" {
   }
 }
 
-mock_provider "aws" {
-  alias = "replica"
-  mock_data "aws_region" {
-    defaults = { name = "eu-west-1" }
-  }
-}
-
 override_resource {
   target = aws_kms_key.this["data"]
   values = {
@@ -41,17 +34,10 @@ override_resource {
   }
 }
 
-override_resource {
-  target = aws_kms_replica_key.this["data"]
-  values = {
-    arn    = "arn:aws:kms:eu-west-1:111122223333:key/mrk-0123456789abcdef0123456789abcdef"
-    key_id = "mrk-0123456789abcdef0123456789abcdef"
-  }
-}
-
 variables {
-  name      = "payments"
-  deployers = ["arn:aws:iam::111122223333:role/workspace"]
+  replica_region = "eu-west-1"
+  name           = "payments"
+  deployers      = ["arn:aws:iam::111122223333:role/workspace"]
   keys = {
     data = { multi_region = true, replicate = true, services = ["logs", "rds"] }
     sig  = { purpose = "signing" }
@@ -62,17 +48,36 @@ variables {
 # Replicas
 # ---------------------------------------------------------------------------
 
-run "a_replica_has_its_own_policy_aliases_and_region" {
+run "a_replica_is_compiled_for_its_region" {
   command = apply
 
   assert {
-    condition     = aws_kms_replica_key.this["data"].primary_key_arn == "arn:aws:kms:eu-west-2:111122223333:key/mrk-0123456789abcdef0123456789abcdef"
-    error_message = "the replica must point at its primary."
+    condition     = output.replicas.region == "eu-west-1"
+    error_message = "the blueprint is for replica_region."
   }
 
   assert {
-    condition     = keys(aws_kms_alias.replica) == ["data/payments-data"]
-    error_message = "aliases are per region: only the replicated key gets replica aliases."
+    condition     = jsonencode(keys(output.replicas.keys)) == jsonencode(["data"])
+    error_message = "only replicating keys are in the blueprint."
+  }
+
+  assert {
+    condition = (
+      output.replicas.keys["data"].primary_key_arn == "arn:aws:kms:eu-west-2:111122223333:key/mrk-0123456789abcdef0123456789abcdef" &&
+      output.replicas.keys["data"].arn == "arn:aws:kms:eu-west-1:111122223333:key/mrk-0123456789abcdef0123456789abcdef" &&
+      output.keys["data"].replica_arn == output.replicas.keys["data"].arn
+    )
+    error_message = "the replica ARN is the primary's key ID in the replica region, known before the replica exists."
+  }
+
+  assert {
+    condition     = output.replicas.keys["data"].policy == output.policies["data"].replica && output.policies["sig"].replica == null
+    error_message = "the blueprint carries the compiled replica policy; a key without a replica has none."
+  }
+
+  assert {
+    condition     = jsonencode(output.replicas.keys["data"].aliases) == jsonencode(["alias/payments-data"]) && output.replicas.keys["data"].tags.Key == "data"
+    error_message = "the replica gets the primary's aliases and tags."
   }
 
   assert {
@@ -86,20 +91,57 @@ run "a_replica_has_its_own_policy_aliases_and_region" {
   }
 
   assert {
-    condition     = output.keys["data"].replica_arn == "arn:aws:kms:eu-west-1:111122223333:key/mrk-0123456789abcdef0123456789abcdef" && output.policies["sig"].replica == null
-    error_message = "output.keys carries the replica ARN; a key without a replica has no replica policy."
+    condition     = aws_kms_key_policy.this["data"].policy == output.policies["data"].primary
+    error_message = "the primary's policy resource applies the primary's document."
   }
+}
+
+run "a_set_without_replicas_has_no_blueprint" {
+  command = apply
+
+  variables {
+    keys = { data = {}, sig = { purpose = "signing" } }
+  }
+
+  assert {
+    condition     = output.replicas == null
+    error_message = "with nothing replicating there is nothing for modules/replica to create."
+  }
+
+  assert {
+    condition     = output.keys["data"].replica_arn == null
+    error_message = "a key that does not replicate has no replica ARN."
+  }
+}
+
+run "a_replica_needs_a_replica_region" {
+  command = plan
+
+  variables {
+    replica_region = ""
+  }
+
+  expect_failures = [aws_kms_key.this]
 }
 
 run "a_replica_in_the_primary_region_is_refused" {
   command = plan
 
-  override_data {
-    target = data.aws_region.replica
-    values = { name = "eu-west-2" }
+  variables {
+    replica_region = "eu-west-2"
   }
 
-  expect_failures = [aws_kms_replica_key.this]
+  expect_failures = [aws_kms_key.this]
+}
+
+run "replica_region_is_a_region_name" {
+  command = plan
+
+  variables {
+    replica_region = "Ireland"
+  }
+
+  expect_failures = [var.replica_region]
 }
 
 run "a_multi_region_key_without_a_replica_warns" {
@@ -178,29 +220,43 @@ run "cloudtrail_events_warn_until_a_trail_is_confirmed" {
   expect_failures = [check.cloudtrail_events_need_a_trail]
 }
 
-run "replica_events_go_to_a_topic_in_the_replica_region" {
+run "replica_notification_patterns_match_the_replicas" {
+  command = apply
+
+  variables {
+    notifications = { sns_topic_arn = "arn:aws:sns:eu-west-2:111122223333:alerts" }
+  }
+
+  assert {
+    condition     = jsonencode(jsondecode(output.replicas.notifications.native_pattern).resources) == jsonencode(["arn:aws:kms:eu-west-1:111122223333:key/mrk-0123456789abcdef0123456789abcdef"])
+    error_message = "the replica region's native rule must match the replicas, not the primaries."
+  }
+
+  assert {
+    condition     = output.replicas.notifications.cloudtrail_pattern == "" && output.sns_topic_policy_requirement.Resource == "arn:aws:sns:eu-west-2:111122223333:alerts"
+    error_message = "no CloudTrail events chosen, no CloudTrail pattern; the primary's topic requirement names the primary's topic."
+  }
+}
+
+run "replication_events_are_matched_where_they_are_logged" {
   command = apply
 
   variables {
     notifications = {
-      sns_topic_arn         = "arn:aws:sns:eu-west-2:111122223333:alerts"
-      replica_sns_topic_arn = "arn:aws:sns:eu-west-1:111122223333:alerts"
+      sns_topic_arn = "arn:aws:sns:eu-west-2:111122223333:alerts"
+      events        = ["replication"]
     }
+    acknowledged_checks = ["cloudtrail_events_need_a_trail"]
   }
 
   assert {
-    condition     = jsondecode(aws_cloudwatch_event_rule.replica_native[0].event_pattern).resources == ["arn:aws:kms:eu-west-1:111122223333:key/mrk-0123456789abcdef0123456789abcdef"]
-    error_message = "the replica rule must match the replicas."
+    condition     = jsonencode(jsondecode(aws_cloudwatch_event_rule.cloudtrail[0].event_pattern).detail.eventName) == jsonencode(["ReplicateKey", "UpdatePrimaryRegion"])
+    error_message = "the primary region logs ReplicateKey and UpdatePrimaryRegion."
   }
 
   assert {
-    condition     = aws_cloudwatch_event_target.replica_native[0].arn == "arn:aws:sns:eu-west-1:111122223333:alerts"
-    error_message = "replica events go to the replica region's topic."
-  }
-
-  assert {
-    condition     = output.sns_topic_policy_requirement.replica.Resource == "arn:aws:sns:eu-west-1:111122223333:alerts" && output.sns_topic_policy_requirement.primary.Principal.Service == "events.amazonaws.com"
-    error_message = "each topic gets its own policy requirement."
+    condition     = jsonencode(jsondecode(output.replicas.notifications.cloudtrail_pattern).detail.eventName) == jsonencode(["UpdatePrimaryRegion"])
+    error_message = "ReplicateKey is logged only in the primary's region: the replica region's rule must not wait for it."
   }
 }
 
@@ -212,7 +268,7 @@ run "the_cost_is_stated" {
   command = plan
 
   assert {
-    condition     = output.cost.monthly_usd_first_year == 3 && output.cost.monthly_usd_upper_bound == 7
+    condition     = output.cost.monthly_usd_before_rotation == 3 && output.cost.monthly_usd_upper_bound == 7
     error_message = "two keys and one replica: $3 before rotation; the rotating data key and its replica reach $3 each, the signing key stays at $1."
   }
 }
@@ -269,5 +325,10 @@ run "verify_commands_name_the_region_and_the_replica" {
   assert {
     condition     = strcontains(output.verify_commands["data"].policy, "--region eu-west-2") && strcontains(output.verify_commands["data"].replica_policy, "--region eu-west-1")
     error_message = "verify commands must name each key's region, including the replica's."
+  }
+
+  assert {
+    condition     = strcontains(output.verify_commands["data"].rotations, "list-key-rotations") && strcontains(output.verify_commands["data"].public, "check-no-public-access --region eu-west-2 --resource-type AWS::KMS::Key")
+    error_message = "verify commands carry the rotation history (audit evidence) and an Access Analyzer public-access check."
   }
 }

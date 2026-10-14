@@ -12,8 +12,10 @@ What it shows:
 - **`iam_delegation = false`.** There is no account-root statement, so an IAM
   policy alone grants nothing. The plan refuses this without a deployer: KMS
   rejects a policy that locks out the principal applying it.
-- **The deployer is named, and detection is off.** A detected deployer
-  follows whoever plans; a strict key names it once.
+- **The deployer is named, and detection is off.** The plan refuses
+  `iam_delegation = false` and `protect_policy` without named deployers: a
+  detected deployer is the plan's role, and HCP Terraform may apply as
+  another. With separate plan and apply roles, list both.
 - **Separation of duties.**
   - `administrators` manage the keys but cannot use them, create grants or
     change the policy.
@@ -29,8 +31,8 @@ What it shows:
     makes for a caller are exempt);
   - no deletion window under 30 days, for anyone;
   - policy, alias and rotation changes only by the deployer and break-glass.
-- **Notifications** include CloudTrail-based events: policy changes, alias
-  changes and rotation being turned off.
+- **Notifications** include CloudTrail-based events: scheduled deletion,
+  disabling, policy changes, alias changes and rotation being turned off.
 - **`organization_policy_snippets`** gives an SCP and an RCP that enforce the
   same perimeter at the organization level, for the platform team.
 

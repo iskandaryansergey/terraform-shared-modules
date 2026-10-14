@@ -20,15 +20,9 @@ mock_provider "aws" {
   }
 }
 
-mock_provider "aws" {
-  alias = "replica"
-  mock_data "aws_region" {
-    defaults = { name = "eu-west-1" }
-  }
-}
-
 variables {
-  name = "payments"
+  replica_region = "eu-west-1"
+  name           = "payments"
 }
 
 # ---------------------------------------------------------------------------
@@ -49,7 +43,7 @@ run "the_minimal_call_is_one_rotating_key_with_no_warnings" {
   }
 
   assert {
-    condition     = aws_kms_alias.this["main/payments-main"].name == "alias/payments-main"
+    condition     = aws_kms_alias.this["payments-main"].name == "alias/payments-main"
     error_message = "the default alias is alias/<name>-<key>."
   }
 
@@ -262,9 +256,131 @@ run "grants_carry_their_constraints" {
   }
 }
 
+run "a_purpose_keeps_its_usage_when_the_spec_allows_it" {
+  command = plan
+
+  variables {
+    keys = { sig = { purpose = "signing", spec = "RSA_2048" }, enc = { spec = "RSA_2048" } }
+  }
+
+  assert {
+    condition     = aws_kms_key.this["sig"].key_usage == "SIGN_VERIFY"
+    error_message = "signing + RSA_2048 is a signing key: the purpose's usage wins when the spec allows it (fixing it later replaces the key)."
+  }
+
+  assert {
+    condition     = aws_kms_key.this["enc"].key_usage == "ENCRYPT_DECRYPT"
+    error_message = "a spec alone takes its natural usage."
+  }
+}
+
+run "aliases_are_addressed_by_name" {
+  command = plan
+
+  variables {
+    keys = { old = {}, new = { aliases = ["payments-app"] } }
+  }
+
+  assert {
+    condition     = aws_kms_alias.this["payments-app"].name == "alias/payments-app"
+    error_message = "an alias is addressed by its name alone, so moving it to another key updates it in place."
+  }
+}
+
+run "extra_statements_take_statements_of_any_shape" {
+  command = plan
+
+  variables {
+    keys = { main = { extra_statements = jsonencode([
+      { Effect = "Allow", Principal = { AWS = "arn:aws:iam::111122223333:role/a" }, Action = "kms:Decrypt", Resource = "*" },
+      { Effect = "Allow", Principal = { AWS = "arn:aws:iam::111122223333:role/b" }, Action = ["kms:Encrypt"], Resource = "*", Condition = { Bool = { "aws:SecureTransport" = "true" } } },
+    ]) } }
+    acknowledged_checks = ["keys_have_an_organization_perimeter"]
+  }
+
+  assert {
+    condition     = length(aws_kms_key.this) == 1
+    error_message = "statements of different shapes, and without Sids, are a valid policy - neither a type error nor a duplicate Sid."
+  }
+}
+
+run "a_disabled_signing_key_is_not_read_for_its_public_key" {
+  command = plan
+
+  variables {
+    keys = { sig = { purpose = "signing", enabled = false } }
+  }
+
+  assert {
+    condition     = length(data.aws_kms_public_key.this) == 0
+    error_message = "GetPublicKey fails on a disabled key; reading it would break every plan."
+  }
+}
+
+run "the_planning_identity_without_a_role_is_no_deployer" {
+  command = plan
+
+  override_data {
+    target = data.aws_iam_session_context.deployer
+    values = { issuer_arn = "arn:aws:sts::111122223333:federated-user/bob" }
+  }
+
+  variables {
+    deployers           = []
+    acknowledged_checks = ["deletion_protection_has_an_exemption"]
+  }
+
+  assert {
+    condition     = output.governance.deployers_source == "none"
+    error_message = "a federated-user session is not an IAM role: no deployer, and no crash."
+  }
+}
+
 # ---------------------------------------------------------------------------
 # Key-level preconditions
 # ---------------------------------------------------------------------------
+
+run "a_grant_operation_the_key_kind_cannot_take_is_refused" {
+  command = plan
+  variables {
+    keys = { sig = { purpose = "signing", grants = { app = { grantee_principal = "arn:aws:iam::111122223333:role/app", operations = ["Decrypt"] } } } }
+  }
+  expect_failures = [aws_kms_grant.this]
+}
+
+run "a_context_constraint_on_a_signing_key_is_refused" {
+  command = plan
+  variables {
+    keys = { sig = { purpose = "signing", grants = { app = { grantee_principal = "arn:aws:iam::111122223333:role/app", operations = ["Sign"], encryption_context_equals = { a = "b" } } } } }
+  }
+  expect_failures = [aws_kms_grant.this]
+}
+
+run "more_than_fifty_tags_are_refused" {
+  command = plan
+  variables {
+    tags = { for i in range(47) : "t${i}" => "x" }
+  }
+  expect_failures = [aws_kms_key.this]
+}
+
+run "policy_protection_needs_named_deployers" {
+  command = plan
+  variables {
+    deployers  = []
+    guardrails = { protect_policy = true, break_glass = ["arn:aws:iam::111122223333:role/break-glass"] }
+  }
+  expect_failures = [aws_kms_key.this]
+}
+
+run "strict_mode_needs_named_deployers" {
+  command = plan
+  variables {
+    deployers      = []
+    iam_delegation = false
+  }
+  expect_failures = [aws_kms_key.this]
+}
 
 run "spec_and_usage_must_combine" {
   command = plan
@@ -451,6 +567,54 @@ run "aliases_are_bare_names" {
     keys = { main = { aliases = ["alias/payments"] } }
   }
   expect_failures = [var.keys]
+}
+
+run "a_default_alias_cannot_collide_with_a_named_one" {
+  command = plan
+  variables {
+    keys = { db = {}, other = { aliases = ["payments-db"] } }
+  }
+  expect_failures = [var.keys]
+}
+
+run "key_tags_cannot_use_the_aws_prefix" {
+  command = plan
+  variables {
+    keys = { main = { tags = { "aws:owner" = "x" } } }
+  }
+  expect_failures = [var.keys]
+}
+
+run "key_default_tags_cannot_use_the_aws_prefix" {
+  command = plan
+  variables {
+    key_defaults = { tags = { "AWS:owner" = "x" } }
+  }
+  expect_failures = [var.key_defaults]
+}
+
+run "key_defaults_rotation_period_is_a_whole_number" {
+  command = plan
+  variables {
+    key_defaults = { rotation_period_days = 100.5 }
+  }
+  expect_failures = [var.key_defaults]
+}
+
+run "principals_cannot_be_wildcards" {
+  command = plan
+  variables {
+    users = ["arn:aws:iam::111122223333:role/*"]
+  }
+  expect_failures = [var.users]
+}
+
+run "replica_deployers_are_role_arns" {
+  command = plan
+  variables {
+    replica_deployers = ["arn:aws:sts::111122223333:assumed-role/dr/x"]
+  }
+  expect_failures = [var.replica_deployers]
 }
 
 run "aws_aliases_are_reserved" {
@@ -701,7 +865,7 @@ run "break_glass_are_role_arns" {
 run "notification_topics_are_validated" {
   command = plan
   variables {
-    notifications = { replica_sns_topic_arn = "topic" }
+    notifications = { sns_topic_arn = "topic" }
   }
   expect_failures = [var.notifications]
 }
@@ -731,17 +895,14 @@ run "create_false_plans_nothing_and_every_output_is_empty" {
       }
       sig = { purpose = "signing" }
     }
-    notifications = { sns_topic_arn = "arn:aws:sns:eu-west-2:111122223333:alerts", replica_sns_topic_arn = "arn:aws:sns:eu-west-1:111122223333:alerts", events = ["deletion", "disable"] }
+    notifications = { sns_topic_arn = "arn:aws:sns:eu-west-2:111122223333:alerts", events = ["deletion", "disable"] }
   }
 
   assert {
     condition = (
-      length(aws_kms_key.this) + length(aws_kms_key_policy.this) + length(aws_kms_alias.this) + length(aws_kms_grant.this) +
-      length(aws_kms_replica_key.this) + length(aws_kms_key_policy.replica) + length(aws_kms_alias.replica) +
+      length(aws_kms_key.this) + length(aws_kms_key_policy.this) + length(aws_kms_alias.this) + length(aws_kms_grant.this) + length(terraform_data.contract_refusals) +
       length(aws_cloudwatch_event_rule.native) + length(aws_cloudwatch_event_rule.cloudtrail) +
-      length(aws_cloudwatch_event_rule.replica_native) + length(aws_cloudwatch_event_rule.replica_cloudtrail) +
-      length(aws_cloudwatch_event_target.native) + length(aws_cloudwatch_event_target.cloudtrail) +
-      length(aws_cloudwatch_event_target.replica_native) + length(aws_cloudwatch_event_target.replica_cloudtrail)
+      length(aws_cloudwatch_event_target.native) + length(aws_cloudwatch_event_target.cloudtrail)
     ) == 0
     error_message = "create = false must plan no resources."
   }
@@ -749,7 +910,7 @@ run "create_false_plans_nothing_and_every_output_is_empty" {
   assert {
     condition = (
       length(data.aws_partition.current) + length(data.aws_region.current) + length(data.aws_caller_identity.current) +
-      length(data.aws_region.replica) + length(data.aws_iam_session_context.deployer) + length(data.aws_kms_public_key.this)
+      length(data.aws_iam_session_context.deployer) + length(data.aws_kms_public_key.this)
     ) == 0
     error_message = "create = false must read no data sources."
   }
@@ -764,8 +925,8 @@ run "create_false_plans_nothing_and_every_output_is_empty" {
 
   assert {
     condition = (
-      output.coverage == null && output.governance == null && output.cost == null && output.verify_commands == null &&
-      output.sns_topic_policy_requirement == null && output.organization_policy_snippets == null
+      output.coverage == null && output.governance == null && output.cost == null && length(output.verify_commands) == 0 &&
+      output.sns_topic_policy_requirement == null && output.organization_policy_snippets == null && output.replicas == null
     )
     error_message = "create = false must leave the object outputs null (service_presets and contract_schema are static)."
   }

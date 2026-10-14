@@ -17,8 +17,7 @@ provider "aws" {
 }
 
 module "kms" {
-  source    = "../.."
-  providers = { aws = aws, aws.replica = aws }
+  source = "../.."
 
   name = "orders"
 }

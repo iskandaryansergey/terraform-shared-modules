@@ -8,6 +8,8 @@ output and fails on what a reviewer should never have to spot by eye:
 
   errors (exit 1)
     - a cluster, instance or global cluster that would be deleted or replaced
+    - a subnet group that would be deleted or replaced (the cluster names it;
+      the name is ForceNew there), or a log group (its logs go with it)
     - a cluster without storage encryption, or without deletion protection
     - an instance that is publicly accessible
     - a security group rule open to 0.0.0.0/0 or ::/0
@@ -41,7 +43,10 @@ import re
 import sys
 from dataclasses import dataclass, field
 
-PROTECTED = {"aws_rds_cluster", "aws_rds_cluster_instance", "aws_rds_global_cluster"}
+PROTECTED = {
+    "aws_rds_cluster", "aws_rds_cluster_instance", "aws_rds_global_cluster",
+    "aws_db_subnet_group", "aws_cloudwatch_log_group",
+}
 MODULE_TYPES = PROTECTED | {
     "aws_db_subnet_group", "aws_security_group", "aws_rds_cluster_parameter_group",
     "aws_db_parameter_group", "aws_db_proxy", "aws_rds_cluster_endpoint",
@@ -118,8 +123,10 @@ def check(plan: dict, require_cmk: bool, required_tags: list[str], allow_replace
                 r.errors.append(f"{address}: storage_encrypted is false")
             if after.get("deletion_protection") is False:
                 r.errors.append(f"{address}: deletion_protection is false")
-            # The value is redacted in the JSON; its presence is not.
-            if after_sensitive.get("master_password") is True or after.get("master_password"):
+            # `terraform show -json` includes sensitive values. after_sensitive
+            # alone means nothing: the schema marks master_password sensitive,
+            # so it is true on every cluster, password or not.
+            if after.get("master_password") is not None or after_unknown.get("master_password") is True:
                 r.errors.append(f"{address}: master_password is set - it is stored in state in plaintext")
             if require_cmk and not after.get("kms_key_id"):
                 # Unknown is either "AWS picks the default key" (nothing
@@ -169,8 +176,9 @@ def self_test() -> int:
     clean = {"resource_changes": [
         _rc("module.db.aws_rds_cluster.this[0]", "aws_rds_cluster", ["create"], {
             "storage_encrypted": True, "deletion_protection": True, "kms_key_id": "arn:aws:kms:x",
-            "tags_all": {"CostCentre": "cc-1", "Owner": "team"},
-        }, {"master_password": False}),
+            "tags_all": {"CostCentre": "cc-1", "Owner": "team"}, "master_password": None,
+        # Sensitive by schema, null in value: an RDS-managed password. Clean.
+        }, {"master_password": True}),
         _rc('module.db.aws_rds_cluster_instance.this["1"]', "aws_rds_cluster_instance", ["update"], {"publicly_accessible": False}),
         _rc('module.db.aws_vpc_security_group_ingress_rule.this["app"]', "aws_vpc_security_group_ingress_rule", ["create"], {"cidr_ipv4": "10.0.0.0/16"}),
         _rc("module.db.aws_rds_cluster_parameter_group.this[0]", "aws_rds_cluster_parameter_group", ["create"], {
@@ -182,18 +190,21 @@ def self_test() -> int:
     bad = {"resource_changes": [
         _rc("module.db.aws_rds_cluster.this[0]", "aws_rds_cluster", ["delete", "create"], {
             "storage_encrypted": False, "deletion_protection": False, "kms_key_id": None, "tags_all": {"Owner": ""},
+            "master_password": "hunter2",
         }, {"master_password": True}),
         _rc('module.db.aws_rds_cluster_instance.this["1"]', "aws_rds_cluster_instance", ["update"], {"publicly_accessible": True}),
         _rc('module.db.aws_vpc_security_group_ingress_rule.this["any"]', "aws_vpc_security_group_ingress_rule", ["create"], {"cidr_ipv6": "::/0"}),
         _rc("module.db.aws_rds_cluster_parameter_group.this[0]", "aws_rds_cluster_parameter_group", ["create"], {
             "parameter": [{"name": "rds.force_ssl", "value": "0"}],
         }),
+        _rc('module.db.aws_cloudwatch_log_group.this["postgresql"]', "aws_cloudwatch_log_group", ["delete"], {}),
     ]}
 
     expected_in_bad = [
         "would be replaced", "storage_encrypted is false", "deletion_protection is false",
         "master_password is set", "AWS-managed key", "required tag CostCentre", "required tag Owner",
         "publicly_accessible is true", "cidr_ipv6 is ::/0", "TLS is not enforced",
+        'aws_cloudwatch_log_group.this["postgresql"] would be deleted',
     ]
 
     failed = 0

@@ -1,6 +1,5 @@
 # A workload's key set in one call: a data key for RDS and Secrets Manager,
-# a logs key for CloudWatch Logs and the alarm topic. One region, so the
-# replica provider is the default one.
+# a logs key for CloudWatch Logs and the alarm topic.
 
 terraform {
   required_version = ">= 1.9.0"
@@ -34,8 +33,7 @@ variable "security_topic_arn" {
 }
 
 module "kms" {
-  source    = "../.."
-  providers = { aws = aws, aws.replica = aws }
+  source = "../.."
 
   name      = "payments"
   deployers = [var.deployer_role_arn]
