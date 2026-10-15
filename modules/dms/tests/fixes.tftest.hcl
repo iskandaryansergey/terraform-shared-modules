@@ -92,17 +92,6 @@ variables {
     }
   }
 
-  # The schema has to come from somewhere: DO_NOTHING means DMS creates nothing.
-  sql_scripts = {
-    pre_data = [
-      { name = "01-schema", path = "sql/01-schema.sql", sha256 = "0000000000000000000000000000000000000000000000000000000000000001" },
-    ]
-    post_data = [
-      { name = "02-indexes", path = "sql/02-indexes.sql", sha256 = "0000000000000000000000000000000000000000000000000000000000000002" },
-      { name = "03-sequences", path = "sql/03-sequences.sql", sha256 = "0000000000000000000000000000000000000000000000000000000000000003" },
-    ]
-  }
-
   tasks = {
     app = {
       source_endpoint = "source-db"
@@ -407,7 +396,9 @@ run "require_cmk_without_the_module_log_group_is_refused" {
     create_log_group = false
   }
 
-  expect_failures = [aws_dms_replication_subnet_group.this]
+  # The retention check also fires: with create_log_group = false the module
+  # applies no retention, and says so rather than certifying one.
+  expect_failures = [aws_dms_replication_subnet_group.this, check.log_retention_is_bounded]
 }
 
 # ---------------------------------------------------------------------------
@@ -471,5 +462,99 @@ run "cdc_alarms_and_commands_use_the_task_resource_id" {
   assert {
     condition     = strcontains(output.verify_commands.stop_task["app"], "arn:aws:dms:eu-west-1:111122223333:task:MOCKTASK")
     error_message = "operator commands carry the real task ARN, not a placeholder."
+  }
+}
+
+# ---------------------------------------------------------------------------
+# Advisory checks that had no test: each fires on its posture and is silenced
+# by acknowledging it.
+# ---------------------------------------------------------------------------
+
+run "control_tables_in_the_targets_default_schema_warn" {
+  command = plan
+
+  variables {
+    tasks = {
+      app = {
+        source_endpoint = "source-db"
+        target_endpoint = "target-db"
+        migration_type  = "full-load-and-cdc"
+        table_mappings  = "{\"rules\":[{\"rule-type\":\"selection\",\"rule-id\":\"1\",\"rule-name\":\"all\",\"object-locator\":{\"schema-name\":\"app\",\"table-name\":\"%\"},\"rule-action\":\"include\"}]}"
+        settings        = { control_schema = "" }
+      }
+    }
+  }
+
+  expect_failures = [check.control_tables_have_their_own_schema]
+
+  assert {
+    condition     = output.governance.tasks_with_default_control_schema == ["app"]
+    error_message = "governance names the task whose exception rows land in the target's default schema."
+  }
+}
+
+run "a_storage_threshold_under_15_percent_warns" {
+  command = plan
+
+  variables {
+    # 1 GiB against the 50 GB default volume: 2%.
+    alarm_free_storage_bytes = 1073741824
+  }
+
+  expect_failures = [check.the_storage_alarm_leaves_room_to_react]
+}
+
+run "unbounded_log_retention_warns" {
+  command = plan
+
+  variables {
+    log_retention_days = 0
+  }
+
+  expect_failures = [check.log_retention_is_bounded]
+
+  assert {
+    condition     = length(aws_cloudwatch_log_group.tasks) == 0 && !output.governance.log_group_managed_by_module
+    error_message = "with retention 0 the module creates no log group and governance says the retention is not applied."
+  }
+}
+
+# The gap the check used to have: create_log_group = false applies no
+# retention, and the check and governance used to certify one anyway.
+run "a_pre_existing_log_group_is_not_certified_as_bounded" {
+  command = plan
+
+  variables {
+    create_log_group = false
+  }
+
+  expect_failures = [check.log_retention_is_bounded]
+
+  assert {
+    condition     = length(aws_cloudwatch_log_group.tasks) == 0 && !output.governance.log_group_managed_by_module && output.governance.log_retention_days == 30
+    error_message = "governance must keep reporting the configured number but say it is applied to nothing."
+  }
+}
+
+run "an_acknowledged_pre_existing_log_group_is_quiet_and_listed" {
+  command = plan
+
+  variables {
+    create_log_group    = false
+    acknowledged_checks = ["log_retention_is_bounded"]
+  }
+
+  assert {
+    condition     = contains(output.governance.acknowledged_checks, "log_retention_is_bounded") && !output.governance.log_group_managed_by_module
+    error_message = "acknowledging the check silences it and the decision is listed for the reviewer."
+  }
+}
+
+run "the_module_log_group_is_reported_as_managed_by_default" {
+  command = plan
+
+  assert {
+    condition     = output.governance.log_group_managed_by_module && length(aws_cloudwatch_log_group.tasks) == 1
+    error_message = "the default posture creates the group and applies the retention."
   }
 }

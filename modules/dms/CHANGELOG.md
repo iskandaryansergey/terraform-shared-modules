@@ -3,14 +3,14 @@
 All notable changes to this module. The format is
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the module follows
 [semantic versioning](https://semver.org): see "Versioning and support" in
-[README.md](README.md). Releases are tagged `dms-vX.Y.Z`.
+[README.md](README.md). Releases are tagged `vX.Y.Z`.
 
 Entries marked **BREAKING** change what an unchanged caller's plan does. This is
 the first release, so nothing is breaking relative to an earlier version; the
 **default changes** below are marked for callers who adopted a pre-release
 build.
 
-## [1.0.0] - unreleased
+## [0.1.0] - unreleased
 
 First release.
 
@@ -23,7 +23,7 @@ Capabilities:
   `compute_mode`.
 - Database endpoints (`endpoints`) for `aurora`, `aurora-postgresql`,
   `mariadb`, `mysql`, `oracle`, `postgres`, `sqlserver`, `db2`, `db2-zos`,
-  `sybase`, `redshift`, `docdb` and `neptune`, and S3 targets (`s3_targets`).
+  `sybase` and `redshift`, and S3 targets (`s3_targets`).
   Credentials through Secrets Manager with a module-created role per secret;
   plaintext credentials refused unless `allow_plaintext_credentials`.
 - CA certificates and Oracle wallets (`certificates`), referenced by
@@ -31,14 +31,12 @@ Capabilities:
 - Tasks with typed, validated settings rendered to the DMS settings JSON, and
   `raw_overrides` merged over them. Table mappings validated for a selection
   rule and unique rule-ids.
-- `sql_scripts`: a manifest of pre-data and post-data SQL with checksums,
-  emitted as `migration_plan`. The module executes no SQL.
 - Alarms (CDC latency on source and target, free storage, CPU, freeable
   memory), DMS event subscriptions, and a task log group with retention.
 - Customer-key support across storage, endpoints, secrets, S3 targets and logs,
   with `require_cmk`.
 - Contract outputs: `source_prerequisites`, `network_contract`,
-  `account_prerequisites`, `migration_plan`, `verify_commands`,
+  `account_prerequisites`, `verify_commands`,
   `task_settings_json`, `governance`.
 - Account-wide service roles (`dms-vpc-role`, `dms-cloudwatch-logs-role`),
   off by default (`create_account_service_roles`).
@@ -77,6 +75,9 @@ Premigration assessment and key policies:
   allow (replication storage, endpoint keys, the CloudWatch Logs grant with its
   encryption context for `dms-tasks-<name>`, secret keys, S3 target keys, the
   assessment key).
+- `kms_key_policy_requirements` entries carry the contract v2 fields (`sid`,
+  `principals`, `conditions`, `purpose`), so `modules/kms` can compile them
+  into key policies; existing fields unchanged.
 - `log_group_skip_destroy` (default `true`): teardown keeps the task log group.
 - Output `task_resource_ids`.
 
@@ -257,6 +258,55 @@ S3 targets:
 - **BREAKING (default):** `instance_event_categories` adds `failover`.
 - **BREAKING (validation):** `batch_apply_enabled` into an S3 target is
   refused. DMS does not support it there and documents possible data loss.
+- `log_retention_is_bounded` also warns with `create_log_group = false`: the
+  module then applies no retention, and the check certified one. The new
+  `governance.log_group_managed_by_module` says whether `log_retention_days`
+  is applied to anything.
+- RUNBOOK section 6a corrects what a replaced instance does to its tasks:
+  `publicly_accessible` and `availability_zone` changes fail at apply unless
+  the tasks are replaced in the same run, because DMS will not delete an
+  instance that still has tasks. The descriptions of `kms_key_arn`,
+  `publicly_accessible` and `availability_zone` now say they replace.
+- **BREAKING (removed):** `sql_scripts`, `output.migration_plan` and the
+  check `the_target_schema_comes_from_somewhere`. The module never ran the
+  scripts, and whatever does run them keeps its own record of what it
+  executed; a second copy here was a manifest nobody read. In their place:
+  `governance.tasks_expecting_a_prebuilt_target` (every `DO_NOTHING` task, from
+  the merged settings) and `verify_commands.start_task`.
+- Check `raw_overrides_use_known_task_settings` and
+  `governance.tasks_with_unknown_task_settings`: a `raw_overrides` section or
+  key outside the DMS-documented list is reported at plan, because DMS drops
+  it silently. The list (`known_task_settings` in locals.tf) is kept equal to
+  the linter's by a self-tested drift check; both gained the documented keys
+  they lacked (`DataMaskingErrorPolicy`, `MaxKeyColumnSize`, `RecoveryTimeout`,
+  `EnableLogContext`, `DeleteTaskLogs`, `ResyncSettings`, the Time Travel
+  keys, the resync log components).
+- `aws_dms_certificate` ids carry an 8-character digest of the content and
+  the resource is `create_before_destroy`: rotating a CA under the same key
+  uploads the new certificate, repoints the endpoints and deletes the old one
+  in one apply. Before, Terraform deleted the in-use certificate first.
+- Serverless mode refuses endpoints DMS Serverless does not support: SAP ASE,
+  Db2 as a target, Db2 with SSL (DMS Serverless documentation). They applied
+  and failed at Testing Connection.
+- Tests: three runs that passed for the wrong reason now trip only the guard
+  they name; the guards for `availability_zone` with `multi_az`, `require_cmk`
+  on S3 targets and in serverless mode, and the `transport_is_verified` check
+  have failing-case runs; every check's acknowledgement branch is tested; every
+  variable with a validation has at least one failing-case run; four asserts
+  that compared a value to itself or to a shared mock are replaced with
+  identity checks.
+- Table mappings are checked at plan against the DMS table-mapping
+  documentation (precondition on the subnet group, naming the task and
+  `rule-id`): rule types, selection/transformation actions and targets,
+  object-locators, wildcard restrictions, table-settings shapes, numeric
+  `rule-id`s, unique `rule-name`s, exclude-only mappings. The linter gained the
+  same rules; its action list lacked ten documented actions (`add-prefix`,
+  `include-column`, the suffix/prefix family, the data-masking family), which
+  it reported as unknown. `known_mapping_rules` in locals.tf and the linter's
+  `MAPPING_RULES` are kept equal by a self-tested drift check.
+- `tests/fixtures/*.json` are now compared with the live rendering by
+  `tests/task_settings.tftest.hcl`; they had drifted on
+  `FailOnTransactionConsistencyBreached` and are regenerated.
 - `permissions_boundary_arn` no longer applies to `dms-vpc-role` and
   `dms-cloudwatch-logs-role`, whose AWS-managed policies a landing-zone
   boundary could cap silently.

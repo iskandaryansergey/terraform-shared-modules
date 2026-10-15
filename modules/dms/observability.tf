@@ -6,8 +6,15 @@
 # catch the case where the task is technically running and falling behind. Both
 # need an SNS topic - without one this file creates almost nothing.
 
+locals {
+  # The module creates and owns the task log group, so log_retention_days is
+  # actually applied, only in this case. governance and the retention check
+  # read this rather than the variable.
+  log_group_managed = local.provisioned && var.create_log_group && var.log_retention_days > 0
+}
+
 resource "aws_cloudwatch_log_group" "tasks" {
-  count = local.create && local.provisioned && var.create_log_group && var.log_retention_days > 0 ? 1 : 0
+  count = local.create && local.log_group_managed ? 1 : 0
 
   name              = local.log_group_name
   retention_in_days = var.log_retention_days
@@ -304,6 +311,22 @@ check "control_tables_have_their_own_schema" {
   }
 }
 
+# DMS ignores a task-settings key it does not recognise - no error, no event,
+# no log line. So "EnableValdiation": true in raw_overrides is a task that
+# runs, reports success, and validates nothing. The typed settings cannot be
+# misspelled; raw_overrides can, and this is where it is caught. A check, not
+# a refusal: the list follows the DMS documentation and DMS adds keys between
+# engine versions, so a legitimate new key must be acknowledgeable while the
+# list catches up.
+check "raw_overrides_use_known_task_settings" {
+  assert {
+    condition = contains(local.acknowledged, "raw_overrides_use_known_task_settings") ? true : (
+      !local.create ? true : length(local.tasks_with_unknown_task_settings) == 0
+    )
+    error_message = "these tasks set task settings the DMS documentation does not list, and DMS drops such keys without an error: ${join("; ", [for k, v in local.tasks_with_unknown_task_settings : "${k}: ${join(", ", v)}"])}. A typo here is a task that runs and silently does not do what the key says. Fix the key - or, if DMS added it after this module's list was written, add it to known_task_settings in locals.tf and tests/lint_task_settings.py, and acknowledge this check until then."
+  }
+}
+
 # Row-level logs are a copy of the data. In a bank that is a different
 # classification of log group from an operational one.
 check "debug_logging_is_temporary" {
@@ -318,18 +341,6 @@ check "debug_logging_is_temporary" {
   }
 }
 
-# DO_NOTHING creates nothing on the target. If the schema is not there, DMS
-# suspends every table rather than failing the task outright - so it looks like
-# a partial success.
-check "the_target_schema_comes_from_somewhere" {
-  assert {
-    condition = contains(local.acknowledged, "the_target_schema_comes_from_somewhere") ? true : (
-      !local.create ? true : length(local.tasks_assuming_a_prebuilt_target) == 0
-    )
-    error_message = "these tasks use target_table_prep_mode = DO_NOTHING with no pre_data script declared: ${join(", ", local.tasks_assuming_a_prebuilt_target)}. DMS will not create the target schema, and a missing table suspends that table instead of failing the task - which reads as a partial success. Declare the DDL in sql_scripts.pre_data, or say explicitly that the schema is built elsewhere."
-  }
-}
-
 # A full load into a target whose triggers and foreign keys are live is slow at
 # best and wrong at worst.
 check "the_full_load_is_not_fighting_the_targets_constraints" {
@@ -337,7 +348,7 @@ check "the_full_load_is_not_fighting_the_targets_constraints" {
     condition = contains(local.acknowledged, "the_full_load_is_not_fighting_the_targets_constraints") ? true : (
       !local.create ? true : length(local.postgres_targets_without_load_guard) == 0
     )
-    error_message = "these PostgreSQL targets have no after_connect_script: ${join(", ", local.postgres_targets_without_load_guard)}. During a full load their triggers fire and their foreign keys reject rows that arrive parent-last. Set postgres.after_connect_script = \"SET session_replication_role = replica;\" nothing needs restoring afterwards because it applies to DMS connections only (the DMS user needs the privilege to set it), or confirm the target has no triggers or FKs yet because post_data builds them."
+    error_message = "these PostgreSQL targets have no after_connect_script: ${join(", ", local.postgres_targets_without_load_guard)}. During a full load their triggers fire and their foreign keys reject rows that arrive parent-last. Set postgres.after_connect_script = \"SET session_replication_role = replica;\" nothing needs restoring afterwards because it applies to DMS connections only (the DMS user needs the privilege to set it), or confirm the target has no triggers or FKs yet because the pipeline builds them after the load."
   }
 }
 
@@ -371,12 +382,16 @@ check "tasks_write_logs" {
   }
 }
 
+# Bounded means bounded BY THIS MODULE: with create_log_group = false the group
+# carries whatever retention it already has - none, if DMS created it - and
+# log_retention_days is not applied to anything, so governance must not report
+# it as if it were.
 check "log_retention_is_bounded" {
   assert {
     condition = contains(local.acknowledged, "log_retention_is_bounded") ? true : (
-      !local.create ? true : (local.provisioned ? var.log_retention_days > 0 : true)
+      !local.create ? true : (local.provisioned ? local.log_group_managed : true)
     )
-    error_message = "log_retention_days is 0, so DMS task logs never expire. A chatty CDC task at DEBUG produces gigabytes, and this log group outlives the migration by default."
+    error_message = "the module is not putting a retention on ${local.log_group_name}: log_retention_days is ${var.log_retention_days} and create_log_group is ${var.create_log_group}. With create_log_group = false the group keeps whatever retention it already has - none, when DMS created it - and DMS task logs then never expire. A chatty CDC task at DEBUG produces gigabytes, and the group outlives the migration. Set a retention on the existing group yourself and acknowledge this check, or let the module create the group."
   }
 }
 
@@ -465,8 +480,13 @@ check "validation_is_claimed_where_it_cannot_run" {
 # missing dms-vpc-role fails the subnet group with an error naming neither the
 # role nor the fix, and a missing dms-cloudwatch-logs-role leaves the task log
 # group empty while the task runs - a task that moves nothing and logs nothing.
-# Looked up rather than assumed. The plan principal needs iam:GetRole; a
-# lookup that fails is reported as a warning, never an error.
+# Looked up rather than assumed. The plan principal needs iam:ListRoles - the
+# data source lists the account's roles and filters by name on the client - and
+# a lookup that fails is reported as a warning, never an error. A check-scoped
+# data source cannot take count, so this read happens on every plan, create =
+# false and create_account_service_roles = true included; moving it to a
+# top-level data source would make a failed lookup an error, which is the wrong
+# trade for an advisory check.
 check "account_service_roles_exist" {
   data "aws_iam_roles" "dms_service" {
     name_regex = "^dms-(vpc|cloudwatch-logs)-role$|^dms-access-for-endpoint$"

@@ -88,17 +88,6 @@ variables {
     }
   }
 
-  # The schema has to come from somewhere: DO_NOTHING means DMS creates nothing.
-  sql_scripts = {
-    pre_data = [
-      { name = "01-schema", path = "sql/01-schema.sql", sha256 = "0000000000000000000000000000000000000000000000000000000000000001" },
-    ]
-    post_data = [
-      { name = "02-indexes", path = "sql/02-indexes.sql", sha256 = "0000000000000000000000000000000000000000000000000000000000000002" },
-      { name = "03-sequences", path = "sql/03-sequences.sql", sha256 = "0000000000000000000000000000000000000000000000000000000000000003" },
-    ]
-  }
-
   tasks = {
     app = {
       source_endpoint = "source-db"
@@ -250,12 +239,16 @@ run "an_after_connect_script_change_changes_the_hash" {
 run "docdb_is_refused" {
   command = plan
 
+  # ssl_mode = "none" on purpose: with the default verify-full and no
+  # certificate, the certificate validation would refuse this endpoint on its
+  # own and the engine allowlist could be deleted without this run noticing.
   variables {
     endpoints = {
       source-db = {
         role       = "source"
         engine     = "docdb"
         secret_arn = "arn:aws:secretsmanager:eu-west-1:111122223333:secret:src-AbCdEf"
+        ssl_mode   = "none"
       }
     }
     tasks = {}

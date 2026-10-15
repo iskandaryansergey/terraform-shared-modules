@@ -22,7 +22,7 @@
     "DataErrorPolicy": "LOG_ERROR",
     "DataTruncationErrorPolicy": "LOG_ERROR",
     "FailOnNoTablesCaptured": true,
-    "FailOnTransactionConsistencyBreached": false,
+    "FailOnTransactionConsistencyBreached": true,
     "FullLoadIgnoreConflicts": true,
     "RecoverableErrorCount": -1,
     "RecoverableErrorInterval": 5,

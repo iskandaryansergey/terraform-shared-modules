@@ -27,6 +27,7 @@ Exit 0 = clean, 1 = a finding, 2 = tool/usage error.
 from __future__ import annotations
 
 import json
+import re
 import pathlib
 import sys
 
@@ -55,9 +56,12 @@ SETTINGS_SCHEMA: dict[str, set[str]] = {
     "FullLoadSettings": {
         "TargetTablePrepMode", "CreatePkAfterFullLoad", "StopTaskCachedChangesApplied",
         "StopTaskCachedChangesNotApplied", "MaxFullLoadSubTasks",
-        "TransactionConsistencyTimeout", "CommitRate",
+        "TransactionConsistencyTimeout", "CommitRate", "ParallelLoadThreads",
     },
-    "Logging": {"EnableLogging", "LogComponents", "CloudWatchLogGroup", "CloudWatchLogStream"},
+    "Logging": {
+        "EnableLogging", "EnableLogContext", "LogComponents", "CloudWatchLogGroup",
+        "CloudWatchLogStream", "DeleteTaskLogs",
+    },
     "ControlTablesSettings": {
         "ControlSchema", "HistoryTimeslotInMinutes", "StatusTableEnabled",
         "SuspendedTablesTableEnabled", "HistoryTableEnabled", "FullLoadExceptionTableEnabled",
@@ -68,10 +72,12 @@ SETTINGS_SCHEMA: dict[str, set[str]] = {
         "TableFailureMaxCount", "HandleCollationDiff", "ValidationOnly",
         "RecordFailureDelayInMinutes", "RecordSuspendDelayInMinutes",
         "RecordFailureDelayLimitInMinutes", "SkipLobColumns", "ValidationPartialLobSize",
-        "ValidationQueryCdcDelaySeconds", "PartitionSize",
+        "ValidationQueryCdcDelaySeconds", "PartitionSize", "MaxKeyColumnSize",
     },
+    "ResyncSettings": {"EnableResync", "ResyncSchedule", "MaxResyncTime", "ValidationTaskId"},
     "ErrorBehavior": {
-        "DataErrorPolicy", "DataTruncationErrorPolicy", "DataErrorEscalationPolicy",
+        "DataErrorPolicy", "DataTruncationErrorPolicy", "DataMaskingErrorPolicy",
+        "DataErrorEscalationPolicy",
         "DataErrorEscalationCount", "TableErrorPolicy", "TableErrorEscalationPolicy",
         "TableErrorEscalationCount", "RecoverableErrorCount", "RecoverableErrorInterval",
         "RecoverableErrorThrottling", "RecoverableErrorThrottlingMax",
@@ -84,7 +90,7 @@ SETTINGS_SCHEMA: dict[str, set[str]] = {
     "ChangeProcessingTuning": {
         "BatchApplyPreserveTransaction", "BatchApplyTimeoutMin", "BatchApplyTimeoutMax",
         "BatchApplyMemoryLimit", "BatchSplitSize", "MinTransactionSize", "CommitTimeout",
-        "MemoryLimitTotal", "MemoryKeepTime", "StatementCacheSize",
+        "MemoryLimitTotal", "MemoryKeepTime", "StatementCacheSize", "RecoveryTimeout",
     },
     "ChangeProcessingDdlHandlingPolicy": {
         "HandleSourceTableDropped", "HandleSourceTableTruncated", "HandleSourceTableAltered",
@@ -95,8 +101,16 @@ SETTINGS_SCHEMA: dict[str, set[str]] = {
     "LoopbackPreventionSettings": {"EnableLoopbackPrevention", "SourceSchema", "TargetSchema"},
     "PostProcessingRules": set(),
     "FailTaskWhenCleanTaskResourceFailed": set(),
-    "TTSettings": {"EnableTT", "TTS3Settings", "TTRecordSettings"},
+    "TTSettings": {
+        "EnableTT", "TTS3Settings", "TTRecordSettings", "EncryptionMode",
+        "ServerSideEncryptionKmsKeyId", "ServiceAccessRoleArn", "BucketName", "BucketFolder",
+        "EnableDeletingFromS3OnTaskDelete", "EnableRawData", "RawDataFormat", "OperationsToLog",
+        "MaxRecordSize",
+    },
 }
+# The same list lives in locals.tf as known_task_settings, where the module's
+# check reads it at plan. Two copies because HCL cannot import this file and
+# this file must run without Terraform; lint_allowlist_drift() keeps them equal.
 
 VALID_PREP_MODES = {"DO_NOTHING", "TRUNCATE_BEFORE_LOAD", "DROP_AND_CREATE"}
 VALID_SEVERITIES = {
@@ -107,7 +121,8 @@ VALID_LOG_COMPONENTS = {
     "SOURCE_UNLOAD", "SOURCE_CAPTURE", "TARGET_LOAD", "TARGET_APPLY", "TASK_MANAGER",
     "TABLES_MANAGER", "TRANSFORMATION", "IO", "PERFORMANCE", "SORTER", "REST_SERVER",
     "VALIDATOR", "VALIDATOR_EXT", "FILE_FACTORY", "FILE_TRANSFER", "METADATA_MANAGER",
-    "COMMON", "ADDONS", "DATA_STRUCTURE", "COMMUNICATION",
+    "COMMON", "ADDONS", "DATA_STRUCTURE", "COMMUNICATION", "DATA_RESYNC", "RESYNC_UNLOAD",
+    "RESYNC_APPLY",
 }
 
 
@@ -179,13 +194,29 @@ def lint_task_settings(doc: dict, label: str) -> None:
 # ---------------------------------------------------------------------------
 # Table mappings
 # ---------------------------------------------------------------------------
-VALID_RULE_TYPES = {"selection", "transformation", "table-settings", "object-mapping"}
-VALID_RULE_ACTIONS = {
-    "include", "exclude", "explicit",
-    "rename", "remove-column", "convert-lowercase", "convert-uppercase",
-    "add-column", "add-before-image-columns", "define-primary-key", "change-data-type",
-    "map-record-to-record", "map-record-to-document",
+# The DMS table-mapping documentation (selection, transformation and
+# table-settings rules). The same lists live in locals.tf as
+# known_mapping_rules, where the module's plan-time gate reads them;
+# lint_mapping_rules_drift() keeps the two equal.
+MAPPING_RULES: dict[str, set[str]] = {
+    "rule_types": {"selection", "transformation", "table-settings", "object-mapping"},
+    "selection_actions": {"include", "exclude", "explicit"},
+    "transformation_actions": {
+        "add-column", "include-column", "remove-column", "rename", "convert-lowercase",
+        "convert-uppercase", "add-prefix", "remove-prefix", "replace-prefix", "add-suffix",
+        "remove-suffix", "replace-suffix", "define-primary-key", "change-data-type",
+        "add-before-image-columns", "data-masking-digits-mask",
+        "data-masking-digits-randomize", "data-masking-hash-mask",
+    },
+    "transformation_targets": {"schema", "table", "column", "table-tablespace", "index-tablespace"},
+    "column_only_actions": {
+        "change-data-type", "data-masking-digits-mask", "data-masking-digits-randomize",
+        "data-masking-hash-mask",
+    },
+    "parallel_load_types": {"partitions-auto", "subpartitions-auto", "partitions-list", "ranges", "none"},
+    "lob_modes": {"limited", "unlimited", "none"},
 }
+VALID_RULE_TYPES = MAPPING_RULES["rule_types"]
 
 
 def lint_table_mappings(doc: dict, label: str) -> None:
@@ -199,50 +230,106 @@ def lint_table_mappings(doc: dict, label: str) -> None:
         return
 
     seen_ids: set[str] = set()
+    names: list[str] = []
     selections = 0
+
+    def text(v: object) -> str:
+        return "" if v is None else str(v).strip()
 
     for rule in rules:
         if not isinstance(rule, dict):
             finding(label, "every rule must be an object.")
             continue
 
-        rid = rule.get("rule-id")
-        if rid is None:
+        rid = text(rule.get("rule-id"))
+        if rid == "":
             finding(label, "a rule has no rule-id.")
-        elif str(rid) in seen_ids:
+            rid = "?"
+        elif not rid.isdigit():
+            finding(label, f"rule {rid!r}: rule-id must be a numeric value.")
+        elif rid in seen_ids:
             finding(label, f"rule-id {rid!r} is used more than once. DMS keys its state by "
                            f"rule-id, so one of these silently does not exist.")
         else:
-            seen_ids.add(str(rid))
+            seen_ids.add(rid)
 
-        rtype = rule.get("rule-type")
-        if rtype not in VALID_RULE_TYPES:
+        rtype = text(rule.get("rule-type"))
+        if rtype not in MAPPING_RULES["rule_types"]:
             finding(label, f"rule {rid!r}: rule-type {rtype!r} is not one of "
-                           f"{sorted(VALID_RULE_TYPES)}.")
+                           f"{sorted(MAPPING_RULES['rule_types'])}.")
             continue
 
-        if rule.get("rule-name") is None:
+        name = text(rule.get("rule-name"))
+        if name == "":
             finding(label, f"rule {rid!r}: no rule-name. DMS requires one.")
+        names.append(name)
+
+        loc = rule.get("object-locator")
+        has_locator = isinstance(loc, dict)
+        schema = text(loc.get("schema-name")) if has_locator else ""
+        table = text(loc.get("table-name")) if has_locator else ""
+        action = text(rule.get("rule-action"))
 
         if rtype == "selection":
             selections += 1
-            action = rule.get("rule-action")
-            if action not in {"include", "exclude", "explicit"}:
+            if action not in MAPPING_RULES["selection_actions"]:
                 finding(label, f"rule {rid!r}: selection rule-action must be include, "
                                f"exclude or explicit, not {action!r}.")
-            loc = rule.get("object-locator")
-            if not isinstance(loc, dict) or "schema-name" not in loc or "table-name" not in loc:
+            if schema == "" or table == "":
                 finding(label, f"rule {rid!r}: selection rules need an object-locator with "
                                f"schema-name and table-name.")
+            if action == "explicit" and "%" in schema + table:
+                finding(label, f"rule {rid!r}: explicit selects one exact table, so % is not "
+                               f"allowed in its names.")
 
         if rtype == "transformation":
-            if rule.get("rule-action") not in VALID_RULE_ACTIONS:
-                finding(label, f"rule {rid!r}: transformation rule-action "
-                               f"{rule.get('rule-action')!r} is not one of "
-                               f"{sorted(VALID_RULE_ACTIONS)}.")
-            if rule.get("rule-target") not in {"schema", "table", "column", "table-tablespace", "index-tablespace"}:
-                finding(label, f"rule {rid!r}: transformation needs a rule-target of schema, "
-                               f"table or column.")
+            target = text(rule.get("rule-target"))
+            if action not in MAPPING_RULES["transformation_actions"]:
+                finding(label, f"rule {rid!r}: transformation rule-action {action!r} is not "
+                               f"one DMS documents.")
+            if target not in MAPPING_RULES["transformation_targets"]:
+                finding(label, f"rule {rid!r}: transformation rule-target must be one of "
+                               f"{sorted(MAPPING_RULES['transformation_targets'])}, not {target!r}.")
+            if not has_locator:
+                finding(label, f"rule {rid!r}: a transformation needs an object-locator.")
+            if action in MAPPING_RULES["column_only_actions"] and target != "column":
+                finding(label, f"rule {rid!r}: {action} applies to rule-target column only.")
+            if action == "define-primary-key" and "%" in schema + table:
+                finding(label, f"rule {rid!r}: define-primary-key cannot use % in schema-name "
+                               f"or table-name.")
+
+        if rtype == "table-settings":
+            if schema == "" or table == "" or "%" in schema + table:
+                finding(label, f"rule {rid!r}: table-settings need an exact schema-name and "
+                               f"table-name, no %. DMS rejects the mapping otherwise.")
+            pl = rule.get("parallel-load")
+            if isinstance(pl, dict):
+                pl_type = text(pl.get("type"))
+                if pl_type not in MAPPING_RULES["parallel_load_types"]:
+                    finding(label, f"rule {rid!r}: parallel-load.type {pl_type!r} is not one of "
+                                   f"{sorted(MAPPING_RULES['parallel_load_types'])}.")
+                if pl_type == "ranges" and not (pl.get("columns") and pl.get("boundaries")):
+                    finding(label, f"rule {rid!r}: parallel-load type ranges needs columns and "
+                                   f"boundaries.")
+                if pl_type == "partitions-list" and not (pl.get("partitions") or pl.get("subpartitions")):
+                    finding(label, f"rule {rid!r}: parallel-load type partitions-list needs "
+                                   f"partitions or subpartitions.")
+            lob = rule.get("lob-settings")
+            if isinstance(lob, dict):
+                mode = text(lob.get("mode")) or "limited"
+                if mode not in MAPPING_RULES["lob_modes"]:
+                    finding(label, f"rule {rid!r}: lob-settings.mode {mode!r} is not limited, "
+                                   f"unlimited or none.")
+                try:
+                    bulk = float(lob.get("bulk-max-size", 0) or 0)
+                except (TypeError, ValueError):
+                    bulk = 0.0
+                if mode == "limited" and bulk <= 0:
+                    finding(label, f"rule {rid!r}: lob-settings in limited mode (the default) "
+                                   f"need a non-zero bulk-max-size; zero is invalid.")
+
+    if len(set(names)) != len(names):
+        finding(label, "rule-name values must be unique.")
 
     if selections == 0:
         finding(label, "no selection rule. Transformation rules alone match no tables, and "
@@ -258,6 +345,67 @@ def lint_table_mappings(doc: dict, label: str) -> None:
     if selections and not includes:
         finding(label, "every selection rule is an exclude. Nothing is included, so nothing "
                        "migrates.")
+
+
+HCL_BEGIN = "# known_task_settings:begin"
+HCL_END = "# known_task_settings:end"
+HCL_MAP_BEGIN = "# known_mapping_rules:begin"
+HCL_MAP_END = "# known_mapping_rules:end"
+
+
+def parse_hcl_lists(text: str, begin: str, end: str) -> dict[str, set[str]] | None:
+    """A map of string lists from locals.tf, between two marker comments.
+
+    Only the shape the module writes is understood: `name = [ "k", ... ]`,
+    one entry per name, string literals only. Anything else is reported as
+    unparsable rather than guessed at.
+    """
+    if begin not in text or end not in text:
+        return None
+    block = text[text.index(begin):text.index(end)]
+    out: dict[str, set[str]] = {}
+    for m in re.finditer(r"^\s*([A-Za-z_]+)\s*=\s*\[(.*?)\]", block, re.S | re.M):
+        out[m.group(1)] = set(re.findall(r'"([^"]+)"', m.group(2)))
+    return out
+
+
+def parse_hcl_known_settings(text: str) -> dict[str, set[str]] | None:
+    return parse_hcl_lists(text, HCL_BEGIN, HCL_END)
+
+
+def _compare_lists(hcl: dict[str, set[str]], py: dict[str, set[str]], hcl_name: str,
+                   py_name: str, label: str) -> None:
+    for key in sorted(set(hcl) | set(py)):
+        if key not in hcl:
+            finding(label, f"{hcl_name} lacks {key!r} that this linter knows; add it there.")
+        elif key not in py:
+            finding(label, f"{hcl_name} has {key!r} that this linter does not know; add it "
+                           f"to {py_name}.")
+        elif hcl[key] != py[key]:
+            only_hcl = sorted(hcl[key] - py[key])
+            only_py = sorted(py[key] - hcl[key])
+            finding(label, f"{hcl_name}.{key} drifted from {py_name}: only in locals.tf "
+                           f"{only_hcl}, only in this linter {only_py}.")
+
+
+def lint_allowlist_drift(locals_text: str, label: str = "locals.tf") -> None:
+    hcl = parse_hcl_known_settings(locals_text)
+    if hcl is None:
+        finding(label, f"no {HCL_BEGIN} / {HCL_END} markers around known_task_settings; "
+                       "the module's plan-time check and this linter can no longer be "
+                       "compared.")
+        return
+    _compare_lists(hcl, SETTINGS_SCHEMA, "known_task_settings", "SETTINGS_SCHEMA", label)
+
+
+def lint_mapping_rules_drift(locals_text: str, label: str = "locals.tf") -> None:
+    hcl = parse_hcl_lists(locals_text, HCL_MAP_BEGIN, HCL_MAP_END)
+    if hcl is None:
+        finding(label, f"no {HCL_MAP_BEGIN} / {HCL_MAP_END} markers around "
+                       "known_mapping_rules; the module's plan-time gate and this linter "
+                       "can no longer be compared.")
+        return
+    _compare_lists(hcl, MAPPING_RULES, "known_mapping_rules", "MAPPING_RULES", label)
 
 
 def lint_file(path: pathlib.Path) -> None:
@@ -279,6 +427,10 @@ def lint_file(path: pathlib.Path) -> None:
         finding(path.name, "does not look like DMS table mappings (no \"rules\") or task "
                            "settings (no recognised section).")
 
+
+SELECT_ALL = {"rule-type": "selection", "rule-id": "1", "rule-name": "all",
+              "rule-action": "include",
+              "object-locator": {"schema-name": "s", "table-name": "%"}}
 
 SELF_TEST_CASES = [
     ("a misspelled settings key", {"ValidationSettings": {"EnableValdiation": True}}),
@@ -314,9 +466,75 @@ SELF_TEST_CASES = [
                  "rule-action": "exclude",
                  "object-locator": {"schema-name": "s", "table-name": "%"}}]}),
     ("an empty rules array", {"rules": []}),
+    ("a non-numeric rule-id",
+     {"rules": [{"rule-type": "selection", "rule-id": "one", "rule-name": "a",
+                 "rule-action": "include",
+                 "object-locator": {"schema-name": "s", "table-name": "%"}}]}),
+    ("explicit with a wildcard",
+     {"rules": [{"rule-type": "selection", "rule-id": "1", "rule-name": "a",
+                 "rule-action": "explicit",
+                 "object-locator": {"schema-name": "s", "table-name": "t%"}}]}),
+    ("a transformation action DMS does not document",
+     {"rules": [SELECT_ALL, {"rule-type": "transformation", "rule-id": "2", "rule-name": "b",
+                             "rule-action": "add-prefx", "rule-target": "table",
+                             "object-locator": {"schema-name": "s", "table-name": "%"},
+                             "value": "x_"}]}),
+    ("a column-only action on a table target",
+     {"rules": [SELECT_ALL, {"rule-type": "transformation", "rule-id": "2", "rule-name": "b",
+                             "rule-action": "change-data-type", "rule-target": "table",
+                             "object-locator": {"schema-name": "s", "table-name": "t"},
+                             "data-type": {"type": "int8"}}]}),
+    ("define-primary-key with a wildcard",
+     {"rules": [SELECT_ALL, {"rule-type": "transformation", "rule-id": "2", "rule-name": "b",
+                             "rule-action": "define-primary-key", "rule-target": "table",
+                             "object-locator": {"schema-name": "s", "table-name": "%"},
+                             "primary-key-def": {"name": "pk", "columns": ["id"]}}]}),
+    ("table-settings with a wildcard",
+     {"rules": [SELECT_ALL, {"rule-type": "table-settings", "rule-id": "2", "rule-name": "b",
+                             "object-locator": {"schema-name": "s", "table-name": "%"},
+                             "parallel-load": {"type": "partitions-auto"}}]}),
+    ("an unknown parallel-load type",
+     {"rules": [SELECT_ALL, {"rule-type": "table-settings", "rule-id": "2", "rule-name": "b",
+                             "object-locator": {"schema-name": "s", "table-name": "t"},
+                             "parallel-load": {"type": "partition-auto"}}]}),
+    ("ranges without boundaries",
+     {"rules": [SELECT_ALL, {"rule-type": "table-settings", "rule-id": "2", "rule-name": "b",
+                             "object-locator": {"schema-name": "s", "table-name": "t"},
+                             "parallel-load": {"type": "ranges", "columns": ["id"]}}]}),
+    ("limited LOB settings without bulk-max-size",
+     {"rules": [SELECT_ALL, {"rule-type": "table-settings", "rule-id": "2", "rule-name": "b",
+                             "object-locator": {"schema-name": "s", "table-name": "t"},
+                             "lob-settings": {"mode": "limited"}}]}),
+    ("duplicate rule-names",
+     {"rules": [SELECT_ALL, {"rule-type": "selection", "rule-id": "2", "rule-name": "all",
+                             "rule-action": "exclude",
+                             "object-locator": {"schema-name": "s", "table-name": "x%"}}]}),
 ]
 
 SELF_TEST_GOOD = [
+    ("every documented rule shape",
+     {"rules": [
+         SELECT_ALL,
+         {"rule-type": "selection", "rule-id": "2", "rule-name": "one", "rule-action": "explicit",
+          "object-locator": {"schema-name": "s", "table-name": "exact"}},
+         {"rule-type": "transformation", "rule-id": "3", "rule-name": "prefix",
+          "rule-action": "add-prefix", "rule-target": "table",
+          "object-locator": {"schema-name": "s", "table-name": "%"}, "value": "x_"},
+         {"rule-type": "transformation", "rule-id": "4", "rule-name": "pk",
+          "rule-action": "define-primary-key", "rule-target": "table",
+          "object-locator": {"schema-name": "s", "table-name": "exact"},
+          "primary-key-def": {"name": "pk", "columns": ["id"]}},
+         {"rule-type": "transformation", "rule-id": "5", "rule-name": "type",
+          "rule-action": "change-data-type", "rule-target": "column",
+          "object-locator": {"schema-name": "s", "table-name": "exact", "column-name": "c"},
+          "data-type": {"type": "int8"}},
+         {"rule-type": "table-settings", "rule-id": "6", "rule-name": "parallel",
+          "object-locator": {"schema-name": "s", "table-name": "exact"},
+          "parallel-load": {"type": "ranges", "columns": ["id"], "boundaries": [["100"]]}},
+         {"rule-type": "table-settings", "rule-id": "7", "rule-name": "lobs",
+          "object-locator": {"schema-name": "s", "table-name": "other"},
+          "lob-settings": {"mode": "unlimited", "bulk-max-size": "0"}},
+     ]}),
     ("a normal selection rule",
      {"rules": [{"rule-type": "selection", "rule-id": "1", "rule-name": "include-app",
                  "rule-action": "include",
@@ -361,9 +579,46 @@ def self_test() -> int:
         else:
             print(f"  ok    no false positive: {label}")
 
+    # The HCL copy of the allowlist: a drifted copy must be detected, and the
+    # shipped one must match.
+    findings = []
+    lint_allowlist_drift(
+        HCL_BEGIN + "\n  known_task_settings = {\n"
+        "    ValidationSettings = [\"EnableValidation\"]\n"
+        "    PostProcessingRules = []\n  }\n" + HCL_END, "synthetic")
+    if findings:
+        print("  ok    detected: known_task_settings drifted from SETTINGS_SCHEMA")
+    else:
+        print("  FAIL  NOT detected: known_task_settings drifted from SETTINGS_SCHEMA")
+        bad += 1
+    findings = []
+    lint_allowlist_drift("locals {\n}\n", "synthetic")
+    if findings:
+        print("  ok    detected: known_task_settings markers missing")
+    else:
+        print("  FAIL  NOT detected: known_task_settings markers missing")
+        bad += 1
+    findings = []
+    lint_mapping_rules_drift(
+        HCL_MAP_BEGIN + "\n  known_mapping_rules = {\n"
+        "    rule_types = [\"selection\"]\n    lob_modes = [\"limited\"]\n  }\n"
+        + HCL_MAP_END, "synthetic")
+    if findings:
+        print("  ok    detected: known_mapping_rules drifted from MAPPING_RULES")
+    else:
+        print("  FAIL  NOT detected: known_mapping_rules drifted from MAPPING_RULES")
+        bad += 1
+
     # And everything shipped in the repo must pass.
     findings = []
     here = pathlib.Path(__file__).resolve().parent.parent
+    locals_tf = here / "locals.tf"
+    if locals_tf.is_file():
+        lint_allowlist_drift(locals_tf.read_text(), "locals.tf")
+        lint_mapping_rules_drift(locals_tf.read_text(), "locals.tf")
+    else:
+        print("  FAIL  locals.tf not found next to tests/; cannot compare the allowlists")
+        bad += 1
     fixtures = here / "tests" / "fixtures"
     if not fixtures.is_dir() or not any(fixtures.glob("*.json")):
         # Path.glob on a missing directory returns empty and reports success,
@@ -390,7 +645,7 @@ def self_test() -> int:
     if bad:
         print(f"SELF-TEST FAILED: {bad} case(s)")
         return 1
-    print(f"SELF-TEST OK: {len(SELF_TEST_CASES)} defects detected, "
+    print(f"SELF-TEST OK: {len(SELF_TEST_CASES) + 3} defects detected, "
           f"{len(SELF_TEST_GOOD)} valid documents accepted")
     return 0
 
@@ -424,6 +679,14 @@ def main(argv: list[str]) -> int:
 
     for f in files:
         lint_file(f)
+
+    # The module's own copy of the allowlist, whenever this runs from the
+    # module tree: a key added on one side only is exactly the drift that
+    # lets a typo through one gate and not the other.
+    locals_tf = pathlib.Path(__file__).resolve().parent.parent / "locals.tf"
+    if locals_tf.is_file():
+        lint_allowlist_drift(locals_tf.read_text(), "locals.tf")
+        lint_mapping_rules_drift(locals_tf.read_text(), "locals.tf")
 
     if findings:
         print(f"FAILED: {len(findings)} finding(s)", file=sys.stderr)

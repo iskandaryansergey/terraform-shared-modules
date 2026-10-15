@@ -1,9 +1,11 @@
 Rendered `replication_task_settings`, one per LOB mode, exactly as the module
-produces them. Regenerate with:
+produces them with its defaults. `tests/lint_task_settings.py` lints them, so
+they are only evidence while they ARE what the module renders:
+`tests/task_settings.tftest.hcl` compares each one with the live output and
+fails on any difference.
 
-    terraform test -filter=tests/dms.tftest.hcl   # proves the module renders these
-    # then, from a plan: terraform output -json task_settings_json
-
-They exist because the linter's settings half was never pointed at a settings
-document — only at table mappings — which is how a broken INLINE rendering
-passed a green self-test.
+To regenerate after a deliberate change to the rendering, take
+`output.task_settings_json["app"]` from a mocked run with
+`settings = { lob_mode = "<MODE>" }` and write it here pretty-printed with
+sorted keys; the test then goes green again, and the linter re-checks the
+result.

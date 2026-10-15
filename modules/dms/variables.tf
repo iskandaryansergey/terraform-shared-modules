@@ -12,7 +12,7 @@
 #     Validate the shape here rather than discovering it after a 6-hour load.
 
 variable "create" {
-  description = "Master switch. false plans and applies cleanly to nothing."
+  description = "Master switch. false plans and applies cleanly to nothing. The one read that still happens is the account_service_roles_exist lookup (iam:ListRoles): a check-scoped data source cannot be switched off, and a failed lookup is a warning, not an error."
   type        = bool
   default     = true
   nullable    = false
@@ -62,7 +62,7 @@ variable "acknowledged_checks" {
         "serverless_replication_is_not_watched_by_this_module",
         "control_tables_have_their_own_schema",
         "debug_logging_is_temporary",
-        "the_target_schema_comes_from_somewhere",
+        "raw_overrides_use_known_task_settings",
         "the_full_load_is_not_fighting_the_targets_constraints",
         "the_storage_alarm_leaves_room_to_react",
         "cdc_tasks_are_validated",
@@ -149,7 +149,7 @@ variable "multi_az" {
 }
 
 variable "availability_zone" {
-  description = "Pin the replication instance to one AZ. Only meaningful when multi_az is false; worth setting to match the source or target's AZ, because cross-AZ traffic is billed both ways."
+  description = "Pin the replication instance to one AZ. Only meaningful when multi_az is false; worth setting to match the source or target's AZ, because cross-AZ traffic is billed both ways. Changing it on an existing instance REPLACES the instance, and DMS will not delete an instance that still has tasks - the tasks have to be replaced in the same apply (RUNBOOK section 6a). Decide it before the first apply."
   type        = string
   default     = ""
   nullable    = false
@@ -189,7 +189,7 @@ variable "preferred_maintenance_window" {
 }
 
 variable "publicly_accessible" {
-  description = "Give the replication instance a public IP. This is a host holding credentials for both your source and your target database."
+  description = "Give the replication instance a public IP. This is a host holding credentials for both your source and your target database. Changing it on an existing instance REPLACES the instance, and DMS will not delete an instance that still has tasks - the tasks have to be replaced in the same apply (RUNBOOK section 6a)."
   type        = bool
   default     = false
   nullable    = false
@@ -288,7 +288,7 @@ variable "security_group_ids" {
 # ---------------------------------------------------------------------------
 
 variable "kms_key_arn" {
-  description = "CMK for replication instance storage, which is where cached changes and unshipped LOBs sit. Empty uses the AWS-managed DMS key. Endpoints can override this per endpoint."
+  description = "CMK for replication instance storage, which is where cached changes and unshipped LOBs sit. Empty uses the AWS-managed DMS key. Endpoints can override this per endpoint. Set it BEFORE the first apply: the key is immutable on the replication instance and on every endpoint that inherits it, and a replaced endpoint replaces every task that uses it - so changing it on a live migration replaces the instance, the endpoints and the tasks, and CDC starts over (RUNBOOK section 6a)."
   type        = string
   default     = ""
   nullable    = false
@@ -374,7 +374,9 @@ variable "endpoints" {
     # which is why the key form exists.
     certificate_key = optional(string, "")
     certificate_arn = optional(string, "")
-    kms_key_arn     = optional(string, "")
+    # Immutable on the endpoint: changing it replaces the endpoint and every
+    # task that uses it. Falls back to the module's kms_key_arn.
+    kms_key_arn = optional(string, "")
 
     extra_connection_attributes = optional(string, "")
 
@@ -677,7 +679,7 @@ variable "s3_targets" {
 }
 
 variable "certificates" {
-  description = "CA certificates DMS uses to verify a server, keyed by name. Required for ssl_mode verify-ca and verify-full. Set exactly one of pem (PEM text) or wallet (base64 of an Oracle wallet, e.g. filebase64 of cwallet.sso). For RDS, pem is the regional or global RDS CA bundle; for an on-prem source it is whatever signed the database's certificate; an Oracle endpoint verifies against a wallet, not a PEM."
+  description = "CA certificates DMS uses to verify a server, keyed by name. Required for ssl_mode verify-ca and verify-full. Set exactly one of pem (PEM text) or wallet (base64 of an Oracle wallet, e.g. filebase64 of cwallet.sso). For RDS, pem is the regional or global RDS CA bundle; for an on-prem source it is whatever signed the database's certificate; an Oracle endpoint verifies against a wallet, not a PEM. Rotating a CA is editing pem or wallet under the same key: the module uploads the new certificate first, repoints every endpoint, then deletes the old one, in one apply (the certificate id carries a digest of the content)."
   type = map(object({
     pem    = optional(string, "")
     wallet = optional(string, "")
@@ -708,8 +710,10 @@ variable "certificates" {
 # replication_task_settings is a JSON blob, and DMS ignores keys it does not
 # recognise WITHOUT ERROR. A typo in "EnableValidation" is a task that runs,
 # reports success, and validates nothing. So the module renders that JSON from
-# typed inputs instead of taking it as a string, and tests/lint_task_settings.py
-# checks whatever you add on top.
+# typed inputs instead of taking it as a string, checks whatever raw_overrides
+# adds on top against the documented keys at plan (check
+# raw_overrides_use_known_task_settings), and tests/lint_task_settings.py
+# checks the shipped JSON documents the same way.
 # ---------------------------------------------------------------------------
 
 variable "tasks" {
@@ -737,8 +741,11 @@ variable "tasks" {
     cdc_start_time and cdc_start_position are refused in serverless mode: the
     replication config has no such argument.
 
-    table_mappings is JSON. It must contain at least one selection rule: a
-    mapping with only transformation rules matches no tables, and the task then
+    table_mappings is JSON, checked at plan against the DMS table-mapping
+    documentation: rule types, selection and transformation actions and
+    targets, object-locators, the table-settings shapes, numeric rule-ids and
+    unique rule-names. It must contain at least one selection rule: a mapping
+    with only transformation rules matches no tables, and the task then
     completes successfully having moved nothing. In table and schema names "%"
     matches any run of characters and "_" matches ANY single character, so an
     exclude on STG_% also drops STGX...; escape a literal underscore (on
@@ -771,11 +778,17 @@ variable "tasks" {
       validation_failure_max       = optional(number, 10000)
       validation_table_failure_max = optional(number, 1000)
 
+      # DO_NOTHING (the default) means DMS creates nothing on the target: the
+      # schema has to exist before the task starts, and a table that does not
+      # suspends itself rather than failing the task, which reads as a partial
+      # success. governance.tasks_expecting_a_prebuilt_target lists the tasks
+      # this applies to. Building that schema is the pipeline's job; this
+      # module runs no SQL.
       target_table_prep_mode = optional(string, "DO_NOTHING")
       stop_after_full_load   = optional(bool, false)
       # Pauses a full-load-and-cdc task after the load and BEFORE the changes
       # cached during it are applied: the window to build the indexes CDC
-      # needs (see output.migration_plan). Resume the task to continue.
+      # needs (RUNBOOK section 4). Resume the task to continue.
       stop_before_cached_changes = optional(bool, false)
       # Oracle source with CDC: a transaction still open
       # transaction_consistency_timeout seconds after the task starts is
@@ -796,8 +809,8 @@ variable "tasks" {
       # Named by default. DMS writes awsdms_apply_exceptions here - failing rows
       # with their data and SQL - and in the target's default schema that is
       # production data in an unscoped table. The schema must exist on the
-      # target, or the migrating user must be able to create it - create it in a
-      # sql_scripts.pre_data script (see output.migration_plan, phase 1).
+      # target, or the migrating user must be able to create it - create it
+      # together with the target schema, before the task starts.
       control_schema      = optional(string, "dms_control")
       task_recovery_table = optional(bool, false)
       apply_error_max     = optional(number, 0)
@@ -1122,101 +1135,6 @@ variable "premigration_assessment" {
   validation {
     condition     = var.premigration_assessment.create_role ? var.premigration_assessment.role_arn == "" : can(regex("^arn:aws[a-z-]*:iam::[0-9]{12}:role/", var.premigration_assessment.role_arn))
     error_message = "premigration_assessment: create_role = false needs role_arn (an IAM role ARN); create_role = true takes none."
-  }
-}
-
-variable "sql_scripts" {
-  description = <<-EOT
-    The SQL that runs either side of the data, as a MANIFEST. The module does
-    not execute any of it - see below for why - it records what must run, in
-    what order, with a checksum, and emits that as output.migration_plan.
-
-    An Oracle to PostgreSQL migration is three phases, and DMS owns only the
-    middle one:
-
-      pre_data   schemas, tables, types, sequences. Must exist before the load,
-                 because the module's default target_table_prep_mode is
-                 DO_NOTHING and DMS will not create them.
-      <DMS>      full load, then CDC.
-      post_data  indexes, foreign keys, constraints, triggers, grants, and the
-                 sequence reset. Applied AFTER the load: building an index
-                 during a full load is slower and foreign keys reject rows that
-                 arrive out of parent-child order.
-
-    Supply sha256 with filesha256() so the change record can prove which version
-    of a script ran:
-
-      pre_data = [{
-        name   = "01-schema"
-        path   = "sql/01-schema.sql"
-        sha256 = filesha256("$${path.module}/sql/01-schema.sql")
-      }]
-
-    WHY THE MODULE DOES NOT RUN THEM. Executing DDL against a private Aurora
-    from a Terraform apply needs network reachability from the runner into an
-    isolated VPC, database credentials on that runner, and it makes a schema
-    change an untracked side effect of an apply. In a change-controlled estate
-    that belongs in your pipeline, as its own reviewable step, with its own
-    approval and its own log. output.migration_plan gives that step its exact
-    ordering and the psql invocation per script.
-  EOT
-  type = object({
-    pre_data = optional(list(object({
-      name        = string
-      path        = string
-      sha256      = optional(string, "")
-      description = optional(string, "")
-      sql         = optional(string, "")
-    })), [])
-    post_data = optional(list(object({
-      name        = string
-      path        = string
-      sha256      = optional(string, "")
-      description = optional(string, "")
-      sql         = optional(string, "")
-    })), [])
-  })
-  default  = {}
-  nullable = false
-
-  validation {
-    condition = alltrue([
-      for s in concat(var.sql_scripts.pre_data, var.sql_scripts.post_data) :
-      can(regex("^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$", s.name))
-    ])
-    error_message = "sql_scripts[*].name must be 1-64 chars of letters, digits, dot, underscore or hyphen; it orders and identifies the script in the change record."
-  }
-
-  validation {
-    condition = length(distinct([
-      for s in var.sql_scripts.pre_data : s.name
-    ])) == length(var.sql_scripts.pre_data)
-    error_message = "sql_scripts.pre_data names must be unique; they are the execution order and the audit key."
-  }
-
-  validation {
-    condition = length(distinct([
-      for s in var.sql_scripts.post_data : s.name
-    ])) == length(var.sql_scripts.post_data)
-    error_message = "sql_scripts.post_data names must be unique."
-  }
-
-  validation {
-    condition = alltrue([
-      for s in concat(var.sql_scripts.pre_data, var.sql_scripts.post_data) :
-      s.sha256 == "" ? true : can(regex("^[0-9a-f]{64}$", s.sha256))
-    ])
-    error_message = "sql_scripts[*].sha256 must be a hex SHA-256 digest - use filesha256(\"$${path.module}/sql/x.sql\")."
-  }
-
-  validation {
-    # Only checkable when the content is supplied. These are the statements that
-    # turn a migration script into an outage on the target.
-    condition = alltrue([
-      for s in concat(var.sql_scripts.pre_data, var.sql_scripts.post_data) :
-      s.sql == "" ? true : !can(regex("(?i)\\b(DROP\\s+DATABASE|DROP\\s+SCHEMA\\s+[^;]*CASCADE|TRUNCATE\\s+TABLE)\\b", s.sql))
-    ])
-    error_message = "a sql_scripts entry contains DROP DATABASE, DROP SCHEMA ... CASCADE or TRUNCATE TABLE. Against a migration target that is data loss rather than schema setup - move it out of the migration path, or supply the script by path only if it is genuinely intended."
   }
 }
 

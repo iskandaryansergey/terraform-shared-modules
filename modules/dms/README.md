@@ -11,8 +11,8 @@ matters: a CDC task that stops while everything still looks green.
 
 ```hcl
 module "migration" {
-  source  = "app.terraform.io/citadel-hub/dms/aws"
-  version = "~> 1.0"
+  source  = "app.terraform.io/CTO/dms/aws"
+  version = "~> 0.1"
 
   name               = "core-to-aurora"
   subnet_ids         = var.private_subnet_ids # two AZs minimum, routed to both databases
@@ -54,19 +54,6 @@ module "migration" {
     }
   }
 
-  sql_scripts = {
-    pre_data = [{
-      name   = "01-schema"
-      path   = "sql/01-schema.sql"
-      sha256 = filesha256("${path.module}/sql/01-schema.sql")
-    }]
-    post_data = [{
-      name   = "02-constraints"
-      path   = "sql/02-constraints.sql"
-      sha256 = filesha256("${path.module}/sql/02-constraints.sql")
-    }]
-  }
-
   tasks = {
     core = {
       source_endpoint = "src"
@@ -85,8 +72,7 @@ Hand the module's contract outputs to the teams that act on them by re-exporting
 them as root outputs of the workspace (or reading them with `tfe_outputs`):
 `source_prerequisites` goes to the DBA team, `network_contract` and
 `replication_instance_private_ips` to the network team, `account_prerequisites`
-to whoever owns IAM, `kms_key_policy_requirements` to the key owners, and
-`migration_plan` to the pipeline that runs the SQL.
+to whoever owns IAM, and `kms_key_policy_requirements` to the key owners.
 
 ## Requirements
 
@@ -112,6 +98,7 @@ first task start.
 | A PEM certificate on an Oracle endpoint | Warns (`oracle_ssl_uses_a_wallet`): DMS expects an Oracle wallet in `certificates[*].wallet` |
 | `TRUNCATE_BEFORE_LOAD` or `DROP_AND_CREATE` | Needs `allow_destructive_target_prep = true`. The gate reads the merged settings, so `raw_overrides` cannot slip past it |
 | A table mapping with no selection rule, or duplicate `rule-id`s | The task completes successfully having moved nothing |
+| A table-mapping rule outside the DMS documentation: unknown `rule-type`, action or target, non-numeric `rule-id`, missing `rule-name` or `object-locator`, `%` in an `explicit`, `define-primary-key` or `table-settings` rule, a column-only action on another target, an undocumented `parallel-load` or `lob-settings` shape, duplicate `rule-name`s, exclude-only selections | DMS rejects the mapping at task creation, after the plan was approved, or applies it to nothing. The message names the task and the `rule-id` |
 | A task using an endpoint that does not exist, or in the wrong direction (including an S3 target as a source) | Terraform would otherwise fail on a map lookup |
 | Full LOB mode (`lob_mode` `FULL` or `INLINE`) into an S3 target | DMS does not support it. Use `LIMITED` with `lob_max_size_kb` above the largest LOB |
 | `cdc_start_time` or `cdc_start_position` in serverless mode | `aws_dms_replication_config` has no such argument, so it would be dropped. Start with `aws dms start-replication --cdc-start-position` |
@@ -119,6 +106,7 @@ first task start.
 | `require_cmk` without a customer key on storage, every endpoint, every S3 target, the assessment, and the module-created task log group | DMS would fall back to an AWS-managed key. With `create_log_group = false` or `log_retention_days = 0`, DMS creates the log group itself with the AWS-managed key |
 | `publicly_accessible` | Needs `allow_public_replication_instance = true` |
 | `validation_tasks` or `premigration_assessment` in serverless mode | Both run on a replication instance |
+| In serverless mode: a `sybase` endpoint, a `db2`/`db2-zos` target, or a `db2`/`db2-zos` endpoint with SSL | DMS Serverless does not support them; the replication would be created and fail at Testing Connection |
 | A `validation_tasks` entry whose mode is `cdc` against a parent that never reads changes, whose parent DMS cannot validate, or whose key collides with a task | The validator could not run |
 | Duplicate keys across `endpoints` and `s3_targets` | Tasks look both up by one key |
 
@@ -151,12 +139,12 @@ for a reviewer. All are silent when `create = false`.
 | `serverless_replication_is_not_watched_by_this_module` | `compute_mode = "serverless"` |
 | `control_tables_have_their_own_schema` | a task writes DMS control tables to the target's default schema |
 | `debug_logging_is_temporary` | a task logs at DEBUG or DETAILED_DEBUG in its merged settings |
-| `the_target_schema_comes_from_somewhere` | `DO_NOTHING` with no `pre_data` script |
+| `raw_overrides_use_known_task_settings` | a `raw_overrides` section or key the DMS documentation does not list. DMS drops such keys silently; `governance.tasks_with_unknown_task_settings` names them |
 | `the_full_load_is_not_fighting_the_targets_constraints` | a PostgreSQL target has no `after_connect_script` |
 | `the_storage_alarm_leaves_room_to_react` | the free-storage threshold is under 15% of `allocated_storage_gb` |
 | `cdc_tasks_are_validated` | validation is off in a task's merged settings |
 | `tasks_write_logs` | logging is off in a task's merged settings |
-| `log_retention_is_bounded` | `log_retention_days = 0` |
+| `log_retention_is_bounded` | the module is not applying a retention: `log_retention_days = 0`, or `create_log_group = false` (the existing group keeps whatever it had). `governance.log_group_managed_by_module` says which |
 | `replication_survives_an_az` | single-AZ |
 | `full_load_does_not_leave_the_meter_running` | every task is full-load only on a provisioned instance |
 | `engine_version_is_pinned` | `engine_version` is empty |
@@ -167,30 +155,29 @@ for a reviewer. All are silent when `create = false`.
 | `validation_is_claimed_where_it_cannot_run` | validation is on for a task DMS cannot validate (below) |
 | `account_service_roles_exist` | `dms-vpc-role` or `dms-cloudwatch-logs-role` is missing from the account |
 
-## The migration is three phases; DMS owns one
+## What DMS does, and what it does not
+
+DMS owns the middle of a migration: the full load and CDC. The target schema
+before it, the indexes, constraints, grants and sequence reset after it, and
+the cutover steps are the pipeline's job: whatever runs SQL against the
+target in your estate, with its own record of which version of each script it
+executed. This module runs no SQL and records no scripts, so it has no
+dependency on that pipeline and no opinion about it. What it does say, as data, is
+which tasks depend on that work having happened:
+`governance.tasks_expecting_a_prebuilt_target` lists every task whose
+`target_table_prep_mode` is `DO_NOTHING`, the default, under which DMS creates
+nothing and a missing table suspends itself instead of failing the task.
 
 ```
-pre_data        schemas, tables, types, sequences          your pipeline
-   |            (DMS creates none of it under DO_NOTHING)
-   v
-assessment      premigration assessment, gated              your pipeline
-   v
-full load -> CDC                                            DMS
-   |            triggers and FKs inert via after_connect_script
-   v
-post_data       indexes, FKs, constraints, grants           your pipeline
-   v
-cutover         stop writes > drain CDC > stop task >       RUNBOOK section 6
+pre-data        schema, tables, primary keys, sequences    pipeline
+assessment      premigration assessment, gated             pipeline
+full load -> CDC                                           DMS
+                triggers and FKs inert via after_connect_script
+post-data       indexes, FKs, constraints, grants          pipeline
+cutover         stop writes > drain CDC > stop task >      RUNBOOK section 6
                 validation-only run > reset sequences >
                 repoint
 ```
-
-`sql_scripts` records the SQL either side as a **manifest** (name, path,
-`filesha256()`), and `output.migration_plan` emits the ordered sequence with
-those checksums, so a change record can state which version of which script
-ran. The module does not execute any of it: running DDL against a private Aurora
-from an apply needs network reachability into the isolated VPC and credentials on
-the runner, and it makes a schema change a side effect of a Terraform run.
 
 The one hook DMS has is `postgres.after_connect_script` on a PostgreSQL target.
 `SET session_replication_role = replica;` runs on every connection DMS opens, so
@@ -281,7 +268,7 @@ purpose is resumed by the next apply that modifies it.
 **On-premises hostnames need a resolver.** In an isolated VPC the VPC resolver
 has no path to your DNS servers, so a corporate hostname returns nothing and the
 connection test times out in a way that reads like a firewall problem. That is
-[`terraform-aws-route53-resolver`](https://github.com/ivasik-k7/terraform-shared-modules/tree/dms-v1.0.0/modules/route53-resolver),
+[`terraform-aws-route53-resolver`](../route53-resolver),
 not this module; build it first.
 
 **The source database has homework.** `source_prerequisites` returns it per
@@ -306,9 +293,9 @@ the slot advancing; dropping the slot afterwards is yours (RUNBOOK section 7).
 
 | Example | Shows |
 |---|---|
-| [`isolated-vpc-onprem-to-aurora`](https://github.com/ivasik-k7/terraform-shared-modules/tree/dms-v1.0.0/modules/dms/examples/isolated-vpc-onprem-to-aurora) | The regulated case: Oracle on-prem over Cloud WAN verified with a wallet (`verify-ca`), private Aurora, pre/post-data SQL with identity columns and a sequence reset, a validation-only task, premigration assessment, and the firewall request as an output |
-| [`oracle-to-aurora-postgresql`](https://github.com/ivasik-k7/terraform-shared-modules/tree/dms-v1.0.0/modules/dms/examples/oracle-to-aurora-postgresql) | The same migration in a simpler network, with batch apply |
-| [`serverless-cdc-to-s3`](https://github.com/ivasik-k7/terraform-shared-modules/tree/dms-v1.0.0/modules/dms/examples/serverless-cdc-to-s3) | Continuous CDC into a lake on serverless compute: parquet, day-partitioned, `LIMITED` LOBs because DMS does not support full LOB mode for S3 |
+| [`isolated-vpc-onprem-to-aurora`](examples/isolated-vpc-onprem-to-aurora) | The regulated case: Oracle on-prem over Cloud WAN verified with a wallet (`verify-ca`), private Aurora, a validation-only task, premigration assessment, and the firewall request as an output |
+| [`oracle-to-aurora-postgresql`](examples/oracle-to-aurora-postgresql) | The same migration in a simpler network, with batch apply |
+| [`serverless-cdc-to-s3`](examples/serverless-cdc-to-s3) | Continuous CDC into a lake on serverless compute: parquet, day-partitioned, `LIMITED` LOBs because DMS does not support full LOB mode for S3 |
 
 ## Most-used inputs
 
@@ -326,8 +313,7 @@ written to be read there.
 | `tasks` | `{}` | Typed settings; mappings validated at plan |
 | `validation_tasks` | `{}` | Validation-only tasks over an existing task |
 | `premigration_assessment` | disabled | Role plus per-task commands; provisioned only |
-| `sql_scripts` | `{}` | Pre/post-data manifest with checksums |
-| `kms_key_arn`, `require_cmk` | `""`, `false` | Storage, endpoints, logs |
+| `kms_key_arn`, `require_cmk` | `""`, `false` | Storage, endpoints, logs. Set the key before the first apply: changing it replaces the instance, the endpoints and the tasks |
 | `multi_az`, `engine_version` | `true`, `""` | Pin the version; minor upgrades are off by default |
 | `sns_topic_arn` | `""` | Without it nothing is watching |
 | `sns_topic_kms_key_arn` | `""` | The topic's customer key, so `kms_key_policy_requirements` can say what it must allow |
@@ -338,7 +324,6 @@ written to be read there.
 
 | Name | Use |
 |---|---|
-| `migration_plan` | The ordered phases with script checksums; hand to the pipeline |
 | `source_prerequisites` | Per source engine, what the DBA team must change before CDC works |
 | `network_contract` | Subnets, endpoints, egress, DNS and return-path notes; hand to the network team |
 | `account_prerequisites` | The fixed-name IAM roles DMS needs (`dms-access-for-endpoint` too with a Redshift target), and the DMS Serverless service-linked role when serverless or assessment is used |
@@ -386,7 +371,9 @@ written to be read there.
   refused: provider 5.x drops the Secrets Manager fields for them, so the
   endpoint would reach DMS without credentials. Kafka, Kinesis, MongoDB,
   OpenSearch, DynamoDB and Redis endpoints are not supported.
-- **The module runs no SQL.** `sql_scripts` is a manifest.
+- **The module runs no SQL and records no scripts.** Schema, constraints and
+  the sequence reset belong to your pipeline; the module only reports which
+  tasks depend on them (`governance.tasks_expecting_a_prebuilt_target`).
 - **Account-wide roles are not created by default.**
 - **Schema conversion is out of scope.** DMS moves data; the target schema is
   yours.
@@ -399,8 +386,12 @@ written to be read there.
 
 ## Versioning and support
 
-Semantic versioning, tagged `dms-vX.Y.Z`. A major release is anything that
-changes what an unchanged configuration plans: a removed or renamed input or
+Semantic versioning, tagged `vX.Y.Z` on the module's repository, which the
+HCP Terraform private registry publishes as `app.terraform.io/CTO/dms/aws`.
+The module stays at 0.x until its first live rehearsal confirms the items
+under "Limits"; while it is, a minor release may change a default and says so
+under **BREAKING**. From 1.0.0 a major release is anything that changes what an
+unchanged configuration plans: a removed or renamed input or
 output, a new required input, a changed default, a change that turns an update
 into a replacement, a changed resource address, or a raised Terraform or
 provider floor. Minor releases add optional inputs, outputs, checks and alarms;
@@ -417,6 +408,6 @@ throwing expression in a later `||` or `&&` operand).
 
 | Document | Question |
 |---|---|
-| [RUNBOOK.md](https://github.com/ivasik-k7/terraform-shared-modules/blob/dms-v1.0.0/modules/dms/RUNBOOK.md) | How to run a migration on HCP Terraform, from first plan to teardown |
-| [COSTS.md](https://github.com/ivasik-k7/terraform-shared-modules/blob/dms-v1.0.0/modules/dms/COSTS.md) | What it costs, and which line has no ceiling |
-| [CHANGELOG.md](https://github.com/ivasik-k7/terraform-shared-modules/blob/dms-v1.0.0/modules/dms/CHANGELOG.md) | What changed in each version |
+| [RUNBOOK.md](RUNBOOK.md) | How to run a migration on HCP Terraform, from first plan to teardown |
+| [COSTS.md](COSTS.md) | What it costs, and which line has no ceiling |
+| [CHANGELOG.md](CHANGELOG.md) | What changed in each version |

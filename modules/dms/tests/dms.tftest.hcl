@@ -96,17 +96,6 @@ variables {
     }
   }
 
-  # The schema has to come from somewhere: DO_NOTHING means DMS creates nothing.
-  sql_scripts = {
-    pre_data = [
-      { name = "01-schema", path = "sql/01-schema.sql", sha256 = "0000000000000000000000000000000000000000000000000000000000000001" },
-    ]
-    post_data = [
-      { name = "02-indexes", path = "sql/02-indexes.sql", sha256 = "0000000000000000000000000000000000000000000000000000000000000002" },
-      { name = "03-sequences", path = "sql/03-sequences.sql", sha256 = "0000000000000000000000000000000000000000000000000000000000000003" },
-    ]
-  }
-
   tasks = {
     app = {
       source_endpoint = "source-db"
@@ -319,9 +308,9 @@ run "the_secret_role_is_scoped_to_one_secret_and_trusts_the_regional_principal" 
   assert {
     condition = alltrue([
       for s in jsondecode(aws_iam_role_policy.endpoint_secret["source-db"].policy).Statement :
-      length(s.Resource) == 1 if s.Sid == "ReadThisSecretOnly"
+      jsonencode(s.Resource) == jsonencode(["arn:aws:secretsmanager:eu-west-1:111122223333:secret:src-AbCdEf"]) if s.Sid == "ReadThisSecretOnly"
     ])
-    error_message = "the secret-reading role must be scoped to exactly one secret."
+    error_message = "the secret-reading role must be scoped to that endpoint's secret and nothing else."
   }
 
   assert {
@@ -418,8 +407,10 @@ run "a_module_created_certificate_reaches_the_endpoint" {
 
   # Referencing the module's own certificate output from its input would be a
   # cycle, which is why endpoints take a key and the module resolves it.
+  # The exact mock ARN, not != "": a failed lookup renders null, and null != ""
+  # is true, so the weaker form passed precisely in the failure it names.
   assert {
-    condition     = aws_dms_endpoint.this["source-db"].certificate_arn != ""
+    condition     = aws_dms_endpoint.this["source-db"].certificate_arn == "arn:aws:dms:eu-west-1:111122223333:cert:MOCKCERT"
     error_message = "an endpoint with certificate_key must receive the created certificate's ARN."
   }
 }
@@ -692,9 +683,7 @@ run "a_stopped_cdc_task_is_alarmed_on" {
   }
 
   assert {
-    condition = alltrue([
-      for c in var.task_event_categories : contains(var.task_event_categories, "state change")
-    ])
+    condition     = contains(aws_dms_event_subscription.task[0].event_categories, "state change")
     error_message = "the task event subscription must include \"state change\", which is what fires when a task stops on its own."
   }
 }
@@ -1113,11 +1102,14 @@ run "regression_serverless_enforces_the_same_invariants" {
   # These preconditions used to live on aws_dms_replication_task, which has zero
   # instances in serverless mode - so a precondition on it never ran, and
   # allow_destructive_target_prep protected nothing there.
+  # source-db, not target-db: with the wrong direction the direction gate
+  # would refuse this on its own and the destructive gate could be deleted
+  # without this run noticing.
   variables {
     compute_mode = "serverless"
     tasks = {
       app = {
-        source_endpoint = "target-db"
+        source_endpoint = "source-db"
         target_endpoint = "target-db"
         migration_type  = "full-load"
         table_mappings  = "{\"rules\":[{\"rule-type\":\"selection\",\"rule-id\":\"1\",\"rule-name\":\"all\",\"object-locator\":{\"schema-name\":\"app\",\"table-name\":\"%\"},\"rule-action\":\"include\"}]}"
@@ -1302,9 +1294,9 @@ run "regression_the_s3_role_trust_is_scoped_to_dms_endpoints" {
   assert {
     condition = alltrue([
       for s in jsondecode(aws_iam_role.s3_target["lake"].assume_role_policy).Statement :
-      can(s.Condition.ArnLike["aws:SourceArn"])
+      try(s.Condition.ArnLike["aws:SourceArn"], "") == "arn:aws:dms:eu-west-1:111122223333:*"
     ])
-    error_message = "the S3 target role's trust policy needs an aws:SourceArn condition, not just aws:SourceAccount."
+    error_message = "the S3 target role's trust policy needs aws:SourceArn scoped to this account's DMS resources, not just aws:SourceAccount."
   }
 }
 
@@ -1356,75 +1348,41 @@ run "regression_the_network_contract_covers_a_hybrid_isolated_vpc" {
 }
 
 # ---------------------------------------------------------------------------
-# Pre-data and post-data
+# What the target has to have before the load
 #
-# DMS owns the middle phase only. The module records the other two and emits the
-# ordering; it deliberately runs none of it.
+# DMS owns the middle phase only. The module runs no SQL; it reports, as data,
+# which tasks depend on a schema that something else has to have built.
 # ---------------------------------------------------------------------------
 
-run "the_migration_plan_orders_all_three_phases" {
+run "tasks_that_need_a_prebuilt_target_are_listed_for_the_pipeline" {
   command = plan
 
   assert {
-    condition = alltrue([
-      length(output.migration_plan.phase_1_pre_data.scripts) == 1,
-      length(output.migration_plan.phase_3_post_data.scripts) == 2,
-    ])
-    error_message = "the plan must carry the pre-data and post-data scripts in their declared order."
-  }
-
-  assert {
-    condition = alltrue([
-      output.migration_plan.phase_1_pre_data.scripts[0].order == 1,
-      output.migration_plan.phase_3_post_data.scripts[0].name == "02-indexes",
-      output.migration_plan.phase_3_post_data.scripts[1].name == "03-sequences",
-    ])
-    error_message = "declared order is execution order: indexes before the sequence reset."
-  }
-
-  assert {
-    condition = alltrue([
-      for s in output.migration_plan.ordered_scripts : can(regex("^[0-9a-f]{64}$", s.sha256))
-    ])
-    error_message = "every script needs a checksum, or the change record cannot state which version ran."
-  }
-
-  assert {
-    condition     = can(regex("psql", output.migration_plan.phase_1_pre_data.example))
-    error_message = "the plan should hand the operator the invocation, not just the filename."
-  }
-
-  assert {
-    condition     = can(regex("(?i)does not execute", output.migration_plan.phase_1_pre_data.run_by)) || can(regex("(?i)pipeline", output.migration_plan.phase_1_pre_data.run_by))
-    error_message = "the plan must be explicit that the module runs none of this."
+    condition     = output.governance.tasks_expecting_a_prebuilt_target == ["app"]
+    error_message = "a DO_NOTHING task depends on a schema the pipeline builds first, and governance has to say which."
   }
 }
 
-run "the_load_guard_is_reported_where_it_is_configured" {
+run "a_task_that_prepares_its_own_target_is_not_listed" {
   command = plan
 
-  # after_connect_script is the only pre-data hook DMS actually has.
-  assert {
-    condition     = contains(output.migration_plan.phase_2_load_and_cdc.target_load_guard.configured_on, "target-db")
-    error_message = "the plan must name which target endpoints carry the load guard."
-  }
-
-  assert {
-    condition     = can(regex("session_replication_role", output.migration_plan.phase_2_load_and_cdc.target_load_guard.suggested))
-    error_message = "the suggested guard is what stops triggers firing and FKs rejecting rows during a full load."
-  }
-}
-
-run "a_migration_with_no_schema_step_is_flagged" {
-  command = plan
-
-  # DO_NOTHING plus no pre-data means the target schema has to exist already,
-  # and if it does not DMS suspends every table rather than failing the task.
   variables {
-    sql_scripts = {}
+    allow_destructive_target_prep = true
+    tasks = {
+      app = {
+        source_endpoint = "source-db"
+        target_endpoint = "target-db"
+        migration_type  = "full-load-and-cdc"
+        table_mappings  = "{\"rules\":[{\"rule-type\":\"selection\",\"rule-id\":\"1\",\"rule-name\":\"all\",\"object-locator\":{\"schema-name\":\"app\",\"table-name\":\"%\"},\"rule-action\":\"include\"}]}"
+        settings        = { target_table_prep_mode = "DROP_AND_CREATE" }
+      }
+    }
   }
 
-  expect_failures = [check.the_target_schema_comes_from_somewhere]
+  assert {
+    condition     = output.governance.tasks_expecting_a_prebuilt_target == []
+    error_message = "DROP_AND_CREATE builds its own tables, so the task does not depend on a prebuilt schema."
+  }
 }
 
 run "a_postgres_target_with_live_constraints_is_flagged" {
@@ -1457,51 +1415,4 @@ run "a_postgres_target_with_live_constraints_is_flagged" {
   }
 
   expect_failures = [check.the_full_load_is_not_fighting_the_targets_constraints]
-}
-
-run "a_destructive_statement_in_a_migration_script_is_rejected" {
-  command = plan
-
-  # Only checkable when the content is supplied, which is why sql is optional.
-  variables {
-    sql_scripts = {
-      pre_data = [{
-        name = "01-schema"
-        path = "sql/01-schema.sql"
-        sql  = "DROP SCHEMA app CASCADE;\nCREATE SCHEMA app;"
-      }]
-    }
-  }
-
-  expect_failures = [var.sql_scripts]
-}
-
-run "script_names_must_be_unique_because_they_are_the_audit_key" {
-  command = plan
-
-  variables {
-    sql_scripts = {
-      post_data = [
-        { name = "02-indexes", path = "sql/a.sql" },
-        { name = "02-indexes", path = "sql/b.sql" },
-      ]
-    }
-  }
-
-  expect_failures = [var.sql_scripts]
-}
-
-run "a_missing_checksum_is_called_out_rather_than_faked" {
-  command = plan
-
-  variables {
-    sql_scripts = {
-      pre_data = [{ name = "01-schema", path = "sql/01-schema.sql" }]
-    }
-  }
-
-  assert {
-    condition     = can(regex("not supplied", output.migration_plan.phase_1_pre_data.scripts[0].sha256))
-    error_message = "a script with no checksum must say so, not present an empty string as if it were verified."
-  }
 }

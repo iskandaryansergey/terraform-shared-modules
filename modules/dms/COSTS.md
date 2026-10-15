@@ -1,10 +1,10 @@
 # terraform-aws-dms — what a migration costs
 
-**Module:** `terraform-aws-dms` (`modules/dms`)
+**Module:** `terraform-aws-dms` (`app.terraform.io/CTO/dms/aws`)
 **Region:** **`eu-west-2` — EU (London)**, with `eu-west-1` (Ireland) alongside
 **Currency:** USD, on-demand list, no Savings Plans, no EDP discount
 **Pricing date:** rates pulled from the **AWS Price List bulk API** (`AWSDatabaseMigrationSvc`) on **2026-09-21**. They were not re-pulled when this document was last revised.
-**Basis:** `modules/dms` at `dms-v1.0.0` (unreleased), module defaults (`multi_az = true`, `log_retention_days = 30`, `auto_minor_version_upgrade = false`, alarms on); every deviation is stated where it is used. Hours are 730 per month and 8,760 per year.
+**Basis:** `terraform-aws-dms` at `v0.1.0` (unreleased), module defaults (`multi_az = true`, `log_retention_days = 30`, `auto_minor_version_upgrade = false`, alarms on); every deviation is stated where it is used. Hours are 730 per month and 8,760 per year.
 
 > **Verify before quoting externally.** These are list prices as of the pricing
 > date, not a live pull, and AWS changes them. Re-check any figure you will put

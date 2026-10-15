@@ -35,6 +35,14 @@ resource "aws_dms_replication_subnet_group" "this" {
     }
 
     precondition {
+      # A precondition rather than a validation on tasks: a validation cannot
+      # read a local derived from the variable it validates, and naming the
+      # task and the rule-id is the whole value of the message.
+      condition     = length(local.mapping_problems) == 0
+      error_message = "these table mappings have rules DMS would reject at task creation, after the plan was approved, or apply to nothing: ${join("; ", [for k, v in local.mapping_problems : "${k}: ${join(", ", v)}"])}. The values follow the DMS table-mapping documentation for selection, transformation and table-settings rules."
+    }
+
+    precondition {
       condition     = length(local.tasks_with_wrong_direction) == 0
       error_message = "these tasks use an endpoint in the wrong direction: ${join(", ", local.tasks_with_wrong_direction)}. An endpoint with role = \"target\" cannot be a task's source, and an S3 target is target-only by construction."
     }
@@ -50,6 +58,11 @@ resource "aws_dms_replication_subnet_group" "this" {
         if(t.cdc_start_time != "" || t.cdc_start_position != "") && !contains(["cdc", "full-load-and-cdc"], t.migration_type)
       ]) == 0
       error_message = "a task sets a CDC start point but its migration_type never reads changes, so the setting would be silently ignored."
+    }
+
+    precondition {
+      condition     = local.serverless ? length(local.endpoints_unsupported_by_serverless) == 0 : true
+      error_message = "compute_mode = \"serverless\" cannot replicate these endpoints: ${join(", ", local.endpoints_unsupported_by_serverless)}. The replication would be created and fail at Testing Connection. Use compute_mode = \"provisioned\", or change the endpoint."
     }
 
     precondition {

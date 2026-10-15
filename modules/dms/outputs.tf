@@ -99,7 +99,10 @@ output "governance" {
 
     # Data handling. Every field here is computed from the MERGED task settings,
     # so a raw_overrides that disables validation shows up as disabled.
-    tasks_deleting_target_data        = local.destructive_tasks
+    tasks_deleting_target_data = local.destructive_tasks
+    # DO_NOTHING: the target schema must exist before these start. The module
+    # runs no SQL; this is the fact the pipeline that does is gated on.
+    tasks_expecting_a_prebuilt_target = local.tasks_expecting_a_prebuilt_target
     tasks_without_validation          = local.unvalidated_tasks
     tasks_whose_validation_cannot_run = local.tasks_whose_validation_cannot_run
     validation_only_tasks             = { for k, v in var.validation_tasks : k => "${v.mode} of ${v.task}" }
@@ -111,6 +114,8 @@ output "governance" {
     tasks_with_raw_overrides = [
       for k, t in var.tasks : k if trimspace(t.settings.raw_overrides) != "{}"
     ]
+    # Keys in raw_overrides that DMS does not document and would drop silently.
+    tasks_with_unknown_task_settings = local.tasks_with_unknown_task_settings
     # What DMS runs with, from the merged settings - raw_overrides can replace
     # LogComponents, so the typed log_level alone would certify the wrong thing.
     task_log_levels = local.task_log_severities
@@ -126,6 +131,9 @@ output "governance" {
     observability_covers_this_compute_mode = local.provisioned
     cdc_tasks                              = keys(local.cdc_tasks)
     log_retention_days                     = var.log_retention_days
+    # false means log_retention_days is applied to nothing: serverless, or
+    # create_log_group = false, or 0. Read this before trusting the number.
+    log_group_managed_by_module = local.log_group_managed
   }
 }
 
@@ -229,70 +237,8 @@ output "account_prerequisites" {
   }] : [])
 }
 
-# ---------------------------------------------------------------------------
-# The migration as an ordered plan
-#
-# DMS owns one phase of three. This is the whole sequence, with the checksum of
-# every script, so the change record can state what ran and in what order.
-# ---------------------------------------------------------------------------
-output "migration_plan" {
-  description = "The full ordered migration: pre-data DDL, the DMS phases, post-data DDL, and the steps DMS cannot do. Hand this to whoever runs the pipeline; the module executes none of it."
-  value = !local.create ? null : {
-    phase_1_pre_data = {
-      when    = "before the task is started, once"
-      run_by  = "your pipeline - the module does not execute SQL"
-      what    = "schemas, tables with their primary keys, types, sequences. The default target_table_prep_mode is DO_NOTHING, so DMS creates none of it. Primary keys belong here: CDC applies changes as soon as each table finishes loading, and on a table without a key every UPDATE and DELETE is a full scan."
-      scripts = local.pre_data_scripts
-      example = length(local.pre_data_scripts) > 0 ? "psql -h <target-host> -d <db> -v ON_ERROR_STOP=1 -f ${local.pre_data_scripts[0].path}" : "no pre_data scripts declared - see sql_scripts"
-    }
-
-    phase_2_load_and_cdc = {
-      when   = "after pre-data completes"
-      run_by = "DMS"
-      what   = "full load, then change data capture until you stop it"
-      start  = local.provisioned ? "aws dms start-replication-task --replication-task-arn <task-arn> --start-replication-task-type start-replication" : "aws dms start-replication --replication-config-arn <config-arn> --start-replication-type start-replication"
-      # The one hook DMS does have, and what it is for.
-      target_load_guard = {
-        mechanism = "postgres_settings.after_connect_script on the TARGET endpoint"
-        configured_on = [
-          for k, e in var.endpoints : k
-          if e.role == "target" && e.postgres.after_connect_script != ""
-        ]
-        suggested = "SET session_replication_role = replica;"
-        why       = "runs on every connection DMS opens to the target, which is what stops triggers firing and foreign keys rejecting rows that arrive parent-last during a full load. It applies to DMS connections only, so nothing needs restoring afterwards; the DMS database user needs the privilege to set it."
-      }
-    }
-
-    phase_3_post_data = {
-      when    = "after the full load completes and before cutover"
-      run_by  = "your pipeline"
-      what    = "secondary indexes, foreign keys, triggers, grants - built after the data so the load is not paying for index maintenance, and so foreign keys are not rejecting rows that arrive out of order. To build them before cached changes are applied, set settings.stop_before_cached_changes, run this, then resume the task."
-      scripts = local.post_data_scripts
-      example = length(local.post_data_scripts) > 0 ? "psql -h <target-host> -d <db> -v ON_ERROR_STOP=1 -f ${local.post_data_scripts[0].path}" : "no post_data scripts declared - see sql_scripts"
-    }
-
-    phase_4_cutover = {
-      when   = "after post-data, in the cutover window"
-      run_by = "your pipeline, then a human"
-      what = [
-        "stop writes to the source",
-        "wait for CDCLatencyTarget to reach ~0",
-        "stop the forward task BEFORE the application writes anywhere, then set start = false on it (or remove it) before any later apply",
-        "reset sequences - DMS migrates rows, not sequence positions, and the first application insert otherwise fails on a duplicate key",
-        "nothing to restore for session_replication_role: after_connect_script applied to DMS connections only",
-        "capture the evidence: table statistics, validation state, governance output, and a full-load validation-only task run just before cutover",
-        "repoint the application",
-      ]
-      detail = "see RUNBOOK.md section 6"
-    }
-
-    # Everything above, flattened, for a pipeline that wants one list.
-    ordered_scripts = concat(local.pre_data_scripts, local.post_data_scripts)
-  }
-}
-
 output "verify_commands" {
-  description = "Copy-paste checks for what actually goes wrong, in the order you will need them. cdc_latency, validation_state, failed_tables and stop_task are maps keyed by task name, with the real task ARN or resource ID filled in. The cutover sequence is in RUNBOOK.md."
+  description = "Copy-paste checks for what actually goes wrong, in the order you will need them. cdc_latency, validation_state, failed_tables, start_task and stop_task are maps keyed by task name, with the real task ARN or resource ID filled in. The cutover sequence is in RUNBOOK.md."
   value = !local.create ? null : {
     # Before anything: does DMS reach the databases at all. This is the check
     # that fails when the network contract was not met.
@@ -327,6 +273,11 @@ output "verify_commands" {
     arm_alarms = {
       for k, t in local.cdc_tasks : k => "aws cloudwatch set-alarm-state --alarm-name ${var.name}-${k}-cdc-latency-target --state-value OK --state-reason 'task started' && aws cloudwatch set-alarm-state --alarm-name ${var.name}-${k}-cdc-latency-source --state-value OK --state-reason 'task started'"
     }
+
+    # Starting is a change-controlled act, which is why start = false is the
+    # default and the command is handed over rather than run. A validation-only
+    # task starts the same way (its ARN is in validation_task_arns).
+    start_task = local.provisioned ? { for k, t in aws_dms_replication_task.this : k => "aws dms start-replication-task --replication-task-arn ${t.replication_task_arn} --start-replication-task-type start-replication" } : { for k, c in aws_dms_replication_config.this : k => "aws dms start-replication --replication-config-arn ${c.arn} --start-replication-type start-replication" }
 
     # The one that stops the bill after cutover.
     stop_task             = local.provisioned ? { for k, t in aws_dms_replication_task.this : k => "aws dms stop-replication-task --replication-task-arn ${t.replication_task_arn}" } : { for k, c in aws_dms_replication_config.this : k => "aws dms stop-replication --replication-config-arn ${c.arn}" }
@@ -413,7 +364,7 @@ output "notification_requirements" {
 }
 
 output "kms_key_policy_requirements" {
-  description = "What each customer-managed key's policy has to allow for this migration to work. The module uses the keys but cannot write their policies - hand this to the key owner before the first apply. A missing CloudWatch Logs grant fails the log group create part way through the apply."
+  description = "What each customer-managed key's policy has to allow for this migration to work. The module uses the keys but cannot write their policies - hand this to the key owner before the first apply. A missing CloudWatch Logs grant fails the log group create part way through the apply. Each entry carries the machine-readable fields sid, principals, actions, conditions (contract v2, compiled by modules/kms) alongside the prose fields."
   value = !local.create ? null : concat(
     # The services that publish to an SSE-KMS topic need the topic's key.
     # Without it SNS rejects the publish and nobody is told.
@@ -427,6 +378,18 @@ output "kms_key_policy_requirements" {
       actions   = ["kms:GenerateDataKey*", "kms:Decrypt"]
       condition = {}
       why       = "the SNS topic is encrypted with this key; each service that publishes to it needs the key, or the notification is dropped."
+      sid       = "SnsTopicPublishers"
+      principals = {
+        services = concat(
+          length(aws_dms_event_subscription.instance) + length(aws_dms_event_subscription.task) > 0 ? ["dms.amazonaws.com"] : [],
+          local.alarms_enabled ? ["cloudwatch.amazonaws.com"] : [],
+          length(aws_cloudwatch_event_rule.serverless_failures) > 0 ? ["events.amazonaws.com"] : [],
+        )
+        arns  = []
+        roles = []
+      }
+      conditions = []
+      purpose    = "services publishing to the SSE-KMS SNS topic need the key, or notifications are dropped."
     }],
     var.kms_key_arn == "" ? [] : [{
       key       = var.kms_key_arn
@@ -434,6 +397,14 @@ output "kms_key_policy_requirements" {
       actions   = ["kms:CreateGrant", "kms:DescribeKey", "kms:Encrypt", "kms:Decrypt", "kms:ReEncrypt*", "kms:GenerateDataKey*"]
       condition = { "kms:ViaService" = "dms.${local.region}.amazonaws.com" }
       why       = "DMS encrypts replication storage (cached changes, in-flight LOBs) and endpoint connection details with grants created on the caller's behalf."
+      sid       = "ReplicationStorage"
+      principals = {
+        services = []
+        arns     = []
+        roles    = ["deployer"]
+      }
+      conditions = [{ test = "StringEquals", variable = "kms:ViaService", values = ["dms.${local.region}.amazonaws.com"] }]
+      purpose    = "DMS encrypts replication storage and endpoint connection details through grants."
     }],
     [for key in distinct([for k, e in var.endpoints : e.kms_key_arn if e.kms_key_arn != "" && e.kms_key_arn != var.kms_key_arn]) : {
       key       = key
@@ -441,13 +412,29 @@ output "kms_key_policy_requirements" {
       actions   = ["kms:CreateGrant", "kms:DescribeKey", "kms:Encrypt", "kms:Decrypt"]
       condition = { "kms:ViaService" = "dms.${local.region}.amazonaws.com" }
       why       = "DMS encrypts the endpoint's connection details with this key."
+      sid       = "EndpointConnection${substr(sha1(key), 0, 8)}"
+      principals = {
+        services = []
+        arns     = []
+        roles    = ["deployer"]
+      }
+      conditions = [{ test = "StringEquals", variable = "kms:ViaService", values = ["dms.${local.region}.amazonaws.com"] }]
+      purpose    = "DMS encrypts endpoint connection details with this key."
     }],
-    !(local.provisioned && var.create_log_group && var.log_retention_days > 0 && var.kms_key_arn != "") ? [] : [{
+    !(local.log_group_managed && var.kms_key_arn != "") ? [] : [{
       key       = var.kms_key_arn
       principal = "Service: logs.${local.region}.amazonaws.com"
       actions   = ["kms:Encrypt*", "kms:Decrypt*", "kms:ReEncrypt*", "kms:GenerateDataKey*", "kms:Describe*"]
       condition = { "ArnEquals kms:EncryptionContext:aws:logs:arn" = "arn:${local.partition}:logs:${local.region}:${local.account_id}:log-group:${local.log_group_name}" }
       why       = "CloudWatch Logs encrypts the task log group with this key. Without the grant the log group create fails."
+      sid       = "TaskLogGroup"
+      principals = {
+        services = ["logs.${local.region}.amazonaws.com"]
+        arns     = []
+        roles    = []
+      }
+      conditions = [{ test = "ArnEquals", variable = "kms:EncryptionContext:aws:logs:arn", values = ["arn:${local.partition}:logs:${local.region}:${local.account_id}:log-group:${local.log_group_name}"] }]
+      purpose    = "CloudWatch Logs encrypts the task log group; without it the log group create fails."
     }],
     [for key in distinct([for k, e in var.endpoints : e.secret_kms_key_arn if e.secret_kms_key_arn != ""]) : {
       key       = key
@@ -455,6 +442,14 @@ output "kms_key_policy_requirements" {
       actions   = ["kms:Decrypt"]
       condition = { "kms:ViaService" = "secretsmanager.${local.region}.amazonaws.com" }
       why       = "DMS reads the endpoint secret through these roles. Needed in the key policy unless it delegates to IAM."
+      sid       = "EndpointSecret${substr(sha1(key), 0, 8)}"
+      principals = {
+        services = []
+        arns     = [for k, e in var.endpoints : local.endpoint_secret_role_arns[k] if e.secret_kms_key_arn == key]
+        roles    = []
+      }
+      conditions = [{ test = "StringEquals", variable = "kms:ViaService", values = ["secretsmanager.${local.region}.amazonaws.com"] }]
+      purpose    = "DMS reads the endpoint secrets through these roles."
     }],
     [for key in distinct([for k, s in var.s3_targets : s.kms_key_arn if s.encryption_mode == "SSE_KMS" && s.kms_key_arn != ""]) : {
       key       = key
@@ -462,6 +457,14 @@ output "kms_key_policy_requirements" {
       actions   = ["kms:GenerateDataKey", "kms:Encrypt", "kms:Decrypt", "kms:DescribeKey"]
       condition = { "kms:ViaService" = "s3.${local.region}.amazonaws.com" }
       why       = "DMS writes SSE-KMS objects to the target bucket through these roles."
+      sid       = "S3Target${substr(sha1(key), 0, 8)}"
+      principals = {
+        services = []
+        arns     = [for k, s in var.s3_targets : local.s3_target_role_arns[k] if s.kms_key_arn == key]
+        roles    = []
+      }
+      conditions = [{ test = "StringEquals", variable = "kms:ViaService", values = ["s3.${local.region}.amazonaws.com"] }]
+      purpose    = "DMS writes SSE-KMS objects to the target bucket through these roles."
     }],
     !local.assessment_enabled || var.premigration_assessment.kms_key_arn == "" ? [] : [{
       key       = var.premigration_assessment.kms_key_arn
@@ -469,6 +472,14 @@ output "kms_key_policy_requirements" {
       actions   = ["kms:GenerateDataKey", "kms:Decrypt"]
       condition = { "kms:ViaService" = "s3.${local.region}.amazonaws.com" }
       why       = "DMS writes the premigration assessment reports encrypted with this key."
+      sid       = "PremigrationAssessment"
+      principals = {
+        services = []
+        arns     = [local.assessment_role_arn]
+        roles    = []
+      }
+      conditions = [{ test = "StringEquals", variable = "kms:ViaService", values = ["s3.${local.region}.amazonaws.com"] }]
+      purpose    = "DMS writes the premigration assessment reports encrypted with this key."
     }],
   )
 }

@@ -90,17 +90,6 @@ variables {
     }
   }
 
-  # The schema has to come from somewhere: DO_NOTHING means DMS creates nothing.
-  sql_scripts = {
-    pre_data = [
-      { name = "01-schema", path = "sql/01-schema.sql", sha256 = "0000000000000000000000000000000000000000000000000000000000000001" },
-    ]
-    post_data = [
-      { name = "02-indexes", path = "sql/02-indexes.sql", sha256 = "0000000000000000000000000000000000000000000000000000000000000002" },
-      { name = "03-sequences", path = "sql/03-sequences.sql", sha256 = "0000000000000000000000000000000000000000000000000000000000000003" },
-    ]
-  }
-
   tasks = {
     app = {
       source_endpoint = "source-db"
@@ -388,6 +377,50 @@ run "create_false_leaves_the_key_contract_null" {
   }
 }
 
+# Apply, because the module-created role ARNs in principals.arns are unknown at plan.
+run "every_key_requirement_carries_the_v2_contract" {
+  command = apply
+
+  variables {
+    sns_topic_kms_key_arn = "arn:aws:kms:eu-west-1:111122223333:key/99999999-2222-3333-4444-555555555555"
+    premigration_assessment = {
+      enabled     = true
+      bucket_name = "migration-evidence"
+      kms_key_arn = "arn:aws:kms:eu-west-1:111122223333:key/77777777-2222-3333-4444-555555555555"
+    }
+  }
+
+  assert {
+    condition     = length(output.kms_key_policy_requirements) >= 5
+    error_message = "this configuration should emit the topic, storage, log group, secret and assessment requirements."
+  }
+
+  assert {
+    condition = alltrue([
+      for r in output.kms_key_policy_requirements :
+      can(regex("^[A-Za-z0-9]+$", r.sid))
+      && can(tolist(r.principals.services)) && can(tolist(r.principals.arns)) && can(tolist(r.principals.roles))
+      && length(r.principals.services) + length(r.principals.arns) + length(r.principals.roles) > 0
+      && length(r.actions) > 0
+      && alltrue([for c in r.conditions : c.test != "" && c.variable != "" && length(c.values) > 0])
+    ])
+    error_message = "every entry needs an alphanumeric sid, all three principal lists, a principal, actions and well-formed conditions."
+  }
+
+  assert {
+    condition     = length(distinct([for r in output.kms_key_policy_requirements : r.sid])) == length(output.kms_key_policy_requirements)
+    error_message = "sids must be unique, or the compiled key policy is rejected."
+  }
+
+  assert {
+    condition = alltrue([
+      for r in output.kms_key_policy_requirements :
+      length(r.principals.arns) + length(r.principals.roles) > 0 || !anytrue([for c in r.conditions : c.variable == "kms:ViaService"])
+    ])
+    error_message = "kms:ViaService on a service-only statement never matches."
+  }
+}
+
 # ---------------------------------------------------------------------------
 # Premigration assessment
 # ---------------------------------------------------------------------------
@@ -495,8 +528,10 @@ run "the_assessment_command_always_encrypts_and_names_the_task" {
     error_message = "the command names the task, writes under the migration's prefix, and never omits the encryption mode - AWS stores results unencrypted without it."
   }
 
+  # Every mocked task returns the same ARN, so the ARN value proves nothing
+  # about which task it came from; the identifier is computed from config.
   assert {
-    condition     = output.validation_task_arns["app-check"] == "arn:aws:dms:eu-west-1:111122223333:task:MOCKTASK"
-    error_message = "validation task ARNs are exposed for the operator commands."
+    condition     = keys(output.validation_task_arns) == ["app-check"] && aws_dms_replication_task.validation["app-check"].replication_task_id == "test-migration-app-check"
+    error_message = "validation task ARNs are exposed per validation task, keyed by its name."
   }
 }

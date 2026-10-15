@@ -72,7 +72,6 @@ attached to the change record as text, not screenshots:
 | `network_contract` | the network team |
 | `account_prerequisites` | whoever owns IAM |
 | `kms_key_policy_requirements` | the owner of each customer key |
-| `migration_plan` | whoever runs the pipeline |
 
 Most of these are known at the first plan. Values that name created resources,
 such as role ARNs, and `replication_instance_private_ips` (the firewall request)
@@ -93,7 +92,9 @@ Blocking items, in the order they bite:
    from inside the VPC, both multi-AZ ENI addresses allowed through the on-prem
    firewall.
 5. **The target schema exists**, because `target_table_prep_mode` defaults to
-   `DO_NOTHING`. That is phase 1 of `migration_plan`.
+   `DO_NOTHING`. The pipeline builds it; the module runs no SQL, and
+   `governance.tasks_expecting_a_prebuilt_target` names the tasks that depend
+   on it.
 6. **Transport is configured for the engine.** Oracle verifies with a wallet and
    `verify-ca`; the module refuses `verify-full` there. See the README's SSL
    table.
@@ -108,13 +109,13 @@ approving a plan never begins writing to a target.
 Then, before starting anything:
 
 ```bash
-# 1. Phase 1 from migration_plan, by your pipeline.
+# 1. Pre-data, by your pipeline. By hand:
 psql -h <target> -d <db> -v ON_ERROR_STOP=1 -f sql/01-pre-data-schema.sql
 ```
 
-Record the checksum that ran: `migration_plan.phase_1_pre_data.scripts[].sha256`
-lets the change record state which version of the script was applied, rather
-than "the one in the repo at the time".
+Record which version ran: your pipeline's own log of what it executed, or by
+hand the `sha256sum` of the file, so the change record states which version was
+applied rather than "the one in the repo at the time".
 
 ```bash
 # 2. Can DMS reach both databases? A missed firewall rule or VPC endpoint
@@ -197,7 +198,7 @@ connect, check that the DMS user may set that parameter.
 
 ## 4. Post-data, then the CDC soak
 
-Run phase 3 of `migration_plan` once the full load completes: secondary
+Run post-data once the full load completes: secondary
 indexes, foreign keys, triggers, grants. Built now rather than during the load,
 because index maintenance slows the load and foreign keys reject rows that
 arrive parent-last. Primary keys are not in this list: they belong in pre-data,
@@ -412,9 +413,11 @@ decide whether it belongs in a cutover window:
 | Change | Effect |
 |---|---|
 | `subnet_ids` | In-place update of the subnet group |
-| A task's `replication_instance_arn` (a replaced instance) | The task moves to the new instance in place |
-| `kms_key_arn` on an endpoint, or the module's `kms_key_arn` (which endpoints inherit) | ForceNew: **replaces the endpoints and the tasks that use them**, as well as the replication instance when it is the module key |
-| `publicly_accessible`, `availability_zone`, `name` on the instance | Replaces the instance. Its cached changes are lost |
+| `kms_key_arn` on an endpoint, or the module's `kms_key_arn` (which endpoints inherit) | Immutable on the endpoint, and a task's endpoint ARNs are immutable on the task: **replaces the endpoints and the tasks that use them**, and the replication instance too when it is the module key. The tasks are destroyed first, so this applies cleanly; the CDC position is lost |
+| `publicly_accessible` or `availability_zone` | Replaces the instance - and **the apply fails** unless the tasks are replaced in the same run. The provider changes a task's `replication_instance_arn` in place, so Terraform deletes the old instance before it touches the tasks, and DMS refuses to delete an instance that still has tasks (`InvalidResourceStateFault`). Replace every task of the module in that apply, which makes Terraform destroy them first: `terraform apply -replace='module.<name>.aws_dms_replication_task.this["<task>"]'` (one `-replace` per task, `aws_dms_replication_task.validation` included). Cached changes and the CDC position are lost either way |
+| `name` | Replaces everything, tasks first, so it applies cleanly - and starts the migration over |
+| `certificates[*].pem` or `.wallet` (a CA rotation) | A new certificate is created first, the endpoints are repointed, then the old one is deleted - one apply, the tasks on those endpoints are updated in place. The certificate id carries a digest of the content, which is what makes this order possible |
+| Serverless: the module's `kms_key_arn`, `serverless.availability_zone`, `name` | Replaces every replication config (`compute_config` keys are immutable). CDC starts over. Any other change to a task stops the replication and resumes it only if `start = true` |
 
 Adopting a CMK mid-migration in response to a control finding is the realistic
 way a replacement happens. Cutover-window only, with a plan to reload.

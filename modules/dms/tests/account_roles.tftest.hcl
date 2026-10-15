@@ -87,17 +87,6 @@ variables {
     }
   }
 
-  # The schema has to come from somewhere: DO_NOTHING means DMS creates nothing.
-  sql_scripts = {
-    pre_data = [
-      { name = "01-schema", path = "sql/01-schema.sql", sha256 = "0000000000000000000000000000000000000000000000000000000000000001" },
-    ]
-    post_data = [
-      { name = "02-indexes", path = "sql/02-indexes.sql", sha256 = "0000000000000000000000000000000000000000000000000000000000000002" },
-      { name = "03-sequences", path = "sql/03-sequences.sql", sha256 = "0000000000000000000000000000000000000000000000000000000000000003" },
-    ]
-  }
-
   tasks = {
     app = {
       source_endpoint = "source-db"

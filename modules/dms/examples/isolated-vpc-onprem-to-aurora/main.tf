@@ -171,37 +171,6 @@ module "migration" {
     }
   }
 
-  # The SQL either side of the data. The module does not run any of it - it
-  # records what must run, in what order, with a checksum, and emits
-  # output.migration_plan for the pipeline that does.
-  #
-  # filesha256() is what lets the change record state which version ran.
-  sql_scripts = {
-    pre_data = [
-      {
-        name        = "01-schema"
-        path        = "sql/01-pre-data-schema.sql"
-        sha256      = filesha256("${path.module}/sql/01-pre-data-schema.sql")
-        description = "Schemas and tables. DMS creates none of this under DO_NOTHING."
-      },
-    ]
-
-    post_data = [
-      {
-        name        = "02-constraints"
-        path        = "sql/02-post-data-constraints.sql"
-        sha256      = filesha256("${path.module}/sql/02-post-data-constraints.sql")
-        description = "Primary keys, indexes, foreign keys and grants - after the load, not during it."
-      },
-      {
-        name        = "03-sequences"
-        path        = "sql/03-post-data-sequences.sql"
-        sha256      = filesha256("${path.module}/sql/03-post-data-sequences.sql")
-        description = "Sequence reset. DMS migrates rows, not sequence positions; re-run immediately before cutover."
-      },
-    ]
-  }
-
   # Premigration assessment: DMS checks the task against the source and target
   # and writes a report to S3 before any data moves. The module creates the
   # role; the command is in output.premigration_assessment, run as a gated step
@@ -302,11 +271,6 @@ output "source_prerequisites" {
 output "governance" {
   description = "The posture, as data, for the change record."
   value       = module.migration.governance
-}
-
-output "migration_plan" {
-  description = "The whole migration in order: pre-data DDL, DMS load and CDC, post-data DDL, cutover. Hand to whoever runs the pipeline - the module executes none of the SQL."
-  value       = module.migration.migration_plan
 }
 
 output "premigration_assessment" {

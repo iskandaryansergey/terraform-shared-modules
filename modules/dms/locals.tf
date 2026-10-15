@@ -26,6 +26,17 @@ locals {
   provisioned = var.compute_mode == "provisioned"
   serverless  = var.compute_mode == "serverless"
 
+  # DMS Serverless supports a subset of DMS Standard ("AWS DMS Serverless
+  # components", supported endpoints): no SAP ASE at all, Db2 as a source only,
+  # and ("AWS DMS Serverless limitations") no SSL on Db2 endpoints. A
+  # replication on any of these applies cleanly and fails at Testing
+  # Connection. Endpoint keys with the reason, for the precondition's message.
+  endpoints_unsupported_by_serverless = concat(
+    [for k, e in var.endpoints : "${k} (SAP ASE is not supported by DMS Serverless)" if e.engine == "sybase"],
+    [for k, e in var.endpoints : "${k} (Db2 is a source only on DMS Serverless)" if contains(["db2", "db2-zos"], e.engine) ? e.role == "target" : false],
+    [for k, e in var.endpoints : "${k} (DMS Serverless does not support SSL on Db2 endpoints)" if contains(["db2", "db2-zos"], e.engine) ? e.ssl_mode != "none" : false],
+  )
+
   # -------------------------------------------------------------------------
   # Endpoints
   # -------------------------------------------------------------------------
@@ -70,6 +81,13 @@ locals {
       ? try(aws_dms_certificate.this[e.certificate_key].certificate_arn, "")
       : e.certificate_arn
     )
+  }
+
+  # Eight hex characters of the content digest, part of the certificate id so
+  # a rotated CA is a new certificate rather than an in-place replacement.
+  # Callers often pass certificates as sensitive; the digest is not.
+  certificate_digests = {
+    for k, c in var.certificates : k => substr(sha256("${try(nonsensitive(c.pem), c.pem)}${try(nonsensitive(c.wallet), c.wallet)}"), 0, 8)
   }
 
   endpoint_arns = merge(
@@ -400,6 +418,200 @@ locals {
     for k, t in var.tasks : k => jsondecode(t.settings.raw_overrides)
   }
 
+  # Every task-settings section and key the DMS user guide documents
+  # ("Specifying task settings", one page per section). DMS ignores anything
+  # else without a word, so raw_overrides is checked against this list at plan
+  # (check raw_overrides_use_known_task_settings). An empty list means the
+  # section's content is free-form (a list, a scalar, or undocumented keys).
+  # tests/lint_task_settings.py carries the same list and fails when the two
+  # drift - edit both, between the begin/end markers.
+  # known_task_settings:begin
+  known_task_settings = {
+    TargetMetadata = [
+      "TargetSchema", "SupportLobs", "FullLobMode", "LobChunkSize", "LimitedSizeLobMode",
+      "LobMaxSize", "InlineLobMaxSize", "LoadMaxFileSize", "ParallelLoadThreads",
+      "ParallelLoadBufferSize", "ParallelLoadQueuesPerThread", "ParallelApplyThreads",
+      "ParallelApplyBufferSize", "ParallelApplyQueuesPerThread", "BatchApplyEnabled",
+      "TaskRecoveryTableEnabled", "UseCsvNoSupValue", "CsvNoSupValue",
+    ]
+    FullLoadSettings = [
+      "TargetTablePrepMode", "CreatePkAfterFullLoad", "StopTaskCachedChangesApplied",
+      "StopTaskCachedChangesNotApplied", "MaxFullLoadSubTasks", "TransactionConsistencyTimeout",
+      "CommitRate", "ParallelLoadThreads",
+    ]
+    Logging = [
+      "EnableLogging", "EnableLogContext", "LogComponents", "CloudWatchLogGroup",
+      "CloudWatchLogStream", "DeleteTaskLogs",
+    ]
+    ControlTablesSettings = [
+      "ControlSchema", "HistoryTimeslotInMinutes", "StatusTableEnabled",
+      "SuspendedTablesTableEnabled", "HistoryTableEnabled", "FullLoadExceptionTableEnabled",
+      "CommitPositionTableEnabled",
+    ]
+    ValidationSettings = [
+      "EnableValidation", "ValidationMode", "ThreadCount", "FailureMaxCount",
+      "TableFailureMaxCount", "HandleCollationDiff", "ValidationOnly",
+      "RecordFailureDelayInMinutes", "RecordSuspendDelayInMinutes",
+      "RecordFailureDelayLimitInMinutes", "SkipLobColumns", "ValidationPartialLobSize",
+      "ValidationQueryCdcDelaySeconds", "PartitionSize", "MaxKeyColumnSize",
+    ]
+    ResyncSettings = ["EnableResync", "ResyncSchedule", "MaxResyncTime", "ValidationTaskId"]
+    ErrorBehavior = [
+      "DataErrorPolicy", "DataTruncationErrorPolicy", "DataMaskingErrorPolicy",
+      "DataErrorEscalationPolicy", "DataErrorEscalationCount", "TableErrorPolicy",
+      "TableErrorEscalationPolicy", "TableErrorEscalationCount", "RecoverableErrorCount",
+      "RecoverableErrorInterval", "RecoverableErrorThrottling", "RecoverableErrorThrottlingMax",
+      "RecoverableErrorStopRetryAfterThrottlingMax", "ApplyErrorDeletePolicy",
+      "ApplyErrorInsertPolicy", "ApplyErrorUpdatePolicy", "ApplyErrorEscalationPolicy",
+      "ApplyErrorEscalationCount", "ApplyErrorFailOnTruncationDdl", "FullLoadIgnoreConflicts",
+      "FailOnTransactionConsistencyBreached", "FailOnNoTablesCaptured", "EventErrorPolicy",
+    ]
+    ChangeProcessingTuning = [
+      "BatchApplyPreserveTransaction", "BatchApplyTimeoutMin", "BatchApplyTimeoutMax",
+      "BatchApplyMemoryLimit", "BatchSplitSize", "MinTransactionSize", "CommitTimeout",
+      "MemoryLimitTotal", "MemoryKeepTime", "StatementCacheSize", "RecoveryTimeout",
+    ]
+    ChangeProcessingDdlHandlingPolicy = [
+      "HandleSourceTableDropped", "HandleSourceTableTruncated", "HandleSourceTableAltered",
+    ]
+    StreamBufferSettings       = ["StreamBufferCount", "StreamBufferSizeInMB", "CtrlStreamBufferSizeInMB"]
+    CharacterSetSettings       = ["CharacterReplacements", "CharacterSetSupport"]
+    BeforeImageSettings        = ["EnableBeforeImage", "FieldName", "ColumnFilter"]
+    LoopbackPreventionSettings = ["EnableLoopbackPrevention", "SourceSchema", "TargetSchema"]
+    TTSettings = [
+      "EnableTT", "TTS3Settings", "TTRecordSettings", "EncryptionMode",
+      "ServerSideEncryptionKmsKeyId", "ServiceAccessRoleArn", "BucketName", "BucketFolder",
+      "EnableDeletingFromS3OnTaskDelete", "EnableRawData", "RawDataFormat", "OperationsToLog",
+      "MaxRecordSize",
+    ]
+    PostProcessingRules                 = []
+    FailTaskWhenCleanTaskResourceFailed = []
+  }
+  # known_task_settings:end
+
+  # -------------------------------------------------------------------------
+  # Table mappings
+  #
+  # DMS rejects a malformed rule at task creation - after the plan was approved
+  # - and applies some well-formed ones to nothing. The values below are the
+  # DMS table-mapping documentation (selection, transformation and
+  # table-settings rules); tests/lint_task_settings.py carries the same lists
+  # and fails when they drift.
+  # -------------------------------------------------------------------------
+
+  # known_mapping_rules:begin
+  known_mapping_rules = {
+    rule_types        = ["selection", "transformation", "table-settings", "object-mapping"]
+    selection_actions = ["include", "exclude", "explicit"]
+    transformation_actions = [
+      "add-column", "include-column", "remove-column", "rename", "convert-lowercase",
+      "convert-uppercase", "add-prefix", "remove-prefix", "replace-prefix", "add-suffix",
+      "remove-suffix", "replace-suffix", "define-primary-key", "change-data-type",
+      "add-before-image-columns", "data-masking-digits-mask", "data-masking-digits-randomize",
+      "data-masking-hash-mask",
+    ]
+    transformation_targets = ["schema", "table", "column", "table-tablespace", "index-tablespace"]
+    column_only_actions = [
+      "change-data-type", "data-masking-digits-mask", "data-masking-digits-randomize",
+      "data-masking-hash-mask",
+    ]
+    parallel_load_types = ["partitions-auto", "subpartitions-auto", "partitions-list", "ranges", "none"]
+    lob_modes           = ["limited", "unlimited", "none"]
+  }
+  # known_mapping_rules:end
+
+  # The rules of every task, as objects only. Anything the validations on
+  # var.tasks already refuse (not JSON, no rules array) comes out empty here so
+  # nothing below can throw. try(), not a conditional: rules of different
+  # shapes are a tuple with no single element type, and a conditional would
+  # demand one. Every string field is read null-safe: a missing or null value
+  # is "", and the rule is judged on that.
+  mapping_rules = {
+    for k, t in var.tasks : k => [
+      for r in try([for r in jsondecode(t.table_mappings).rules : r if can(keys(r))], []) : {
+        id           = try(trimspace(tostring(r["rule-id"])), "?")
+        name         = try(trimspace(tostring(r["rule-name"])), "")
+        type         = try(trimspace(tostring(r["rule-type"])), "")
+        action       = try(trimspace(tostring(r["rule-action"])), "")
+        target       = try(trimspace(tostring(r["rule-target"])), "")
+        has_locator  = can(keys(r["object-locator"]))
+        schema       = try(trimspace(tostring(r["object-locator"]["schema-name"])), "")
+        table        = try(trimspace(tostring(r["object-locator"]["table-name"])), "")
+        has_pl       = can(keys(r["parallel-load"]))
+        pl_type      = try(trimspace(tostring(r["parallel-load"]["type"])), "")
+        pl_cols      = can(r["parallel-load"]["columns"][0])
+        pl_bounds    = can(r["parallel-load"]["boundaries"][0])
+        pl_parts     = can(r["parallel-load"]["partitions"][0])
+        pl_subparts  = can(r["parallel-load"]["subpartitions"][0])
+        has_lob      = can(keys(r["lob-settings"]))
+        lob_mode     = try(trimspace(tostring(r["lob-settings"]["mode"])), "limited")
+        lob_max_size = try(tonumber(r["lob-settings"]["bulk-max-size"]), 0)
+      }
+    ]
+  }
+
+  # Nested ternaries throughout: the floor evaluates both operands of && and ||.
+  mapping_problems_all = {
+    for k, rules in local.mapping_rules : k => concat(
+      [for r in rules : "rule ${r.id}: rule-id must be a numeric value" if !can(regex("^[0-9]+$", r.id))],
+      [for r in rules : "rule ${r.id}: rule-name is required" if r.name == ""],
+      [for r in rules : "rule ${r.id}: rule-type \"${r.type}\" is not one of ${join(", ", local.known_mapping_rules.rule_types)}" if !contains(local.known_mapping_rules.rule_types, r.type)],
+
+      [for r in rules : "rule ${r.id}: a selection rule-action is include, exclude or explicit, not \"${r.action}\"" if r.type == "selection" ? !contains(local.known_mapping_rules.selection_actions, r.action) : false],
+      [for r in rules : "rule ${r.id}: a selection rule needs object-locator.schema-name and table-name" if r.type == "selection" ? (r.schema == "" ? true : r.table == "") : false],
+      [for r in rules : "rule ${r.id}: explicit selects one exact table, so % is not allowed in its names" if r.type == "selection" ? (r.action == "explicit" ? strcontains("${r.schema}${r.table}", "%") : false) : false],
+
+      [for r in rules : "rule ${r.id}: transformation rule-action \"${r.action}\" is not one DMS documents" if r.type == "transformation" ? !contains(local.known_mapping_rules.transformation_actions, r.action) : false],
+      [for r in rules : "rule ${r.id}: transformation rule-target must be one of ${join(", ", local.known_mapping_rules.transformation_targets)}, not \"${r.target}\"" if r.type == "transformation" ? !contains(local.known_mapping_rules.transformation_targets, r.target) : false],
+      [for r in rules : "rule ${r.id}: a transformation needs an object-locator" if r.type == "transformation" ? !r.has_locator : false],
+      [for r in rules : "rule ${r.id}: ${r.action} applies to rule-target column only" if r.type == "transformation" ? (contains(local.known_mapping_rules.column_only_actions, r.action) ? r.target != "column" : false) : false],
+      [for r in rules : "rule ${r.id}: define-primary-key cannot use % in schema-name or table-name" if r.type == "transformation" ? (r.action == "define-primary-key" ? strcontains("${r.schema}${r.table}", "%") : false) : false],
+
+      [for r in rules : "rule ${r.id}: table-settings need an exact schema-name and table-name, no %" if r.type == "table-settings" ? (strcontains("${r.schema}${r.table}", "%") ? true : (r.schema == "" ? true : r.table == "")) : false],
+      [for r in rules : "rule ${r.id}: parallel-load.type \"${r.pl_type}\" is not one of ${join(", ", local.known_mapping_rules.parallel_load_types)}" if r.type == "table-settings" ? (r.has_pl ? !contains(local.known_mapping_rules.parallel_load_types, r.pl_type) : false) : false],
+      [for r in rules : "rule ${r.id}: parallel-load type ranges needs columns and boundaries" if r.type == "table-settings" ? (r.pl_type == "ranges" ? (r.pl_cols ? !r.pl_bounds : true) : false) : false],
+      [for r in rules : "rule ${r.id}: parallel-load type partitions-list needs partitions or subpartitions" if r.type == "table-settings" ? (r.pl_type == "partitions-list" ? (r.pl_parts ? false : !r.pl_subparts) : false) : false],
+      [for r in rules : "rule ${r.id}: lob-settings.mode \"${r.lob_mode}\" is not limited, unlimited or none" if r.type == "table-settings" ? (r.has_lob ? !contains(local.known_mapping_rules.lob_modes, r.lob_mode) : false) : false],
+      [for r in rules : "rule ${r.id}: lob-settings in limited mode (the default) need a non-zero bulk-max-size; zero is invalid and every LOB would be truncated to nothing" if r.type == "table-settings" ? (r.has_lob ? (r.lob_mode == "limited" ? r.lob_max_size <= 0 : false) : false) : false],
+
+      length(distinct([for r in rules : r.name])) == length(rules) ? [] : ["rule-name values must be unique"],
+      length([for r in rules : r if r.type == "selection"]) == 0 ? [] : (
+        length([for r in rules : r if r.type == "selection" ? contains(["include", "explicit"], r.action) : false]) == 0
+        ? ["every selection rule is an exclude, so nothing is included and the task migrates nothing"] : []
+      ),
+    )
+  }
+
+  mapping_problems = { for k, v in local.mapping_problems_all : k => v if length(v) > 0 }
+
+  # Per task, the raw_overrides entries DMS would silently drop: unknown
+  # sections, and unknown keys inside sections whose keys are documented.
+  # Nested ternaries, not || - the floor evaluates both operands.
+  tasks_with_unknown_task_settings = {
+    for k, t in var.tasks : k => flatten([
+      for section, body in local.task_settings_overrides[k] :
+      !contains(keys(local.known_task_settings), section) ? ["${section} (unknown section)"] : (
+        length(local.known_task_settings[section]) == 0 ? [] : (
+          !can(keys(body)) ? ["${section} (expected an object)"] : [
+            for key in keys(body) : "${section}.${key}"
+            if !contains(local.known_task_settings[section], key)
+          ]
+        )
+      )
+    ])
+    if length(flatten([
+      for section, body in jsondecode(t.settings.raw_overrides) :
+      !contains(keys(local.known_task_settings), section) ? [section] : (
+        length(local.known_task_settings[section]) == 0 ? [] : (
+          !can(keys(body)) ? [section] : [
+            for key in keys(body) : key
+            if !contains(local.known_task_settings[section], key)
+          ]
+        )
+      )
+    ])) > 0
+  }
+
   # Merged one level deep, so overriding a single key inside TargetMetadata does
   # not discard the rest of the section. merge() throws on a list (LogComponents
   # is one), and the try() then takes the override wholesale.
@@ -556,43 +768,21 @@ locals {
   }
 
   # -------------------------------------------------------------------------
-  # Pre-data and post-data
+  # What the target has to have before the load
   #
-  # DMS has no hook that runs a SQL script. The only in-service hook is
-  # postgres_settings.after_connect_script, which runs per connection rather
-  # than per migration. So the module records the manifest and emits the
-  # ordering; running it is the pipeline's job.
+  # DMS has no hook that runs a SQL script; the only in-service hook is
+  # postgres_settings.after_connect_script, per connection. Schema, constraints
+  # and the sequence reset are the pipeline's job. What this
+  # module can do is say, as data, which tasks depend on that having happened.
   # -------------------------------------------------------------------------
 
-  pre_data_scripts = [
-    for i, s in var.sql_scripts.pre_data : {
-      order       = i + 1
-      phase       = "pre_data"
-      name        = s.name
-      path        = s.path
-      sha256      = s.sha256 != "" ? s.sha256 : (s.sql != "" ? sha256(s.sql) : "not supplied - use filesha256() so the change record can prove what ran")
-      description = s.description
-    }
-  ]
-
-  post_data_scripts = [
-    for i, s in var.sql_scripts.post_data : {
-      order       = i + 1
-      phase       = "post_data"
-      name        = s.name
-      path        = s.path
-      sha256      = s.sha256 != "" ? s.sha256 : (s.sql != "" ? sha256(s.sql) : "not supplied - use filesha256() so the change record can prove what ran")
-      description = s.description
-    }
-  ]
-
-  # DO_NOTHING means DMS creates nothing on the target. With no pre-data script
-  # declared either, the tables have to already exist - and if they do not, the
-  # task suspends every table rather than failing outright.
-  tasks_assuming_a_prebuilt_target = [
+  # DO_NOTHING means DMS creates nothing on the target, so the tables have to
+  # exist already - and if they do not, the task suspends every table rather
+  # than failing outright. Read from the MERGED settings, like every other
+  # governance fact.
+  tasks_expecting_a_prebuilt_target = [
     for k, t in var.tasks : k
     if try(local.task_settings_merged[k].FullLoadSettings.TargetTablePrepMode, "DO_NOTHING") == "DO_NOTHING"
-    && length(local.pre_data_scripts) == 0
   ]
 
   # A full load into a target whose triggers and foreign keys are live is the

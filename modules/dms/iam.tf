@@ -144,6 +144,12 @@ resource "aws_iam_role_policy" "s3_target" {
       # GlueCatalogGeneration: the endpoint role creates the Glue tables and
       # runs Athena, as the DMS S3 target documentation lists. Without these
       # the load succeeds and the catalog never appears.
+      # s3:GetObject is bucket-wide here, unlike the write statement above,
+      # because that is the exact policy the DMS documentation gives for
+      # GlueCatalogGeneration ("Using AWS Glue Data Catalog with an Amazon S3
+      # target"): where Athena reads for the catalog is not documented to stay
+      # inside bucket_folder, and narrowing it would fail as an empty catalog
+      # with no error. A caller who needs it narrower brings their own role.
       each.value.glue_catalog_generation ? [
         {
           Sid    = "ReadForGlueCatalog"

@@ -61,8 +61,8 @@ resource "aws_dms_endpoint" "this" {
   # runs on every connection DMS opens to the target, which is where
   # "SET session_replication_role = replica" belongs - that is what stops
   # triggers firing and foreign keys rejecting rows that arrive parent-last
-  # during a full load. Everything else pre-data is your pipeline's job; see
-  # output.migration_plan.
+  # during a full load. Everything else that has to be true of the target before
+  # the load - the schema itself - is your pipeline's job; this module runs no SQL.
   dynamic "postgres_settings" {
     for_each = contains(["postgres", "aurora-postgresql"], each.value.engine) && each.value.role == "target" ? [1] : []
 
@@ -173,12 +173,22 @@ resource "aws_dms_s3_endpoint" "this" {
 
 # CA certificates for ssl_mode verify-ca and verify-full. For RDS this is the
 # regional CA bundle; for an on-prem source, whatever signed its certificate.
+# The PEM and the wallet are immutable on the certificate (the provider
+# replaces it), and Terraform deletes the old certificate BEFORE it updates
+# the endpoints that reference it. With a fixed id that is an in-use
+# certificate being deleted mid-apply. So the id carries a digest of the
+# content and the new certificate is created first: a CA rotation is then
+# create new, repoint endpoints, delete old - in one apply.
 resource "aws_dms_certificate" "this" {
   for_each = local.create ? var.certificates : {}
 
-  certificate_id     = "${var.name}-${each.key}"
+  certificate_id     = "${var.name}-${each.key}-${local.certificate_digests[each.key]}"
   certificate_pem    = each.value.pem != "" ? each.value.pem : null
   certificate_wallet = each.value.wallet != "" ? each.value.wallet : null
 
   tags = local.common_tags
+
+  lifecycle {
+    create_before_destroy = true
+  }
 }
