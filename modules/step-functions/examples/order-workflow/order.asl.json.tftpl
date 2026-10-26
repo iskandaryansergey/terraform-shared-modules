@@ -1,0 +1,53 @@
+{
+  "Comment": "Reserve stock, take payment, notify. Payment failures release the stock.",
+  "StartAt": "Reserve",
+  "States": {
+    "Reserve": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": { "FunctionName": "${reserve_function_arn}", "Payload.$": "$" },
+      "ResultSelector": { "reservation.$": "$.Payload" },
+      "ResultPath": "$.reserve",
+      "Retry": [{ "ErrorEquals": ["Lambda.TooManyRequestsException", "Lambda.ServiceException"], "IntervalSeconds": 2, "MaxAttempts": 3, "BackoffRate": 2 }],
+      "Next": "Charge"
+    },
+    "Charge": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": { "FunctionName": "${charge_function_arn}", "Payload.$": "$" },
+      "ResultPath": "$.charge",
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "Release" }],
+      "Next": "Record"
+    },
+    "Release": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Parameters": {
+        "TableName": "${orders_table}",
+        "Key": { "orderId": { "S.$": "$.orderId" } },
+        "UpdateExpression": "SET orderStatus = :s",
+        "ExpressionAttributeValues": { ":s": { "S": "RELEASED" } }
+      },
+      "Next": "Failed"
+    },
+    "Failed": { "Type": "Fail", "Error": "PaymentFailed" },
+    "Record": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Parameters": {
+        "TableName": "${orders_table}",
+        "Key": { "orderId": { "S.$": "$.orderId" } },
+        "UpdateExpression": "SET orderStatus = :s",
+        "ExpressionAttributeValues": { ":s": { "S": "PAID" } }
+      },
+      "ResultPath": null,
+      "Next": "Notify"
+    },
+    "Notify": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": { "TopicArn": "${notify_topic_arn}", "Message.$": "States.JsonToString($)" },
+      "End": true
+    }
+  }
+}
