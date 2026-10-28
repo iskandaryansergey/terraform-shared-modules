@@ -404,6 +404,11 @@ variable "endpoints" {
       # Seconds. Sent as given: the provider sends 0 for an unset value rather
       # than leaving DMS's default (60), so the default is spelled out here.
       execute_timeout = optional(number, 60)
+      # KB, target only. Same provider behaviour as execute_timeout: unset is
+      # sent as 0, and DMS 3.5.x with MaxFileSize = 0 on a PostgreSQL target
+      # keeps every table in "Before load" and never finishes the full load.
+      # 32768 is the DMS default.
+      max_file_size = optional(number, 32768)
     }), {})
   }))
   default  = {}
@@ -431,6 +436,15 @@ variable "endpoints" {
       ], e.engine)
     ])
     error_message = "endpoints[*].engine must be a relational engine DMS supports: aurora, aurora-postgresql, mariadb, mysql, oracle, postgres, sqlserver, db2, db2-zos, sybase, redshift. S3 targets go in s3_targets. docdb and neptune are not supported: the provider drops the Secrets Manager fields for them, so the endpoint would reach DMS with no credentials."
+  }
+
+  validation {
+    # A credential source is required: endpoints_with_secret (a for_each) puts
+    # every endpoint without a username on the secret path.
+    condition = alltrue([
+      for k, e in var.endpoints : e.secret_arn != "" ? true : e.username != ""
+    ])
+    error_message = "every endpoint needs a credential: secret_arn (supported) or username/password."
   }
 
   validation {

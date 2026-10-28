@@ -71,6 +71,7 @@ resource "aws_dms_endpoint" "this" {
       fail_tasks_on_lob_truncation = each.value.postgres.fail_tasks_on_lob_truncation
       after_connect_script         = each.value.postgres.after_connect_script != "" ? each.value.postgres.after_connect_script : null
       execute_timeout              = each.value.postgres.execute_timeout
+      max_file_size                = each.value.postgres.max_file_size
     }
   }
 
@@ -111,11 +112,14 @@ resource "terraform_data" "postgres_settings" {
   # Each branch is encoded on its own: a conditional over two object shapes
   # would convert both to a common type first.
   input = !contains(["postgres", "aurora-postgresql"], each.value.engine) ? "" : sha256(
-    each.value.role == "source" ? jsonencode(each.value.postgres) : jsonencode({
+    # max_file_size is target-only and left out of the source hash, so adding
+    # the field does not replace existing source endpoints.
+    each.value.role == "source" ? jsonencode({ for k, v in each.value.postgres : k => v if k != "max_file_size" }) : jsonencode({
       map_boolean_as_boolean       = each.value.postgres.map_boolean_as_boolean
       fail_tasks_on_lob_truncation = each.value.postgres.fail_tasks_on_lob_truncation
       after_connect_script         = each.value.postgres.after_connect_script
       execute_timeout              = each.value.postgres.execute_timeout
+      max_file_size                = each.value.postgres.max_file_size
     })
   )
 }

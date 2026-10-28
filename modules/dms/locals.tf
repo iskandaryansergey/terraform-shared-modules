@@ -43,9 +43,16 @@ locals {
 
   # Endpoints DMS reads a secret for. An empty secret_access_role_arn means we
   # make the role, scoped to that one secret.
+  #
+  # This map is a for_each, so its keys must be known at plan. secret_arn is
+  # often not: the secret is created in the same configuration, and a filter on
+  # it fails the plan with "Invalid for_each argument" (and fails a second
+  # destroy once the secrets are gone). An endpoint is on the secret path
+  # exactly when it carries no username (the variable allows one credential
+  # source and requires one), which is static configuration.
   endpoints_with_secret = {
     for k, e in var.endpoints : k => e
-    if e.secret_arn != "" && e.secret_access_role_arn == ""
+    if e.username == "" && e.secret_access_role_arn == ""
   }
 
   # S3 targets DMS writes through a role. Same deal: supply one or get one
